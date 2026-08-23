@@ -23,13 +23,15 @@ export default {
     }
 
     // path is absolute — new URL(path, base) would drop API_BASE's path, so concatenate
-    const upstream = new URL(API_BASE + path + incoming.search);
-    const upstreamRes = await fetch(upstream, {
+    const url = API_BASE + path + incoming.search;
+    // Edge-cached 30s: feeds update at most once a minute, so HITs are never more than 30s stale
+    const upstreamRes = await fetch(url, {
       headers: { 'x-api-key': env.DATA_GOV_SG_API_KEY },
+      cf: { cacheTtl: 30 },
     });
 
     const res = new Response(upstreamRes.body, upstreamRes);
-    res.headers.set('x-upstream-url', upstream.toString());
+    res.headers.set('x-upstream-url', url);
     return res;
   },
 };
