@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>SG Weather Radar</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('sgwr-theme');
+          if (pref === 'light' || pref === 'dark') document.documentElement.dataset.theme = pref;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="radar-container">
+      <img
+        id="radar-img-480"
+        class="radar-img"
+        decoding="async"
+        style="width: 480px; height: 480px; z-index: 1"
+      />
+      <img
+        id="radar-img-240"
+        class="radar-img"
+        decoding="async"
+        style="width: 480px; height: 480px; z-index: 2"
+      />
+      <img
+        id="radar-img-70"
+        class="radar-img"
+        decoding="async"
+        style="width: 480px; height: 480px; z-index: 3"
+      />
+    </div>
+    <canvas id="wind-canvas" aria-hidden="true"></canvas>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="0"
+      height="0"
+      style="position: absolute"
+      aria-hidden="true"
+    >
+      <defs>
+        <path id="range-shape-70" d="M6 1.2 11 10.8H1Z" />
+        <rect id="range-shape-240" x="2.5" y="2.5" width="7" height="7" />
+        <rect id="range-shape-480" x="3" y="3" width="6" height="6" transform="rotate(45 6 6)" />
+        <path
+          id="range-shape-sg"
+          d="M3 2.25H5.25V3H6.75V3.75H9V4.5H9.75V5.25H10.5V6H9V6.75H8.25V7.5H6V8.25H3V7.5H0.75V6.75H0V5.25H0.75V4.5H1.5V3H3ZM9 3.75V3H9.75V3.75ZM3 8.25V9H1.5V8.25ZM10.5 3H11.25V3.75H12V4.5H10.5ZM4.5 9H6V9.75H4.5Z"
+        />
+      </defs>
+    </svg>
+
+    <div class="panel masthead">
+      <h1>SG Weather Radar</h1>
+      <div class="scale">
+        <div class="scale-gradient"></div>
+        <div class="scale-labels"><span>Light</span><span>Moderate</span><span>Heavy</span></div>
+      </div>
+    </div>
+
+    <div class="panel console">
+      <div class="console-top">
+        <div class="scan">
+          <div class="scan-head">
+            <span
+              class="donut"
+              id="refresh-donut"
+              title="Next update…"
+              aria-label="Countdown to next update"
+            >
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                <circle class="donut-track" cx="12" cy="12" r="9" />
+                <circle class="donut-progress" cx="12" cy="12" r="9" />
+                <text
+                  class="donut-value"
+                  x="12"
+                  y="12"
+                  text-anchor="middle"
+                  dominant-baseline="central"
+                >
+                  --
+                </text>
+              </svg>
+            </span>
+            <span class="scan-date" id="scan-date">--</span>
+            <span class="scan-time" id="scan-time">--:--</span>
+          </div>
+          <div class="slider-ticks" id="slider-ticks" aria-hidden="true"></div>
+          <input
+            type="range"
+            id="time-slider"
+            min="0"
+            max="0"
+            value="0"
+            aria-label="Radar image time"
+          />
+          <div class="scan-foot">
+            <span id="time-oldest">--:--</span>
+            <span id="time-latest">--:--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-btn" id="settings-btn">
+      <button type="button" class="settings-gear" aria-label="Settings" title="Settings">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="3" />
+          <path
+            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+          />
+        </svg>
+      </button>
+    </div>
+
+    <div class="sheet-backdrop" id="sheet-backdrop"></div>
+    <div
+      class="sheet"
+      id="settings-sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      aria-hidden="true"
+    >
+      <div class="sheet-head">
+        <h2 id="settings-title">Settings</h2>
+        <button
+          type="button"
+          class="sheet-close"
+          id="sheet-close"
+          aria-label="Close settings"
+          title="Close"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+      <div class="sheet-section">
+        <div class="sheet-label">Appearance</div>
+        <div class="theme-control" id="theme-control" role="group" aria-label="Theme">
+          <button
+            type="button"
+            class="theme-btn"
+            data-theme="system"
+            aria-label="System theme"
+            title="Follow system"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="2" y="3" width="20" height="14" rx="2" />
+              <path d="M8 21h8M12 17v4" />
+            </svg>
+            <span>System</span>
+          </button>
+          <button
+            type="button"
+            class="theme-btn"
+            data-theme="light"
+            aria-label="Light theme"
+            title="Always light"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="4" />
+              <path
+                d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+              />
+            </svg>
+            <span>Light</span>
+          </button>
+          <button
+            type="button"
+            class="theme-btn"
+            data-theme="dark"
+            aria-label="Dark theme"
+            title="Always dark"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+            </svg>
+            <span>Dark</span>
+          </button>
+        </div>
+      </div>
+      <div class="sheet-section">
+        <div class="sheet-label">Radar</div>
+        <div class="sheet-row">
+          <span>Opacity</span>
+          <span class="sheet-row-trailing">
+            <button
+              type="button"
+              class="sheet-reset"
+              id="opacity-reset"
+              aria-label="Reset opacity to default"
+              title="Reset to default"
+            >
+              reset
+            </button>
+            <span class="sheet-row-value" id="opacity-value">75%</span>
+          </span>
+        </div>
+        <input
+          type="range"
+          class="sheet-slider"
+          id="opacity-slider"
+          min="0.1"
+          max="1"
+          step="0.05"
+          value="0.75"
+          aria-label="Radar image opacity"
+        />
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

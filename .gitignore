@@ -1,0 +1,19 @@
+node_modules/
+
+# secrets — never commit
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+
+# build output
+dist/
+
+# cloudflare
+.wrangler/
+
+# macOS
+.DS_Store
+
+# local tooling artifacts (browser automation logs/screenshots)
+.playwright-mcp/
