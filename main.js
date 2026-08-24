@@ -489,6 +489,7 @@ function initMap() {
   map.on('style.load', () => {
     styleReady = true;
     addRadarLayers();
+    addWindLayer();
     addBoundaryLayers();
     addLightningLayer();
   });
@@ -1600,8 +1601,17 @@ function renderLightning() {
   );
 }
 
-const windCanvas = document.getElementById('wind-canvas');
+// Particles draw with the 2D API onto an offscreen canvas (trails persist via destination-in
+// fades); a custom layer uploads it as a texture so wind lives inside the map's layer stack.
+const windCanvas = document.createElement('canvas');
 const windCtx = windCanvas.getContext('2d');
+const WIND_LAYER_ID = 'wind-layer';
+let windProgram = null;
+let windTexture = null;
+let windQuadBuffer = null;
+let windAPos = 0;
+let windUTex = 0;
+let windNeedsUpload = false;
 // CSS-pixel viewport size, cached for the per-frame loop (canvas is fixed at 100% × 100%).
 let windViewW = 0;
 let windViewH = 0;
@@ -1625,7 +1635,6 @@ const windBucketXY = Array.from(
 const windBucketN = new Int32Array(WIND_COLOR_BUCKETS);
 let windField = null;
 let windSpawn = null;
-let windRaf = 0;
 let windLastT = 0;
 let windClearNext = false;
 let windParticleCount = 0;
@@ -1812,10 +1821,7 @@ function windRespawn(i) {
   windSx[i] = NaN;
 }
 
-function windFrame(now) {
-  if (!showWind) return;
-  windRaf = requestAnimationFrame(windFrame);
-  if (!windField || !map) return;
+function stepWind(now) {
   let dt = now - windLastT;
   windLastT = now;
   dt = clamp(dt, 4, 50);
@@ -1933,6 +1939,9 @@ function renderWindStatic() {
     windCtx.stroke();
   }
   windCtx.globalAlpha = 1;
+  windNeedsUpload = true;
+  // The map may be idle (no camera motion), so nudge one repaint to show the static render.
+  if (map && map.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
 }
 
 function sizeWindCanvas() {
@@ -1951,30 +1960,129 @@ function sizeWindCanvas() {
   windParticleCount = clamp(Math.round((w * h) / 650), 500, WIND_MAX_PARTICLES);
 }
 
+const WIND_VERT = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+const WIND_FRAG = `
+precision mediump float;
+uniform sampler2D u_tex;
+varying vec2 v_uv;
+void main() {
+  vec4 c = texture2D(u_tex, v_uv);
+  gl_FragColor = vec4(c.rgb * c.a, c.a);
+}
+`;
+
+function initWindGL(gl) {
+  if (windProgram) return;
+  const compile = (type, src) => {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    return shader;
+  };
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, WIND_VERT));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, WIND_FRAG));
+  gl.linkProgram(program);
+  windProgram = program;
+  windAPos = gl.getAttribLocation(program, 'a_pos');
+  windUTex = gl.getUniformLocation(program, 'u_tex');
+  windQuadBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, windQuadBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  windTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, windTexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function compositeWind(gl) {
+  const mapCanvas = map.getCanvas();
+  if (!mapCanvas.width || !mapCanvas.height) return;
+  const prevViewport = gl.getParameter(gl.VIEWPORT);
+  const prevDepth = gl.isEnabled(gl.DEPTH_TEST);
+  const prevBlend = gl.isEnabled(gl.BLEND);
+  gl.viewport(0, 0, mapCanvas.width, mapCanvas.height);
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  // Canvas2D strokes are straight alpha; premultiply here so blending matches source-over.
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(windProgram);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, windTexture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, windCanvas);
+  gl.uniform1i(windUTex, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, windQuadBuffer);
+  gl.enableVertexAttribArray(windAPos);
+  gl.vertexAttribPointer(windAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.disableVertexAttribArray(windAPos);
+  gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+  if (prevDepth) gl.enable(gl.DEPTH_TEST);
+  if (!prevBlend) gl.disable(gl.BLEND);
+}
+
+const windCustomLayer = {
+  id: WIND_LAYER_ID,
+  type: 'custom',
+  renderingMode: '2d',
+  onAdd(map, gl) {
+    initWindGL(gl);
+  },
+  render(gl) {
+    if (!showWind || !windField || !windProgram) return;
+    if (windMotionQuery.matches) {
+      // Frames repaint from scratch, so keep compositing; only re-upload when redrawn.
+      windNeedsUpload = false;
+    } else {
+      stepWind(performance.now());
+      map.triggerRepaint();
+    }
+    compositeWind(gl);
+  },
+};
+
+function addWindLayer() {
+  if (!map || !styleReady) return;
+  // setStyle() preserves custom layers but re-inserts them mid-stack; re-add above the rasters.
+  if (map.getLayer(WIND_LAYER_ID)) map.removeLayer(WIND_LAYER_ID);
+  map.addLayer(windCustomLayer);
+  map.setLayoutProperty(WIND_LAYER_ID, 'visibility', showWind ? 'visible' : 'none');
+}
+
 function startWindLoop() {
-  cancelAnimationFrame(windRaf);
-  windRaf = 0;
-  if (!showWind) return;
+  if (!showWind || !map || !map.getLayer(WIND_LAYER_ID)) return;
   if (windMotionQuery.matches) {
     renderWindStatic();
     return;
   }
   windLastT = performance.now();
-  windRaf = requestAnimationFrame(windFrame);
+  map.triggerRepaint();
 }
 
 function setWindOverlay(on) {
+  const hasLayer = !!map?.getLayer(WIND_LAYER_ID);
   if (on) {
-    windCanvas.style.display = 'block';
     sizeWindCanvas();
     for (let i = 0; i < WIND_MAX_PARTICLES; i++) windSx[i] = NaN;
+    if (hasLayer) {
+      map.setLayoutProperty(WIND_LAYER_ID, 'visibility', 'visible');
+      startWindLoop();
+    }
     loadWind();
-    startWindLoop();
   } else {
-    cancelAnimationFrame(windRaf);
-    windRaf = 0;
+    if (hasLayer) map.setLayoutProperty(WIND_LAYER_ID, 'visibility', 'none');
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
-    windCanvas.style.display = 'none';
+    windNeedsUpload = false;
   }
 }
 
@@ -1990,7 +2098,11 @@ function windInvalidateScreen() {
 }
 
 async function loadWind() {
-  if (!showWind || (windField && Date.now() - windDataAt < 4 * 60 * 1000)) return;
+  if (!showWind || (windField && Date.now() - windDataAt < 4 * 60 * 1000)) {
+    // Fresh cache or hidden tab: the map's animation chain may have stalled, so nudge a frame.
+    if (showWind && !windMotionQuery.matches && map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
+    return;
+  }
   if (windLoading) return windLoading;
   const run = (async () => {
     setBusy(true);
@@ -2029,6 +2141,7 @@ async function loadWind() {
       updateWindSpawn();
       windDataAt = Date.now();
       if (windMotionQuery.matches) renderWindStatic();
+      else if (map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
     } finally {
       setBusy(false);
     }
