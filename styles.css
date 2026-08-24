@@ -922,29 +922,6 @@ body {
   flex-shrink: 0;
 }
 
-#radar-container {
-  position: fixed;
-  inset: 0;
-  overflow: hidden;
-  pointer-events: none;
-  transform-origin: 0 0;
-  will-change: transform;
-}
-.radar-img {
-  position: absolute;
-  left: 0;
-  top: 0;
-  pointer-events: none;
-  opacity: 0.75;
-  display: none;
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
-  transform-origin: 0 0;
-}
-#radar-container.tilted .radar-img {
-  image-rendering: auto;
-}
-
 #wind-canvas {
   position: fixed;
   left: 0;

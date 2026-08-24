@@ -64,7 +64,6 @@ let framesByRange = {};
 let framesMap = {};
 let allTimestamps = [];
 let lastRadarSignature = null;
-let layout = {};
 let themePreference = localStorage.getItem(THEME_STORAGE_KEY) || 'system';
 let appliedStyle = null;
 const darkModeQuery = matchMedia('(prefers-color-scheme: dark)');
@@ -76,27 +75,6 @@ let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let lightningStrikes = [];
 let lightningLoading = null;
 const failedImages = new Set();
-const imageRetries = new Map();
-
-for (const range of RANGES) {
-  const img = document.getElementById(`radar-img-${range}`);
-  img.addEventListener('error', () => {
-    if (img.style.display === 'none' || !img.dataset.frameUrl) return;
-    const failedUrl = img.dataset.frameUrl;
-    const count = imageRetries.get(range) || 0;
-    if (count < 1) {
-      imageRetries.set(range, count + 1);
-      const sep = img.src.includes('?') ? '&' : '?';
-      img.src = img.src + sep + '_t=' + Date.now();
-    } else {
-      failedImages.add(failedUrl);
-      img.style.display = 'none';
-      imageRetries.delete(range);
-      renderTicks();
-      updateBoundaryAvailability();
-    }
-  });
-}
 
 function clamp(v, min, max) {
   return Math.min(max, Math.max(min, v));
@@ -156,13 +134,6 @@ function setBusy(on) {
     restartCountdown();
     tickCountdown();
   }
-}
-
-function trackImageBusy(img) {
-  if (img.complete) return;
-  setBusy(true);
-  const done = () => setBusy(false);
-  img.decode().then(done, done);
 }
 
 // Constructed once: building formatters with a timeZone is far too costly per scrub event.
@@ -290,7 +261,7 @@ class ClipToggleControl {
       localStorage.setItem(CLIP_STORAGE_KEY, clipBoundaries ? 'on' : 'off');
       button.classList.toggle('toggle-active', clipBoundaries);
       button.setAttribute('aria-pressed', String(clipBoundaries));
-      computeLayout();
+      showFrame(currentIndex);
       showToast(
         clipBoundaries ? 'Clipping radar at range boundaries' : 'Showing intersecting radar',
       );
@@ -416,9 +387,13 @@ function setThemePreference(pref) {
 function applyOpacity(value) {
   const v = clamp(value, 0.1, 1);
   radarOpacity = v;
-  document.querySelectorAll('.radar-img').forEach((img) => {
-    img.style.opacity = String(v);
-  });
+  if (map) {
+    for (const range of RANGES) {
+      if (map.getLayer(`radar-${range}`)) {
+        map.setPaintProperty(`radar-${range}`, 'raster-opacity', v);
+      }
+    }
+  }
   document.getElementById('opacity-value').textContent = `${Math.round(v * 100)}%`;
   document.getElementById('opacity-reset').classList.toggle('visible', v !== 0.75);
 }
@@ -505,7 +480,6 @@ function initMap() {
   map.once('load', () => {
     if (showWind) setWindOverlay(true);
   });
-  map.on('move', updateAllImagePositions);
   map.on('move', windInvalidateScreen);
   map.on('moveend', () => {
     if (!showWind) return;
@@ -514,6 +488,7 @@ function initMap() {
   });
   map.on('style.load', () => {
     styleReady = true;
+    addRadarLayers();
     addBoundaryLayers();
     addLightningLayer();
   });
@@ -848,7 +823,6 @@ function applyRadarData(rangeResults, strikes) {
   framesByRange = {};
   framesMap = {};
   failedImages.clear();
-  imageRetries.clear();
   for (const range of RANGES) {
     const result = rangeResults[range];
     if (!result) continue;
@@ -870,7 +844,6 @@ function applyRadarData(rangeResults, strikes) {
   if (strikes) lightningStrikes = strikes;
 
   const newSlots = rebuildTimeline();
-  computeLayout();
   addBoundaryLayers();
   updateSlider(newSlots);
   showFrame(currentIndex);
@@ -899,7 +872,6 @@ function mergeRangeResults(rangeResults) {
     }
     framesMap[range] = slots;
   }
-  computeLayout();
   addBoundaryLayers();
   const newSlots = rebuildTimeline();
   updateSlider(newSlots);
@@ -1099,120 +1071,186 @@ function updateSliderUI(index) {
   document.getElementById('scan-date').textContent = ts ? formatDate(ts) : '--';
 }
 
-function projectQuad(bb) {
+const RADAR_BLANK_PNG =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=';
+const CLIP_SOURCE = { 480: 240, 240: 70 };
+const frameImageCache = new Map();
+const FRAME_CACHE_MAX = 24;
+const radarShownKey = new Map();
+
+function bbCoordinatesOf(bb) {
   return [
-    map.project([bb.upperLeft.longitude, bb.upperLeft.latitude]),
-    map.project([bb.lowerRight.longitude, bb.upperLeft.latitude]),
-    map.project([bb.lowerRight.longitude, bb.lowerRight.latitude]),
-    map.project([bb.upperLeft.longitude, bb.lowerRight.latitude]),
+    [bb.upperLeft.longitude, bb.upperLeft.latitude],
+    [bb.lowerRight.longitude, bb.upperLeft.latitude],
+    [bb.lowerRight.longitude, bb.lowerRight.latitude],
+    [bb.upperLeft.longitude, bb.lowerRight.latitude],
   ];
 }
 
-function solveHomography(src, dst) {
-  const a = [];
-  const b = [];
-  for (let i = 0; i < 4; i++) {
-    const [x, y] = src[i];
-    const [u, v] = dst[i];
-    a.push([x, y, 1, 0, 0, 0, -u * x, -u * y], [0, 0, 0, x, y, 1, -v * x, -v * y]);
-    b.push(u, v);
-  }
-  const n = 8;
-  for (let col = 0; col < n; col++) {
-    let pivot = col;
-    for (let r = col + 1; r < n; r++) {
-      if (Math.abs(a[r][col]) > Math.abs(a[pivot][col])) pivot = r;
-    }
-    if (Math.abs(a[pivot][col]) < 1e-10) return null;
-    [a[col], a[pivot]] = [a[pivot], a[col]];
-    [b[col], b[pivot]] = [b[pivot], b[col]];
-    const pv = a[col][col];
-    for (let c = col; c < n; c++) a[col][c] /= pv;
-    b[col] /= pv;
-    for (let r = 0; r < n; r++) {
-      if (r === col) continue;
-      const f = a[r][col];
-      if (!f) continue;
-      for (let c = col; c < n; c++) a[r][c] -= f * a[col][c];
-      b[r] -= f * b[col];
-    }
-  }
-  return [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], 1];
-}
-
-function homographyMatrix3d(h) {
-  return `matrix3d(${h[0]}, ${h[3]}, 0, ${h[6]}, ${h[1]}, ${h[4]}, 0, ${h[7]}, 0, 0, 1, 0, ${h[2]}, ${h[5]}, 0, ${h[8]})`;
-}
-
-function updateAllImagePositions() {
-  if (!boundaryBoxes[480] || !layout[480]) return;
-  const quad = projectQuad(boundaryBoxes[480]);
-  const h = solveHomography(
-    [
-      [0, 0],
-      [480, 0],
-      [480, 480],
-      [0, 480],
-    ],
-    [
-      [quad[0].x, quad[0].y],
-      [quad[1].x, quad[1].y],
-      [quad[2].x, quad[2].y],
-      [quad[3].x, quad[3].y],
-    ],
-  );
-  if (!h) return;
-  const el = document.getElementById('radar-container');
-  const pitched = Math.abs(h[6]) + Math.abs(h[7]) > 1e-5;
-  if (pitched) {
-    el.style.transform = homographyMatrix3d(h);
-    el.classList.add('tilted');
-  } else {
-    const θ = Math.atan2(h[3], h[0]);
-    const sx = Math.hypot(h[0], h[3]);
-    const sy = Math.hypot(h[1], h[4]);
-    el.style.transform = `translate3d(${h[2]}px, ${h[5]}px, 0) rotate3d(0, 0, 1, ${θ}rad) scale3d(${sx}, ${sy}, 1)`;
-    el.classList.remove('tilted');
-  }
-}
-
-function computeLayout() {
-  if (!boundaryBoxes[480]) return;
-  const outer = boundaryBoxes[480];
-  const outerW = outer.lowerRight.longitude - outer.upperLeft.longitude;
-  const outerH = outer.upperLeft.latitude - outer.lowerRight.latitude;
-  if (!outerW || !outerH) return;
-
-  layout = {};
+function addRadarLayers() {
+  if (!map || !styleReady) return;
+  radarShownKey.clear();
   for (const range of RANGES) {
-    const bb = boundaryBoxes[range];
-    if (!bb) continue;
-
-    const left = ((bb.upperLeft.longitude - outer.upperLeft.longitude) / outerW) * 480;
-    const right = ((bb.lowerRight.longitude - outer.upperLeft.longitude) / outerW) * 480;
-    const top = ((outer.upperLeft.latitude - bb.upperLeft.latitude) / outerH) * 480;
-    const bottom = ((outer.upperLeft.latitude - bb.lowerRight.latitude) / outerH) * 480;
-
-    let clip = 'none';
-    const innerRange = range === 480 ? 240 : range === 240 ? 70 : null;
-    if (clipBoundaries && innerRange && boundaryBoxes[innerRange]) {
-      const inner = boundaryBoxes[innerRange];
-      const w = bb.lowerRight.longitude - bb.upperLeft.longitude;
-      const h = bb.upperLeft.latitude - bb.lowerRight.latitude;
-      const l = ((inner.upperLeft.longitude - bb.upperLeft.longitude) / w) * range;
-      const r = ((inner.lowerRight.longitude - bb.upperLeft.longitude) / w) * range;
-      const t = ((bb.upperLeft.latitude - inner.upperLeft.latitude) / h) * range;
-      const b = ((bb.upperLeft.latitude - inner.lowerRight.latitude) / h) * range;
-      // Hole coords are in range×range display space; scale to the declared 480×480 img space.
-      const s = 480 / range;
-      clip = `polygon(evenodd, 0 0, 480px 0, 480px 480px, 0 480px, ${l * s}px ${t * s}px, ${r * s}px ${t * s}px, ${r * s}px ${b * s}px, ${l * s}px ${b * s}px)`;
-    }
-    const img = document.getElementById(`radar-img-${range}`);
-    img.style.clipPath = clip;
-    img.style.transform = `translate3d(${left}px, ${top}px, 0) scale3d(${(right - left) / 480}, ${(bottom - top) / 480}, 1)`;
-    layout[range] = true;
+    if (map.getSource(`radar-${range}`)) continue;
+    map.addSource(`radar-${range}`, {
+      type: 'image',
+      url: RADAR_BLANK_PNG,
+      coordinates: bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]),
+    });
+    map.addLayer({
+      id: `radar-${range}`,
+      type: 'raster',
+      source: `radar-${range}`,
+      paint: {
+        'raster-opacity': radarOpacity,
+        resampling: 'nearest',
+        'raster-fade-duration': 0,
+      },
+    });
   }
-  updateAllImagePositions();
+  if (allTimestamps.length) showFrame(currentIndex);
+}
+
+function mercatorY(lat) {
+  return Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
+}
+
+function mercatorLat(y) {
+  return ((2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180) / Math.PI;
+}
+
+async function fetchRadarImage(url) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+      if (res.ok) return await res.blob();
+    } catch (e) {}
+    if (attempt >= FETCH_RETRIES) throw new Error(`Radar image failed [${url}]`);
+    await delay(FETCH_RETRY_DELAY);
+  }
+}
+
+// Source rows are evenly spaced in latitude but the map stretches the texture evenly
+// in Mercator Y, so resample row by row to land every radar pixel in its true place.
+function buildRadarCanvas(range, frame, clip) {
+  return fetchRadarImage(frame.url).then((blob) =>
+    createImageBitmap(blob).then((bitmap) => {
+      try {
+        const bb = boundaryBoxes[range] || RADAR_BOUNDS[range];
+        const W = bitmap.width;
+        const H = bitmap.height;
+        const canvas = document.createElement('canvas');
+        canvas.width = W;
+        canvas.height = H;
+        const ctx = canvas.getContext('2d');
+        const yTop = mercatorY(bb.upperLeft.latitude);
+        const yBot = mercatorY(bb.lowerRight.latitude);
+        const latSpan = bb.upperLeft.latitude - bb.lowerRight.latitude;
+        // Pixel-center latitude of each output row (rows are evenly spaced in Mercator Y).
+        const rowLat = new Float64Array(H);
+        for (let y = 0; y < H; y++) {
+          const lat = mercatorLat(yTop + ((y + 0.5) / H) * (yBot - yTop));
+          rowLat[y] = lat;
+          const srcY = clamp(((bb.upperLeft.latitude - lat) / latSpan) * H - 0.5, 0, H - 1);
+          ctx.drawImage(bitmap, 0, srcY, W, 1, 0, y, W, 1);
+        }
+        const innerRange = CLIP_SOURCE[range];
+        if (clip && innerRange) {
+          const inner = boundaryBoxes[innerRange] || RADAR_BOUNDS[innerRange];
+          const lonSpan = bb.lowerRight.longitude - bb.upperLeft.longitude;
+          // Shrink the target box inward by half an outer texel before selecting pixels to
+          // clear. Without this, texel-center quantization can push the hole edge a sliver
+          // *outside* the inner box, leaving a hairline base-map seam at the boundary. The
+          // eroded hole is always strictly covered by the inner image (whose map-drawn edge
+          // is sub-pixel exact), so the visible outer->inner edge is sub-pixel accurate.
+          const west = inner.upperLeft.longitude + lonSpan / W / 2;
+          const east = inner.lowerRight.longitude - lonSpan / W / 2;
+          const halfRow = (yTop - yBot) / H / 2;
+          const north = mercatorLat(mercatorY(inner.upperLeft.latitude) - halfRow);
+          const south = mercatorLat(mercatorY(inner.lowerRight.latitude) + halfRow);
+          let x0 = W,
+            x1 = -1;
+          for (let x = 0; x < W; x++) {
+            const lon = bb.upperLeft.longitude + ((x + 0.5) / W) * lonSpan;
+            if (lon >= west && lon <= east) {
+              if (x < x0) x0 = x;
+              if (x > x1) x1 = x;
+            }
+          }
+          let y0 = H,
+            y1 = -1;
+          for (let y = 0; y < H; y++) {
+            if (rowLat[y] <= north && rowLat[y] >= south) {
+              if (y < y0) y0 = y;
+              if (y > y1) y1 = y;
+            }
+          }
+          if (x1 >= x0 && y1 >= y0) ctx.clearRect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+        }
+        return canvas;
+      } finally {
+        bitmap.close();
+      }
+    }),
+  );
+}
+
+function frameImageKey(frame, clip) {
+  return clip ? `${frame.url}#clip` : frame.url;
+}
+
+function prepareFrameImage(range, frame) {
+  const key = frameImageKey(frame, clipBoundaries);
+  let promise = frameImageCache.get(key);
+  if (!promise) {
+    promise = buildRadarCanvas(range, frame, clipBoundaries).catch((e) => {
+      frameImageCache.delete(key);
+      throw e;
+    });
+    frameImageCache.set(key, promise);
+    while (frameImageCache.size > FRAME_CACHE_MAX) {
+      frameImageCache.delete(frameImageCache.keys().next().value);
+    }
+  }
+  frameImageCache.delete(key);
+  frameImageCache.set(key, promise);
+  return promise;
+}
+
+function applyRadarFrame(range, frame) {
+  const source = map && styleReady && map.getSource(`radar-${range}`);
+  if (!source) return;
+  if (!frame || failedImages.has(frame.url)) {
+    radarShownKey.delete(range);
+    map.setLayoutProperty(`radar-${range}`, 'visibility', 'none');
+    return;
+  }
+  map.setLayoutProperty(`radar-${range}`, 'visibility', 'visible');
+  source.setCoordinates(bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]));
+  const key = frameImageKey(frame, clipBoundaries);
+  if (radarShownKey.get(range) === key) return;
+  radarShownKey.set(range, key);
+  setBusy(true);
+  prepareFrameImage(range, frame)
+    .then((canvas) => {
+      const src = styleReady && map.getSource(`radar-${range}`);
+      if (!src || radarShownKey.get(range) !== key) return;
+      src.updateImage({ image: canvas });
+    })
+    .catch(() => {
+      if (!failedImages.has(frame.url)) {
+        failedImages.add(frame.url);
+        renderTicks();
+        updateBoundaryAvailability();
+      }
+      if (radarShownKey.get(range) === key) {
+        radarShownKey.delete(range);
+        if (map.getLayer(`radar-${range}`)) {
+          map.setLayoutProperty(`radar-${range}`, 'visibility', 'none');
+        }
+      }
+    })
+    .finally(() => setBusy(false));
 }
 
 function boundaryOutlineColor() {
@@ -2017,8 +2055,6 @@ windMotionQuery.addEventListener('change', () => {
   if (showWind) startWindLoop();
 });
 
-const prefetchPool = new Set();
-
 // Warm frames around the current slot so timeline scrubbing doesn't wait on the network.
 function prefetchFrames(index) {
   const lo = Math.max(0, index - 3);
@@ -2027,12 +2063,8 @@ function prefetchFrames(index) {
     const slotMs = new Date(allTimestamps[i]).getTime();
     for (const range of RANGES) {
       const frame = framesMap[range]?.get(slotMs);
-      if (!frame || failedImages.has(frame.url) || prefetchPool.has(frame.url)) continue;
-      prefetchPool.add(frame.url);
-      const img = new Image();
-      img.decoding = 'async';
-      img.src = frame.url;
-      img.decode().catch(() => {});
+      if (!frame || failedImages.has(frame.url)) continue;
+      prepareFrameImage(range, frame).catch(() => {});
     }
   }
 }
@@ -2043,19 +2075,8 @@ function showFrame(index) {
   const slotMs = new Date(allTimestamps[index]).getTime();
 
   for (const range of RANGES) {
-    const img = document.getElementById(`radar-img-${range}`);
-    const frame = framesMap[range]?.get(slotMs);
-    if (frame && !failedImages.has(frame.url)) {
-      imageRetries.delete(range);
-      img.dataset.frameUrl = frame.url;
-      img.src = frame.url;
-      img.style.display = 'block';
-      trackImageBusy(img);
-    } else {
-      img.style.display = 'none';
-    }
+    applyRadarFrame(range, framesMap[range]?.get(slotMs));
   }
-  updateAllImagePositions();
   renderLightning();
   updateBoundaryAvailability();
   prefetchFrames(index);
