@@ -74,6 +74,7 @@ let clipBoundaries = localStorage.getItem(CLIP_STORAGE_KEY) !== 'off';
 let showLightning = localStorage.getItem(LIGHTNING_STORAGE_KEY) === 'on';
 let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let lightningStrikes = [];
+let lightningLoading = null;
 const failedImages = new Set();
 const imageRetries = new Map();
 
@@ -358,6 +359,7 @@ class LightningToggleControl {
       button.classList.toggle('toggle-active', showLightning);
       button.setAttribute('aria-pressed', String(showLightning));
       renderLightning();
+      refreshLightning();
       showToast(
         showLightning ? 'Showing cloud-to-ground lightning' : 'Hiding cloud-to-ground lightning',
       );
@@ -700,6 +702,22 @@ async function loadLightningData(fetchFn) {
   return strikes.sort((a, b) => a.t - b.t);
 }
 
+async function refreshLightning() {
+  if (!showLightning || lightningLoading) return;
+  lightningLoading = loadLightningData(fetchJsonCached)
+    .then((strikes) => {
+      lightningStrikes = strikes;
+      renderLightning();
+    })
+    .catch((e) => {
+      console.error('Lightning fetch error:', e);
+    })
+    .finally(() => {
+      lightningLoading = null;
+    });
+  return lightningLoading;
+}
+
 async function loadRadarData(fetchFn, ranges = RANGES) {
   const now = sgtNow();
   const cutoff = new Date(now.getTime() - PAST_HOURS * 60 * 60 * 1000 - FETCH_PAD_MS);
@@ -926,7 +944,7 @@ async function doFetchRadar() {
   try {
     const [rangeResults, strikes] = await Promise.all([
       loadRadarData(cacheReader),
-      loadLightningData(cacheReader).catch(() => null),
+      showLightning ? loadLightningData(cacheReader).catch(() => null) : null,
     ]);
     if (RANGES.some((range) => rangeResults[range]?.frames.length)) {
       applyRadarData(rangeResults, strikes);
@@ -937,9 +955,11 @@ async function doFetchRadar() {
   try {
     const [rangeResults, strikes] = await Promise.all([
       loadRadarData(fetchBypassCache),
-      loadLightningData(fetchBypassCache).catch((e) => {
-        console.error('Lightning fetch error:', e);
-      }),
+      showLightning
+        ? loadLightningData(fetchBypassCache).catch((e) => {
+            console.error('Lightning fetch error:', e);
+          })
+        : null,
     ]);
     if (!rendered || hasNewerRadarData(rangeResults)) {
       applyRadarData(rangeResults, strikes);
