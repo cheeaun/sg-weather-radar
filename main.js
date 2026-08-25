@@ -489,9 +489,11 @@ function initMap() {
   map.on('style.load', () => {
     styleReady = true;
     addRadarLayers();
+    addLandOutline();
     addWindLayer();
     addBoundaryLayers();
     addLightningLayer();
+    raisePlaceLabels();
   });
   applyTheme();
 }
@@ -1112,6 +1114,45 @@ function addRadarLayers() {
   if (allTimestamps.length) showFrame(currentIndex);
 }
 
+// Coastline traced above the radar so rain stays readable against the land it falls on.
+// Inland water edges only join at close zooms, where their detail stops being noise.
+function addLandOutline() {
+  if (!map || !styleReady) return;
+  if (!map.getSource('openmaptiles')) return;
+  const specs = [
+    { id: LAND_OUTLINE_LAYER_ID, filter: ['==', ['get', 'class'], 'ocean'] },
+    {
+      id: LAND_OUTLINE_INLAND_LAYER_ID,
+      minzoom: 12,
+      filter: ['in', ['get', 'class'], ['literal', ['lake', 'pond', 'river', 'canal']]],
+    },
+  ];
+  for (const { id, filter, minzoom } of specs) {
+    if (map.getLayer(id)) map.removeLayer(id);
+    map.addLayer({
+      id,
+      type: 'line',
+      source: 'openmaptiles',
+      'source-layer': 'water',
+      ...(minzoom ? { minzoom } : {}),
+      filter,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: {
+        'line-color': landOutlineColor(),
+        'line-width': ['interpolate', ['linear'], ['zoom'], 5, 0.8, 12, 1.6],
+      },
+    });
+  }
+}
+
+// Base-style place labels sit under the overlays; raise them so names stay readable over rain.
+function raisePlaceLabels() {
+  if (!map || !styleReady) return;
+  for (const layer of map.getStyle().layers) {
+    if (layer.type === 'symbol' && layer['source-layer'] === 'place') map.moveLayer(layer.id);
+  }
+}
+
 function mercatorY(lat) {
   return Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
 }
@@ -1258,6 +1299,13 @@ function boundaryOutlineColor() {
   return (
     getComputedStyle(document.documentElement).getPropertyValue('--radar-outline').trim() ||
     'rgba(0, 0, 0, 0.4)'
+  );
+}
+
+function landOutlineColor() {
+  return (
+    getComputedStyle(document.documentElement).getPropertyValue('--land-outline').trim() ||
+    'rgba(52, 66, 74, 0.6)'
   );
 }
 
@@ -1606,6 +1654,8 @@ function renderLightning() {
 const windCanvas = document.createElement('canvas');
 const windCtx = windCanvas.getContext('2d');
 const WIND_LAYER_ID = 'wind-layer';
+const LAND_OUTLINE_LAYER_ID = 'land-outline';
+const LAND_OUTLINE_INLAND_LAYER_ID = 'land-outline-inland';
 let windProgram = null;
 let windTexture = null;
 let windQuadBuffer = null;

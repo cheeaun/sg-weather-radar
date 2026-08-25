@@ -15,6 +15,7 @@
   --track: rgba(15, 33, 41, 0.14);
   --scale-line: rgba(10, 22, 28, 0.12);
   --radar-outline: rgba(0, 0, 0, 0.4);
+  --land-outline: rgba(52, 66, 74, 0.6);
   --toast-error-bg: #fdf0ef;
   --toast-error-line: #ecc8c4;
   --toast-error-ink: #7d2520;
@@ -40,6 +41,7 @@
     --track: rgba(255, 255, 255, 0.14);
     --scale-line: rgba(255, 255, 255, 0.16);
     --radar-outline: rgba(255, 255, 255, 0.42);
+    --land-outline: rgba(214, 228, 236, 0.55);
     --toast-error-bg: #2a1715;
     --toast-error-line: #5a2c26;
     --toast-error-ink: #f3b3ab;
@@ -124,6 +126,7 @@
   --track: rgba(255, 255, 255, 0.14);
   --scale-line: rgba(255, 255, 255, 0.16);
   --radar-outline: rgba(255, 255, 255, 0.42);
+  --land-outline: rgba(214, 228, 236, 0.55);
   --toast-error-bg: #2a1715;
   --toast-error-line: #5a2c26;
   --toast-error-ink: #f3b3ab;
