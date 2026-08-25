@@ -822,12 +822,19 @@ function rebuildTimeline() {
 }
 
 function applyRadarData(rangeResults, strikes) {
+  const prevBoxes = boundaryBoxes;
+  const prevFrames = framesByRange;
   boundaryBoxes = {};
   framesByRange = {};
   framesMap = {};
   failedImages.clear();
   for (const range of RANGES) {
-    const result = rangeResults[range];
+    let result = rangeResults[range];
+    // A full refresh that comes back empty for one range (pruned/missed cache read,
+    // transient upstream gap) must not erase the frames already on screen.
+    if ((!result || !result.frames.length) && prevFrames[range]?.length) {
+      result = { bb: prevBoxes[range], frames: prevFrames[range] };
+    }
     if (!result) continue;
     boundaryBoxes[range] = result.bb;
     framesByRange[range] = result.frames;
@@ -860,6 +867,8 @@ function mergeRangeResults(rangeResults) {
   for (const range of RANGES) {
     const result = rangeResults[range];
     if (!result) continue;
+    // Same rule as applyRadarData: an empty poll result keeps the existing frames.
+    if (!result.frames.length && framesByRange[range]?.length) continue;
     boundaryBoxes[range] = result.bb;
     framesByRange[range] = result.frames;
     const slots = new Map();
