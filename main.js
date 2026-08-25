@@ -1,6 +1,10 @@
 import 'maplibre-gl/dist/maplibre-gl.css';
 import * as maplibregl from 'maplibre-gl';
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
+// MRT/LRT lines + stations from cheeaun/sgraildata, compiled to rail.json by
+// scripts/build-rail-data.mjs (delta-encoded int coords at 1e-5 deg). Imported
+// so Vite bundles it under a content hash like the rest of the assets.
+import railRaw from './rail.json';
 
 maplibregl.setWorkerUrl(workerUrl);
 const API_BASE = '/api';
@@ -476,6 +480,7 @@ function initMap() {
   map.addControl(panelControl('.console'), 'bottom-left');
   map.addControl(panelControl('.settings-btn'), 'top-right');
   fitToBounds('sg', 0);
+  loadRailData();
   // Radar data fetch starts immediately at module init; only wind needs the loaded map.
   map.once('load', () => {
     if (showWind) setWindOverlay(true);
@@ -490,6 +495,7 @@ function initMap() {
     styleReady = true;
     addRadarLayers();
     addLandOutline();
+    addRailLayers();
     addWindLayer();
     addBoundaryLayers();
     addLightningLayer();
@@ -1160,6 +1166,130 @@ function raisePlaceLabels() {
   for (const layer of map.getStyle().layers) {
     if (layer.type === 'symbol' && layer['source-layer'] === 'place') map.moveLayer(layer.id);
   }
+}
+
+let railData = null;
+
+function decodeRail(raw) {
+  const s = raw.scale;
+  const lineFeatures = raw.lines.map(([name, color, segs]) => ({
+    type: 'Feature',
+    properties: { name, color },
+    geometry: {
+      type: 'MultiLineString',
+      coordinates: segs.map((seg) => {
+        const ring = [];
+        let x = 0;
+        let y = 0;
+        for (let i = 0; i < seg.length; i += 2) {
+          x += seg[i];
+          y += seg[i + 1];
+          ring.push([x / s, y / s]);
+        }
+        return ring;
+      }),
+    },
+  }));
+  // Stations are one delta chain: accumulate from the first absolute pair.
+  let sx = 0;
+  let sy = 0;
+  const stationFeatures = raw.stations.map(([name, x, y, p]) => {
+    sx += x;
+    sy += y;
+    return {
+      type: 'Feature',
+      properties: { name, p },
+      geometry: { type: 'Point', coordinates: [sx / s, sy / s] },
+    };
+  });
+  // Interchanges (higher p) draw on top of single-line stops.
+  stationFeatures.sort((a, b) => a.properties.p - b.properties.p);
+  return {
+    lines: { type: 'FeatureCollection', features: lineFeatures },
+    stations: { type: 'FeatureCollection', features: stationFeatures },
+  };
+}
+
+async function loadRailData() {
+  if (railData) return;
+  try {
+    railData = decodeRail(railRaw);
+    addRailLayers();
+  } catch (e) {}
+}
+
+function addRailLayers() {
+  if (!map || !styleReady || !railData || map.getSource('rail-lines')) return;
+  map.addSource('rail-lines', { type: 'geojson', data: railData.lines });
+  map.addSource('rail-stations', { type: 'geojson', data: railData.stations });
+  map.addLayer({
+    id: 'rail-line',
+    type: 'line',
+    source: 'rail-lines',
+    minzoom: 10,
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color': ['get', 'color'],
+      'line-width': ['interpolate', ['linear'], ['zoom'], 10, 1, 14, 2.5],
+      'line-opacity': 0.85,
+    },
+  });
+  map.addLayer({
+    id: 'rail-station-circle',
+    type: 'circle',
+    source: 'rail-stations',
+    minzoom: 12,
+    layout: { 'circle-sort-key': ['get', 'p'] },
+    paint: {
+      'circle-pitch-alignment': 'map',
+      'circle-radius': ['case', ['>=', ['get', 'p'], 3], 4.5, ['==', ['get', 'p'], 2], 4, 3],
+      'circle-color': boundaryTextColor(),
+      'circle-stroke-color': boundaryTextHalo(),
+      'circle-stroke-width': 1,
+    },
+  });
+  // Interchange names appear first; plain stations only once zoomed further in.
+  map.addLayer({
+    id: 'rail-station-label-interchange',
+    type: 'symbol',
+    source: 'rail-stations',
+    minzoom: 13,
+    filter: ['>=', ['get', 'p'], 2],
+    layout: {
+      'text-field': ['get', 'name'],
+      'text-font': ['Noto Sans Bold'],
+      'text-size': 10,
+      'text-anchor': 'top',
+      'text-offset': [0, 1],
+      'symbol-sort-key': ['get', 'p'],
+    },
+    paint: {
+      'text-color': boundaryTextColor(),
+      'text-halo-color': boundaryTextHalo(),
+      'text-halo-width': 2,
+    },
+  });
+  map.addLayer({
+    id: 'rail-station-label',
+    type: 'symbol',
+    source: 'rail-stations',
+    minzoom: 14,
+    filter: ['<', ['get', 'p'], 2],
+    layout: {
+      'text-field': ['get', 'name'],
+      'text-font': ['Noto Sans Regular'],
+      'text-size': 10,
+      'text-anchor': 'top',
+      'text-offset': [0, 1],
+    },
+    paint: {
+      'text-color': boundaryTextColor(),
+      'text-halo-color': boundaryTextHalo(),
+      'text-halo-width': 2,
+    },
+  });
+  // Rail is usually fetched after style.load, so place labels need re-raising above it.
+  raisePlaceLabels();
 }
 
 function mercatorY(lat) {
