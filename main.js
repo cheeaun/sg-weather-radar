@@ -1095,6 +1095,7 @@ const CLIP_SOURCE = { 480: 240, 240: 70 };
 const frameImageCache = new Map();
 const FRAME_CACHE_MAX = 24;
 const radarShownKey = new Map();
+const radarPendingKey = new Map();
 
 function bbCoordinatesOf(bb) {
   return [
@@ -1102,6 +1103,16 @@ function bbCoordinatesOf(bb) {
     [bb.lowerRight.longitude, bb.upperLeft.latitude],
     [bb.lowerRight.longitude, bb.lowerRight.latitude],
     [bb.upperLeft.longitude, bb.lowerRight.latitude],
+  ];
+}
+
+function boxRing(bb) {
+  return [
+    [bb.upperLeft.longitude, bb.upperLeft.latitude],
+    [bb.lowerRight.longitude, bb.upperLeft.latitude],
+    [bb.lowerRight.longitude, bb.lowerRight.latitude],
+    [bb.upperLeft.longitude, bb.lowerRight.latitude],
+    [bb.upperLeft.longitude, bb.upperLeft.latitude],
   ];
 }
 
@@ -1401,35 +1412,40 @@ function prepareFrameImage(range, frame) {
 function applyRadarFrame(range, frame) {
   const source = map && styleReady && map.getSource(`radar-${range}`);
   if (!source) return;
-  if (!frame || failedImages.has(frame.url)) {
+  const layerId = `radar-${range}`;
+  const hide = () => {
     radarShownKey.delete(range);
-    map.setLayoutProperty(`radar-${range}`, 'visibility', 'none');
+    radarPendingKey.delete(range);
+    if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
+    updateBoundaryAvailability();
+  };
+  if (!frame || failedImages.has(frame.url)) {
+    hide();
     return;
   }
-  map.setLayoutProperty(`radar-${range}`, 'visibility', 'visible');
+  map.setLayoutProperty(layerId, 'visibility', 'visible');
   source.setCoordinates(bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]));
   const key = frameImageKey(frame, clipBoundaries);
-  if (radarShownKey.get(range) === key) return;
-  radarShownKey.set(range, key);
+  if (radarShownKey.get(range) === key) {
+    if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'visible');
+    return;
+  }
+  radarPendingKey.set(range, key);
   setBusy(true);
   prepareFrameImage(range, frame)
     .then((canvas) => {
       const src = styleReady && map.getSource(`radar-${range}`);
-      if (!src || radarShownKey.get(range) !== key) return;
+      if (!src || radarPendingKey.get(range) !== key) return;
       src.updateImage({ image: canvas });
+      radarShownKey.set(range, key);
+      updateBoundaryAvailability();
     })
     .catch(() => {
       if (!failedImages.has(frame.url)) {
         failedImages.add(frame.url);
         renderTicks();
-        updateBoundaryAvailability();
       }
-      if (radarShownKey.get(range) === key) {
-        radarShownKey.delete(range);
-        if (map.getLayer(`radar-${range}`)) {
-          map.setLayoutProperty(`radar-${range}`, 'visibility', 'none');
-        }
-      }
+      if (radarPendingKey.get(range) === key) hide();
     })
     .finally(() => setBusy(false));
 }
@@ -1539,6 +1555,56 @@ function ensureRangeShapes() {
   return Promise.all([...shapeImagePromises.values()]);
 }
 
+// Diagonal hatched fill for radar areas that are not (yet) rendered. Tiled at 45°,
+// white in light mode / black in dark mode, matching the requested placeholder look.
+const STRIPE_PATTERN_SIZE = 8;
+const STRIPE_WIDTH = 0.5;
+const STRIPE_COLORS = { light: '#ffffff', dark: '#000000' };
+
+function buildStripeImageData(color) {
+  const N = STRIPE_PATTERN_SIZE;
+  // Supersample so sub-pixel stripe widths antialias (a plain fillRect below 1px just
+  // snaps back to hard 1px lines); downscale keeps the 45° pattern seamless.
+  const S = 4;
+  const tmp = document.createElement('canvas');
+  tmp.width = N * S;
+  tmp.height = N * S;
+  const tctx = tmp.getContext('2d');
+  tctx.fillStyle = color;
+  for (let y = 0; y < N * S; y++) {
+    for (let x = 0; x < N * S; x++) {
+      // (x+y) mod period tiles seamlessly in both axes at 45°.
+      if ((x + y) % (N * S) < STRIPE_WIDTH * S) tctx.fillRect(x, y, 1, 1);
+    }
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = N;
+  canvas.height = N;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(tmp, 0, 0, N * S, N * S, 0, 0, N, N);
+  return ctx.getImageData(0, 0, N, N);
+}
+
+const stripeImagePromises = new Map();
+
+function ensureStripeImages() {
+  for (const variant of Object.keys(STRIPE_COLORS)) {
+    const name = `radar-stripe-${variant}`;
+    if (map.hasImage(name)) continue;
+    const p = Promise.resolve().then(() => {
+      const imageData = buildStripeImageData(STRIPE_COLORS[variant]);
+      if (imageData && !map.hasImage(name)) {
+        try {
+          map.addImage(name, imageData);
+        } catch (e) {}
+      }
+    });
+    stripeImagePromises.set(name, p);
+  }
+  return Promise.all([...stripeImagePromises.values()]);
+}
+
 function circlePolygon(lon, lat, radiusKm, steps = 180) {
   const coords = [];
   const rad = Math.PI / 180;
@@ -1621,93 +1687,158 @@ function addBoundaryLayers() {
     updateBoundaryAvailability();
     return;
   }
-  ensureRangeShapes().then(() => {
-    if (!map || map.getSource('radar-boundaries')) return;
-    map.addSource('radar-boundaries', {
-      type: 'geojson',
-      data: { type: 'FeatureCollection', features },
-    });
-    const BOUNDARY_DASHES = { 70: [1, 2], 240: [2, 3], 480: [4, 5] };
-    for (const range of RANGES) {
+  ensureRangeShapes()
+    .then(() => ensureStripeImages())
+    .then(() => {
+      if (!map || map.getSource('radar-boundaries')) return;
+      map.addSource('radar-boundaries', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features },
+      });
+      map.addSource('radar-stripe', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: stripeFeatures(computeAvailability()) },
+      });
+      map.addLayer(
+        {
+          id: 'radar-boundary-stripe',
+          type: 'fill',
+          source: 'radar-stripe',
+          paint: {
+            'fill-pattern': `radar-stripe-${resolvedTheme()}`,
+            'fill-opacity': 1,
+          },
+        },
+        map.getLayer('wind-layer') ? 'wind-layer' : undefined,
+      );
+      const BOUNDARY_DASHES = { 70: [1, 2], 240: [2, 3], 480: [4, 5] };
+      for (const range of RANGES) {
+        map.addLayer({
+          id: `radar-boundary-line-${range}`,
+          type: 'line',
+          source: 'radar-boundaries',
+          filter: ['==', ['get', 'range'], range],
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: {
+            'line-color': boundaryOutlineColor(),
+            'line-width': 1.5,
+            'line-dasharray': BOUNDARY_DASHES[range],
+            'line-opacity': ['case', ['boolean', ['feature-state', 'available'], true], 1, 0.25],
+          },
+        });
+      }
+      map.addSource('radar-boundary-circles', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: circleFeatures },
+      });
+      for (const range of RANGES) {
+        map.addLayer({
+          id: `radar-boundary-circle-${range}`,
+          type: 'line',
+          source: 'radar-boundary-circles',
+          filter: ['==', ['get', 'range'], range],
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: {
+            'line-color': boundaryOutlineColor(),
+            'line-width': 1.5,
+            'line-dasharray': BOUNDARY_DASHES[range],
+            'line-opacity': ['case', ['boolean', ['feature-state', 'available'], true], 0.5, 0.125],
+          },
+        });
+      }
+      map.addSource('radar-boundary-labels', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: labelFeatures },
+      });
       map.addLayer({
-        id: `radar-boundary-line-${range}`,
-        type: 'line',
-        source: 'radar-boundaries',
-        filter: ['==', ['get', 'range'], range],
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        id: 'radar-boundary-label',
+        type: 'symbol',
+        source: 'radar-boundary-labels',
+        layout: {
+          'text-field': [
+            'format',
+            ['image', ['concat', `radar-shape-${resolvedTheme()}-`, ['get', 'range']]],
+            {},
+            ' ',
+            {},
+            ['get', 'label'],
+            {},
+          ],
+          'text-font': ['Noto Sans Bold'],
+          'text-size': 11,
+          'text-anchor': 'center',
+          'text-offset': [0, 0.9],
+          'text-allow-overlap': true,
+        },
         paint: {
-          'line-color': boundaryOutlineColor(),
-          'line-width': 1.5,
-          'line-dasharray': BOUNDARY_DASHES[range],
-          'line-opacity': ['case', ['boolean', ['feature-state', 'available'], true], 1, 0.25],
+          'text-color': boundaryTextColor(),
+          'text-halo-color': boundaryTextHalo(),
+          'text-halo-width': 2.5,
+          'text-opacity': ['case', ['boolean', ['feature-state', 'available'], true], 1, 0.25],
         },
       });
-    }
-    map.addSource('radar-boundary-circles', {
-      type: 'geojson',
-      data: { type: 'FeatureCollection', features: circleFeatures },
+      updateBoundaryAvailability();
     });
-    for (const range of RANGES) {
-      map.addLayer({
-        id: `radar-boundary-circle-${range}`,
-        type: 'line',
-        source: 'radar-boundary-circles',
-        filter: ['==', ['get', 'range'], range],
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: {
-          'line-color': boundaryOutlineColor(),
-          'line-width': 1.5,
-          'line-dasharray': BOUNDARY_DASHES[range],
-          'line-opacity': ['case', ['boolean', ['feature-state', 'available'], true], 0.5, 0.125],
-        },
-      });
-    }
-    map.addSource('radar-boundary-labels', {
-      type: 'geojson',
-      data: { type: 'FeatureCollection', features: labelFeatures },
+}
+
+function computeAvailability() {
+  const slotMs = allTimestamps.length ? new Date(allTimestamps[currentIndex]).getTime() : null;
+  const available = {};
+  for (const range of RANGES) {
+    const frame = slotMs !== null ? framesMap[range]?.get(slotMs) : null;
+    // Available only once the frame's image is actually rendered (not merely fetched),
+    // so the striped placeholder stays visible through the loading window.
+    available[range] = Boolean(
+      frame &&
+      !failedImages.has(frame.url) &&
+      radarShownKey.get(range) === frameImageKey(frame, clipBoundaries),
+    );
+  }
+  return available;
+}
+
+// Stripe polygons get a punch-hole for each loaded inner range, mirroring the raster clip:
+// a range's placeholder must never paint hatch over a smaller range whose frame is rendered,
+// so the loaded rain stays visible (e.g. 70km shown while 240/480 are still loading).
+function stripeFeatures(available) {
+  const features = [];
+  for (const range of RANGES) {
+    if (available[range]) continue;
+    const bb = boundaryBoxes[range] || RADAR_BOUNDS[range];
+    const availInners = RANGES.filter((r) => r < range && available[r]);
+    // Nested holes are invalid in GeoJSON; since the ranges nest, only the outermost
+    // available inner box(es) are needed — smaller ones are already inside them.
+    const holes = availInners
+      .filter((r) => !availInners.some((bigger) => bigger > r))
+      .map((r) => boxRing(boundaryBoxes[r] || RADAR_BOUNDS[r]));
+    features.push({
+      type: 'Feature',
+      id: range,
+      properties: { range },
+      geometry: { type: 'Polygon', coordinates: [boxRing(bb), ...holes] },
     });
-    map.addLayer({
-      id: 'radar-boundary-label',
-      type: 'symbol',
-      source: 'radar-boundary-labels',
-      layout: {
-        'text-field': [
-          'format',
-          ['image', ['concat', `radar-shape-${resolvedTheme()}-`, ['get', 'range']]],
-          {},
-          ' ',
-          {},
-          ['get', 'label'],
-          {},
-        ],
-        'text-font': ['Noto Sans Bold'],
-        'text-size': 11,
-        'text-anchor': 'center',
-        'text-offset': [0, 0.9],
-        'text-allow-overlap': true,
-      },
-      paint: {
-        'text-color': boundaryTextColor(),
-        'text-halo-color': boundaryTextHalo(),
-        'text-halo-width': 2.5,
-        'text-opacity': ['case', ['boolean', ['feature-state', 'available'], true], 1, 0.25],
-      },
-    });
-    updateBoundaryAvailability();
-  });
+  }
+  return features;
 }
 
 function updateBoundaryAvailability() {
   if (!map || !map.getSource('radar-boundaries') || !map.getSource('radar-boundary-labels')) return;
-  const slotMs = allTimestamps.length ? new Date(allTimestamps[currentIndex]).getTime() : null;
+  const available = computeAvailability();
   for (const range of RANGES) {
-    const frame = slotMs !== null ? framesMap[range]?.get(slotMs) : null;
-    const available = Boolean(frame && !failedImages.has(frame.url));
-    map.setFeatureState({ source: 'radar-boundaries', id: range }, { available });
-    map.setFeatureState({ source: 'radar-boundary-labels', id: range }, { available });
+    map.setFeatureState({ source: 'radar-boundaries', id: range }, { available: available[range] });
+    map.setFeatureState(
+      { source: 'radar-boundary-labels', id: range },
+      { available: available[range] },
+    );
     if (map.getSource('radar-boundary-circles'))
-      map.setFeatureState({ source: 'radar-boundary-circles', id: range }, { available });
+      map.setFeatureState(
+        { source: 'radar-boundary-circles', id: range },
+        { available: available[range] },
+      );
   }
+  const stripeSource = map.getSource('radar-stripe');
+  if (stripeSource)
+    stripeSource.setData({ type: 'FeatureCollection', features: stripeFeatures(available) });
 }
 
 const LIGHTNING_BOLT_PATH = 'M13 2 3 14h7l-2 8 11-13h-7l1-7Z';
