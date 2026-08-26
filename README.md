@@ -6,7 +6,7 @@ Real-time Singapore rainfall radar on a MapLibre GL map, powered by [NEA data vi
 
 Runs as a single Cloudflare Worker: the site is served as static assets and `/api/*` requests are proxied server-side so the data.gov.sg API key is never exposed to the browser. Built with the [Cloudflare Vite plugin](https://developers.cloudflare.com/workers/vite-plugin/).
 
-![SG Weather Radar on mobile](screenshot-1.jpg) ![SG Weather Radar on mobile](screenshot-2.jpg)
+<img src="screenshot-1.jpg" alt="SG Weather Radar on mobile" width="320" /> <img src="screenshot-2.jpg" alt="SG Weather Radar on mobile" width="320" />
 
 ## Features
 
