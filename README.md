@@ -10,9 +10,10 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 
 - Radar imagery composited from three ranges (70 km, 240 km, 480 km) centered on Singapore
 - Time scrubber over the past hour of radar frames
-- Auto-refresh every 2 minutes with countdown indicator
+- Auto-refresh aligned to 5-minute feed slots: polls every 30s until a slot's data is complete, then idles until the next slot (pausing when hidden)
+- MRT/LRT lines and stations overlay
 - Optional cloud-to-ground lightning overlay
-- Optional wind particle animation driven by station wind readings
+- Optional (off by default) wind particle animation driven by station wind readings
 - System / light / dark themes with matching map styles
 - Adjustable radar opacity and boundary clipping
 - Geolocate and navigation controls
@@ -23,6 +24,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Radar images: [NEA Weather Radar Images API](https://data.gov.sg/datasets/d_418e9ac3414fd927b7405631e0a7bc82/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Lightning: [NEA Lightning API](https://data.gov.sg/datasets/d_08238953fe0f6dd13f10714ebfbcb9f9/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Wind speed & direction: [NEA Wind Speed API](https://data.gov.sg/datasets/d_7677738484067741bf3b56ab5d69c7e9/view) / [NEA Wind Direction API](https://data.gov.sg/datasets/d_534cf203023b51f51f879145ccc56ff9/view) via `api-open.data.gov.sg` (proxied through the Worker)
+- Rail lines & stations: [cheeaun/sgraildata](https://github.com/cheeaun/sgraildata), compiled to `rail.json` by `scripts/build-rail-data.mjs` and bundled with the app
 - Map tiles: [OpenFreeMap](https://openfreemap.org)
 
 Data from data.gov.sg is covered by the [Singapore Open Data Licence](https://data.gov.sg/open-data-licence).
@@ -75,6 +77,16 @@ Pushing to `main` (or running the [Deploy](.github/workflows/deploy.yml) workflo
 npm run build    # outputs to dist/
 npm run preview  # runs the build in the Workers runtime locally
 ```
+
+## Rail data
+
+The bundled `rail.json` (MRT/LRT lines + stations) is generated from `data/sg-rail.geojson` ([cheeaun/sgraildata](https://github.com/cheeaun/sgraildata)) — coordinates are delta-encoded and simplified to keep the bundle small:
+
+```sh
+node scripts/build-rail-data.mjs
+```
+
+Only rerun this when updating the underlying rail dataset.
 
 ## Icons
 
