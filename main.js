@@ -1055,7 +1055,8 @@ function renderTicks(newSlots) {
       shape.className = 'tick-shape';
       shape.innerHTML = rangeShapeSVG(range);
       const frame = framesMap[range]?.get(slotMs);
-      if (frame && !failedImages.has(frame.url)) shape.classList.add('on');
+      if (frame && !failedImages.has(frameImageKey(range, frame, clipBoundaries)))
+        shape.classList.add('on');
       col.appendChild(shape);
     }
     if (newSlots && newSlots.has(slotMs)) col.classList.add('new');
@@ -1387,12 +1388,15 @@ function buildRadarCanvas(range, frame, clip) {
   );
 }
 
-function frameImageKey(frame, clip) {
-  return clip ? `${frame.url}#clip` : frame.url;
+// S3 re-signs the image URL on every API fetch even for a timestamp already rendered, so
+// identity must be range+timestamp, not the (ever-changing) signed URL, or already-shown
+// frames get treated as new/not-yet-available on every refresh.
+function frameImageKey(range, frame, clip) {
+  return `${range}:${frame.timestamp}${clip ? '#clip' : ''}`;
 }
 
 function prepareFrameImage(range, frame) {
-  const key = frameImageKey(frame, clipBoundaries);
+  const key = frameImageKey(range, frame, clipBoundaries);
   let promise = frameImageCache.get(key);
   if (!promise) {
     promise = buildRadarCanvas(range, frame, clipBoundaries).catch((e) => {
@@ -1419,13 +1423,13 @@ function applyRadarFrame(range, frame) {
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
     updateBoundaryAvailability();
   };
-  if (!frame || failedImages.has(frame.url)) {
+  const key = frame && frameImageKey(range, frame, clipBoundaries);
+  if (!frame || failedImages.has(key)) {
     hide();
     return;
   }
   map.setLayoutProperty(layerId, 'visibility', 'visible');
   source.setCoordinates(bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]));
-  const key = frameImageKey(frame, clipBoundaries);
   if (radarShownKey.get(range) === key) {
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'visible');
     return;
@@ -1441,8 +1445,8 @@ function applyRadarFrame(range, frame) {
       updateBoundaryAvailability();
     })
     .catch(() => {
-      if (!failedImages.has(frame.url)) {
-        failedImages.add(frame.url);
+      if (!failedImages.has(key)) {
+        failedImages.add(key);
         renderTicks();
       }
       if (radarPendingKey.get(range) === key) hide();
@@ -1786,13 +1790,10 @@ function computeAvailability() {
   const available = {};
   for (const range of RANGES) {
     const frame = slotMs !== null ? framesMap[range]?.get(slotMs) : null;
+    const key = frame && frameImageKey(range, frame, clipBoundaries);
     // Available only once the frame's image is actually rendered (not merely fetched),
     // so the striped placeholder stays visible through the loading window.
-    available[range] = Boolean(
-      frame &&
-      !failedImages.has(frame.url) &&
-      radarShownKey.get(range) === frameImageKey(frame, clipBoundaries),
-    );
+    available[range] = Boolean(frame && !failedImages.has(key) && radarShownKey.get(range) === key);
   }
   return available;
 }
@@ -2496,7 +2497,7 @@ function prefetchFrames(index) {
     const slotMs = new Date(allTimestamps[i]).getTime();
     for (const range of RANGES) {
       const frame = framesMap[range]?.get(slotMs);
-      if (!frame || failedImages.has(frame.url)) continue;
+      if (!frame || failedImages.has(frameImageKey(range, frame, clipBoundaries))) continue;
       prepareFrameImage(range, frame).catch(() => {});
     }
   }
