@@ -1055,8 +1055,7 @@ function renderTicks(newSlots) {
       shape.className = 'tick-shape';
       shape.innerHTML = rangeShapeSVG(range);
       const frame = framesMap[range]?.get(slotMs);
-      if (frame && !failedImages.has(frameImageKey(range, frame, clipBoundaries)))
-        shape.classList.add('on');
+      if (frame && !failedImages.has(frame.url)) shape.classList.add('on');
       col.appendChild(shape);
     }
     if (newSlots && newSlots.has(slotMs)) col.classList.add('new');
@@ -1424,7 +1423,9 @@ function applyRadarFrame(range, frame) {
     updateBoundaryAvailability();
   };
   const key = frame && frameImageKey(range, frame, clipBoundaries);
-  if (!frame || failedImages.has(key)) {
+  // Only the exact signed URL is failed; a re-signed URL for the same timestamp is retried,
+  // else stale cached API data (expired S3 URLs) poisons a whole range until the next refresh.
+  if (!frame || failedImages.has(frame.url)) {
     hide();
     return;
   }
@@ -1445,8 +1446,8 @@ function applyRadarFrame(range, frame) {
       updateBoundaryAvailability();
     })
     .catch(() => {
-      if (!failedImages.has(key)) {
-        failedImages.add(key);
+      if (!failedImages.has(frame.url)) {
+        failedImages.add(frame.url);
         renderTicks();
       }
       if (radarPendingKey.get(range) === key) hide();
@@ -1793,7 +1794,9 @@ function computeAvailability() {
     const key = frame && frameImageKey(range, frame, clipBoundaries);
     // Available only once the frame's image is actually rendered (not merely fetched),
     // so the striped placeholder stays visible through the loading window.
-    available[range] = Boolean(frame && !failedImages.has(key) && radarShownKey.get(range) === key);
+    available[range] = Boolean(
+      frame && !failedImages.has(frame.url) && radarShownKey.get(range) === key,
+    );
   }
   return available;
 }
@@ -2497,7 +2500,7 @@ function prefetchFrames(index) {
     const slotMs = new Date(allTimestamps[i]).getTime();
     for (const range of RANGES) {
       const frame = framesMap[range]?.get(slotMs);
-      if (!frame || failedImages.has(frameImageKey(range, frame, clipBoundaries))) continue;
+      if (!frame || failedImages.has(frame.url)) continue;
       prepareFrameImage(range, frame).catch(() => {});
     }
   }
