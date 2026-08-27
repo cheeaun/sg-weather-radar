@@ -323,6 +323,9 @@ body {
   .scan-time.flash {
     animation: none;
   }
+  .rain-summary {
+    transition: none;
+  }
   .toast {
     transition: none;
   }
@@ -765,6 +768,27 @@ body {
 }
 .scan-time.flash {
   animation: scan-time-flash 1.2s cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+
+.rain-summary {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  margin-bottom: -4px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+  transition:
+    max-height 0.35s cubic-bezier(0.32, 0.72, 0, 1),
+    opacity 0.35s cubic-bezier(0.32, 0.72, 0, 1),
+    margin-bottom 0.35s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.rain-summary.show {
+  max-height: 2em;
+  opacity: 1;
+  margin-bottom: 0;
 }
 
 #time-slider {

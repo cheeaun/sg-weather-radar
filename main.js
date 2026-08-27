@@ -5,6 +5,7 @@ import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 // scripts/build-rail-data.mjs (delta-encoded int coords at 1e-5 deg). Imported
 // so Vite bundles it under a content hash like the rest of the assets.
 import railRaw from './rail.json';
+import SINGAPORE_PLACES from './places.json';
 
 maplibregl.setWorkerUrl(workerUrl);
 const API_BASE = '/api';
@@ -2502,6 +2503,240 @@ function showFrame(index) {
   prefetchFrames(index);
 
   updateSliderUI(index);
+  updateRainSummary();
+}
+
+// One-line "where is it raining" summary sampled from the 70km radar canvas.
+// Places are NEA-style forecast regions, so many hits collapse to region terms.
+const REGION_LABELS = {
+  north: 'the north',
+  'north-east': 'the north-east',
+  east: 'the east',
+  west: 'the west',
+  south: 'the south',
+  central: 'the central area',
+};
+const SAMPLE_WINDOW_PX = 8;
+const NEARBY_WINDOW_PX = 24;
+const MIN_RAINY_PIXELS = 3;
+const MIN_NEARBY_PIXELS = 5;
+const EARTH_RADIUS_KM = 6371;
+const LEVEL_WORDS = { 1: 'Light', 2: 'Moderate', 3: 'Heavy' };
+
+// The scale bar in the masthead is the palette the radar images are quantized to;
+// map a pixel back to its position on that ramp to classify intensity.
+let radarScaleStopsCache = null;
+function radarScaleStops() {
+  if (radarScaleStopsCache) return radarScaleStopsCache;
+  const bg = getComputedStyle(document.querySelector('.scale-gradient')).backgroundImage;
+  const stops = [];
+  const re = /rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)[^)]*\)\s+([\d.]+)%/g;
+  let m;
+  while ((m = re.exec(bg))) {
+    stops.push([parseFloat(m[4]) / 100, [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3])]]);
+  }
+  radarScaleStopsCache = stops;
+  return stops;
+}
+
+const rainLevelCache = new Map();
+function rainLevelForColor(r, g, b) {
+  const key = (r << 16) | (g << 8) | b;
+  if (rainLevelCache.has(key)) return rainLevelCache.get(key);
+  let level = 0;
+  // Rain palette colors are fully saturated; background/land pixels are near-grey.
+  const sat = Math.max(r, g, b) - Math.min(r, g, b);
+  if (sat >= 40) {
+    let best = Infinity;
+    let t = 0;
+    for (const [stop, [sr, sg, sb]] of radarScaleStops()) {
+      const dr = r - sr;
+      const dg = g - sg;
+      const db = b - sb;
+      const d = dr * dr + dg * dg + db * db;
+      if (d < best) {
+        best = d;
+        t = stop;
+      }
+    }
+    // Green = light, yellow = moderate, orange/red/magenta = heavy.
+    if (t >= 0.667) level = 3;
+    else if (t >= 0.485) level = 2;
+    else if (t >= 0.394) level = 1;
+  }
+  rainLevelCache.set(key, level);
+  return level;
+}
+
+function countLevelsInArea(ctx, x, y, w, h, cx, cy, radius) {
+  // Sample a circular area by skipping pixels outside the radius from the center.
+  const counts = [0, 0, 0, 0];
+  const data = ctx.getImageData(x, y, w, h).data;
+  const r2 = radius * radius;
+  for (let py = 0; py < h; py++) {
+    const dy = y + py - cy;
+    for (let px = 0; px < w; px++) {
+      const dx = x + px - cx;
+      if (dx * dx + dy * dy > r2) continue;
+      const i = (py * w + px) * 4;
+      counts[rainLevelForColor(data[i], data[i + 1], data[i + 2])]++;
+    }
+  }
+  return counts;
+}
+
+function highestLevelWithMin(counts, min) {
+  for (let l = 3; l >= 1; l--) {
+    if (counts[l] >= min) return l;
+  }
+  return 0;
+}
+
+function analyzeRadar(canvas, bb) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  const lonSpan = bb.lowerRight.longitude - bb.upperLeft.longitude;
+  const yTop = mercatorY(bb.upperLeft.latitude);
+  const yBot = mercatorY(bb.lowerRight.latitude);
+  const immediate = [];
+  const nearby = [];
+  for (const place of SINGAPORE_PLACES) {
+    const radius = place.radius || 2;
+    // Convert km radius to pixel radius; pixels are wider than tall in Mercator so use both axes.
+    const rx = (radius / (lonSpan * EARTH_RADIUS_KM * Math.cos((place.lat * Math.PI) / 180))) * W;
+    const ry = (radius / ((yTop - yBot) * EARTH_RADIUS_KM)) * H;
+    const rPx = Math.max(2, Math.max(rx, ry));
+    const cx = ((place.lng - bb.upperLeft.longitude) / lonSpan) * W;
+    const cy = ((mercatorY(place.lat) - yTop) / (yBot - yTop)) * H;
+    // Scale threshold with area: larger places need more rainy pixels.
+    const areaThreshold = Math.max(3, Math.round(3 * (radius / 2) ** 2));
+    const ix0 = Math.max(0, Math.floor(cx - rPx));
+    const ix1 = Math.min(W - 1, Math.ceil(cx + rPx));
+    const iy0 = Math.max(0, Math.floor(cy - rPx));
+    const iy1 = Math.min(H - 1, Math.ceil(cy + rPx));
+    const inner = highestLevelWithMin(
+      countLevelsInArea(ctx, ix0, iy0, ix1 - ix0 + 1, iy1 - iy0 + 1, cx, cy, rPx),
+      areaThreshold,
+    );
+    if (inner) {
+      immediate.push({ name: place.name, region: place.region, level: inner });
+      continue;
+    }
+    // Nearby uses a fixed 7km bubble regardless of place size.
+    const nearbyRx = (7 / (lonSpan * EARTH_RADIUS_KM * Math.cos((place.lat * Math.PI) / 180))) * W;
+    const nearbyRy = (7 / ((yTop - yBot) * EARTH_RADIUS_KM)) * H;
+    const nPx = Math.max(6, Math.max(nearbyRx, nearbyRy));
+    const ox0 = Math.max(0, Math.floor(cx - nPx));
+    const ox1 = Math.min(W - 1, Math.ceil(cx + nPx));
+    const oy0 = Math.max(0, Math.floor(cy - nPx));
+    const oy1 = Math.min(H - 1, Math.ceil(cy + nPx));
+    const outer = highestLevelWithMin(
+      countLevelsInArea(ctx, ox0, oy0, ox1 - ox0 + 1, oy1 - oy0 + 1, cx, cy, nPx),
+      MIN_NEARBY_PIXELS,
+    );
+    if (outer) nearby.push({ name: place.name, region: place.region, level: outer });
+  }
+  return { immediate, nearby };
+}
+
+function joinList(items) {
+  if (items.length === 1) return items[0];
+  return `${items.slice(0, -1).join(', ')} & ${items[items.length - 1]}`;
+}
+
+function summarizeRain(hits) {
+  const maxLevel = Math.max(...hits.map((h) => h.level));
+  const places = hits.filter((h) => h.level === maxLevel);
+  const word = LEVEL_WORDS[maxLevel];
+  const regionCount = {};
+  for (const p of places) regionCount[p.region] = (regionCount[p.region] || 0) + 1;
+  const regions = Object.keys(regionCount).filter((r) => regionCount[r] >= 3);
+  const named = places.filter((p) => regionCount[p.region] < 3).map((p) => p.name);
+  if (places.length >= Math.ceil(SINGAPORE_PLACES.length / 2) || regions.length >= 4) {
+    return `${word} rain across the island`;
+  }
+  const parts = [];
+  if (regions.length) {
+    if (regions.length === 1) {
+      parts.push(`in ${REGION_LABELS[regions[0]]}`);
+    } else {
+      const labels = regions.map((r) => REGION_LABELS[r].replace(/^the /, ''));
+      parts.push(`across the ${joinList(labels)}`);
+    }
+  }
+  // Keep name-only summaries specific, but don't append long outlier lists to region summaries.
+  if (named.length) {
+    if (!regions.length) {
+      const names =
+        named.length > 5 ? named.slice(0, 4).concat([`${named.length - 4} others`]) : named;
+      parts.push(`around ${joinList(names)}`);
+    } else if (regions.length === 1 && named.length <= 2) {
+      parts.push(`around ${joinList(named)}`);
+    }
+  }
+  return `${word} rain ${parts.join(' & ')}`;
+}
+
+function summarizeNearby(hits) {
+  const maxLevel = Math.max(...hits.map((h) => h.level));
+  const places = hits.filter((h) => h.level === maxLevel);
+  const regionCount = {};
+  for (const p of places) regionCount[p.region] = (regionCount[p.region] || 0) + 1;
+  const regions = Object.keys(regionCount).filter((r) => regionCount[r] >= 3);
+  const named = places.filter((p) => regionCount[p.region] < 3).map((p) => p.name);
+  if (places.length >= Math.ceil(SINGAPORE_PLACES.length / 2) || regions.length >= 4) {
+    return 'Nearby rain…';
+  }
+  const parts = [];
+  if (regions.length) {
+    if (regions.length === 1) {
+      parts.push(`in ${REGION_LABELS[regions[0]]}`);
+    } else {
+      const labels = regions.map((r) => REGION_LABELS[r].replace(/^the /, ''));
+      parts.push(`across the ${joinList(labels)}`);
+    }
+  }
+  if (named.length && !regions.length) {
+    const names =
+      named.length > 5 ? named.slice(0, 4).concat([`${named.length - 4} others`]) : named;
+    parts.push(`around ${joinList(names)}`);
+  }
+  return parts.length ? `Nearby rain ${parts.join(' & ')}` : 'Nearby rain…';
+}
+
+let summaryRequest = 0;
+let summaryShownKey = null;
+
+function updateRainSummary() {
+  const el = document.getElementById('rain-summary');
+  const ts = allTimestamps[currentIndex] ? new Date(allTimestamps[currentIndex]).getTime() : null;
+  const frame = ts != null ? framesMap[70]?.get(ts) : null;
+  const key =
+    frame && !failedImages.has(frame.url) ? frameImageKey(70, frame, clipBoundaries) : null;
+  if (key === summaryShownKey) return;
+  const req = ++summaryRequest;
+  if (!key) {
+    summaryShownKey = null;
+    el.textContent = '';
+    el.classList.remove('show');
+    return;
+  }
+  const promise = frameImageCache.get(key) || prepareFrameImage(70, frame);
+  promise
+    .then((canvas) => {
+      if (req !== summaryRequest) return;
+      summaryShownKey = key;
+      const { immediate, nearby } = analyzeRadar(canvas, boundaryBoxes[70] || RADAR_BOUNDS[70]);
+      const text = immediate.length
+        ? summarizeRain(immediate)
+        : nearby.length
+          ? summarizeNearby(nearby)
+          : null;
+      el.textContent = text || '';
+      el.classList.toggle('show', !!text);
+    })
+    .catch(() => {});
 }
 
 const timeSlider = document.getElementById('time-slider');
