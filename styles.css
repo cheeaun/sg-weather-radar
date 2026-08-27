@@ -276,8 +276,8 @@ body {
 .panel {
   pointer-events: auto;
   background: var(--paper);
-  backdrop-filter: blur(5px);
   -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
   border: 1px solid var(--line);
   border-radius: 12px;
   box-shadow: var(--shadow);
@@ -334,8 +334,8 @@ body {
 .settings-btn {
   pointer-events: auto;
   background: var(--paper);
-  backdrop-filter: blur(5px);
   -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
   border: 1px solid var(--line);
   border-radius: 50%;
   box-shadow: var(--shadow);
