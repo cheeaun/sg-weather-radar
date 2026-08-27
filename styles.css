@@ -798,10 +798,11 @@ body {
 
 .slider-ticks {
   position: relative;
-  height: 32px;
+  z-index: 1;
+  height: 40px;
   cursor: pointer;
-  margin-bottom: 2px;
-  padding: 0 4px;
+  margin-bottom: -6px;
+  padding: 0 4px 8px;
   display: flex;
   justify-content: space-between;
 }
