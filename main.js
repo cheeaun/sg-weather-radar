@@ -579,20 +579,22 @@ async function httpErrorMessage(res, url) {
   return `${msg} [${url}]`;
 }
 
+// Returns { data, fresh }; fresh means the data came from upstream, so callers must
+// never cache it into a fresh-looking entry when it was actually a stale-cache fallback.
 async function fetchWithRetry(url, cached) {
   for (let attempt = 1; ; attempt++) {
     let res;
     try {
       res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
-      if (res.status === 409 && cached) return cached.data;
-      if (res.ok) return await res.json();
+      if (res.ok) return { data: await res.json(), fresh: true };
+      if (res.status === 409 && cached) return { data: cached.data, fresh: false };
     } catch (e) {
-      if (cached) return cached.data;
+      if (cached) return { data: cached.data, fresh: false };
       if (attempt > FETCH_RETRIES) throw new Error(`${e.message || 'fetch failed'} [${url}]`);
       await delay(FETCH_RETRY_DELAY);
       continue;
     }
-    if (cached) return cached.data;
+    if (cached) return { data: cached.data, fresh: false };
     if (attempt <= FETCH_RETRIES) {
       await delay(FETCH_RETRY_DELAY);
       continue;
@@ -601,15 +603,23 @@ async function fetchWithRetry(url, cached) {
   }
 }
 
-async function fetchJsonCached(url) {
+function isCacheable(json) {
+  // Only envelopes the app itself accepts via assertApiOk may enter the cache.
+  return !!json && json.code === 0;
+}
+
+// Single fetch reader for all API consumers. maxAgeMs is an age budget: within it, cached
+// data short-circuits without touching the network; beyond it the network answers, falling
+// back to stale cache only on failure (which must never be re-stamped as fresh).
+async function apiFetch(url, { maxAgeMs = 0 } = {}) {
   if (inflightFetches.has(url)) return inflightFetches.get(url);
   const promise = (async () => {
     const cached = readApiCache(url);
-    if (cached && Date.now() - cached.cachedAt < API_CACHE_TTL) return cached.data;
+    if (cached && Date.now() - cached.cachedAt < maxAgeMs) return cached.data;
 
-    const json = await fetchWithRetry(url, cached);
-    writeApiCache(url, json);
-    return json;
+    const { data, fresh } = await fetchWithRetry(url, cached);
+    if (fresh && isCacheable(data)) writeApiCache(url, data);
+    return data;
   })();
   inflightFetches.set(url, promise);
   try {
@@ -619,30 +629,16 @@ async function fetchJsonCached(url) {
   }
 }
 
-async function fetchBypassCache(url) {
-  if (inflightFetches.has(url)) return inflightFetches.get(url);
-  const promise = (async () => {
-    const cached = readApiCache(url);
-    const json = await fetchWithRetry(url, cached);
-    writeApiCache(url, json);
-    return json;
-  })();
-  inflightFetches.set(url, promise);
-  try {
-    return await promise;
-  } finally {
-    inflightFetches.delete(url);
-  }
-}
-
-async function fetchDayForRange(range, dateStr, paginationToken, fetchFn = fetchJsonCached) {
+async function fetchDayForRange(range, dateStr, paginationToken, fetchFn) {
   const url = apiURL(`/weather-radar-images/${range}km`, { date: dateStr, paginationToken });
+  // fetchFn is injected rather than defaulted: the cache-only first paint pass in
+  // doFetchRadar substitutes a synchronous reader for the network path.
   const json = await fetchFn(url);
   assertApiOk(json, url);
   return json;
 }
 
-async function fetchLightningDay(dateStr, paginationToken, fetchFn = fetchJsonCached) {
+async function fetchLightningDay(dateStr, paginationToken, fetchFn) {
   const url = apiURL('/weather', { api: 'lightning', date: dateStr, paginationToken });
   const json = await fetchFn(url);
   assertApiOk(json, url);
@@ -688,7 +684,7 @@ async function loadLightningData(fetchFn) {
 
 async function refreshLightning() {
   if (!showLightning || lightningLoading) return;
-  lightningLoading = loadLightningData(fetchJsonCached)
+  lightningLoading = loadLightningData((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
     .then((strikes) => {
       lightningStrikes = strikes;
       renderLightning();
@@ -896,20 +892,6 @@ function mergeRangeResults(rangeResults) {
   showFrame(currentIndex);
 }
 
-function hasNewerRadarData(rangeResults) {
-  let latestNew = 0;
-  for (const range of RANGES) {
-    const frames = rangeResults[range]?.frames || [];
-    if (frames.length)
-      latestNew = Math.max(latestNew, new Date(frames[frames.length - 1].timestamp).getTime());
-  }
-  if (!latestNew) return false;
-  const latestCur = allTimestamps.length
-    ? new Date(allTimestamps[allTimestamps.length - 1]).getTime()
-    : 0;
-  return latestNew > latestCur;
-}
-
 let fetchRadarBusy = false;
 let lastFetchStart = 0;
 
@@ -927,7 +909,8 @@ async function fetchRadar() {
 async function doFetchRadar() {
   setBusy(true);
   let rendered = false;
-  // Cache miss returns an empty success so the best-effort first pass doesn't log errors
+  // Best-effort pass from the session cache so the map paints before the network answers.
+  // Cache miss reads as empty records, so the pass itself never errors out on a cold start.
   const cacheMiss = { code: 0, data: { records: [] } };
   const cacheReader = (url) => readApiCache(url)?.data ?? cacheMiss;
 
@@ -942,18 +925,18 @@ async function doFetchRadar() {
     }
   } catch (e) {}
 
+  // Network pass is strictly fresher than the cache pass, so its result is always applied;
+  // last-known-frame guards in applyRadarData absorb any transient upstream gaps.
   try {
     const [rangeResults, strikes] = await Promise.all([
-      loadRadarData(fetchBypassCache),
+      loadRadarData(apiFetch),
       showLightning
-        ? loadLightningData(fetchBypassCache).catch((e) => {
+        ? loadLightningData(apiFetch).catch((e) => {
             console.error('Lightning fetch error:', e);
           })
         : null,
     ]);
-    if (!rendered || hasNewerRadarData(rangeResults)) {
-      applyRadarData(rangeResults, strikes);
-    }
+    applyRadarData(rangeResults, strikes);
   } catch (e) {
     if (!rendered) {
       console.error('Fetch error:', e);
@@ -996,7 +979,7 @@ async function pollOnce() {
   lastFetchStart = Date.now();
   setBusy(true);
   try {
-    const rangeResults = await loadRadarData(fetchBypassCache, ranges);
+    const rangeResults = await loadRadarData(apiFetch, ranges);
     mergeRangeResults(rangeResults);
   } catch (e) {
     console.error('Poll fetch error:', e);
@@ -1093,7 +1076,9 @@ const RADAR_BLANK_PNG =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=';
 const CLIP_SOURCE = { 480: 240, 240: 70 };
 const frameImageCache = new Map();
-const FRAME_CACHE_MAX = 24;
+// One canvas per range per slot across the whole visible window (+pad), so replay/scrub
+// never evicts a frame it will immediately revisit.
+const FRAME_CACHE_MAX = RANGES.length * Math.ceil((PAST_HOURS * 60 * 60 * 1000) / SLOT_MS + 2);
 const radarShownKey = new Map();
 const radarPendingKey = new Map();
 
@@ -2433,10 +2418,8 @@ async function loadWind() {
     try {
       const speedUrl = apiURL('/wind-speed');
       const dirUrl = apiURL('/wind-direction');
-      const [speedJson, dirJson] = await Promise.all([
-        fetchJsonCached(speedUrl),
-        fetchJsonCached(dirUrl),
-      ]);
+      const agedFetch = (url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL });
+      const [speedJson, dirJson] = await Promise.all([agedFetch(speedUrl), agedFetch(dirUrl)]);
       assertApiOk(speedJson, speedUrl);
       assertApiOk(dirJson, dirUrl);
       const speedByStation = new Map();
