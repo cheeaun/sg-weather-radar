@@ -786,7 +786,7 @@ body {
     margin-bottom 0.35s cubic-bezier(0.32, 0.72, 0, 1);
 }
 .rain-summary.show {
-  max-height: 2em;
+  max-height: 4em;
   opacity: 1;
   margin-bottom: 0;
 }

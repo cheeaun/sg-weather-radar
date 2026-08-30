@@ -11,6 +11,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 ## Features
 
 - Radar imagery composited from three ranges (70 km, 240 km, 480 km) centered on Singapore
+- One-line rain summary (e.g. “Heavy rain in the west”) computed from the 70 km frame, scoped to the Singapore landmass so rain across the causeway in Johor isn’t counted
 - Time scrubber over the past hour of radar frames
 - Auto-refresh aligned to 5-minute feed slots: polls every 30s until a slot's data is complete, then idles until the next slot (pausing when hidden)
 - MRT/LRT lines and stations overlay
@@ -27,6 +28,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Lightning: [NEA Lightning API](https://data.gov.sg/datasets/d_08238953fe0f6dd13f10714ebfbcb9f9/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Wind speed & direction: [NEA Wind Speed API](https://data.gov.sg/datasets/d_7677738484067741bf3b56ab5d69c7e9/view) / [NEA Wind Direction API](https://data.gov.sg/datasets/d_534cf203023b51f51f879145ccc56ff9/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Rail lines & stations: [cheeaun/sgraildata](https://github.com/cheeaun/sgraildata), compiled to `rail.json` by `scripts/build-rail-data.mjs` and bundled with the app
+- Singapore landmass boundary (for the rain summary): [URA Master Plan 2025 Planning Area Boundary (No Sea)](https://data.gov.sg/datasets/d_2cc750190544007400b2cfd5d7f53209/view), compiled into the bundled rain-pixel index by `scripts/build-rain-data.mjs`
 - Map tiles: [OpenFreeMap](https://openfreemap.org)
 
 Data from data.gov.sg is covered by the [Singapore Open Data Licence](https://data.gov.sg/open-data-licence).
@@ -89,6 +91,16 @@ node scripts/build-rail-data.mjs
 ```
 
 Only rerun this when updating the underlying rail dataset.
+
+## Rain-summary boundary
+
+The rain summary filters radar pixels to Singapore's planning areas using data from `data/sg-planning-area.geojson` (URA Master Plan 2025 Planning Area Boundary (No Sea) via data.gov.sg). The geometry is Douglas-Peucker simplified in memory; `rain-pixels.json` is a precomputed 70 km radar pixel-to-area lookup:
+
+```sh
+node scripts/build-rain-data.mjs
+```
+
+This rebuilds `rain-pixels.json` and `areas-idx.json`. Rerun it when updating the underlying planning-area dataset or the fixed radar-grid mapping.
 
 ## Icons
 
