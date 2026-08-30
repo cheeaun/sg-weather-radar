@@ -109,12 +109,6 @@ console.log(
   `planning areas: ${areas.length} areas, ${areas.reduce((n, a) => n + a.rings.length, 0)} rings, ${keptPts}/${rawPts} points`,
 );
 
-function mercatorY(lat) {
-  return Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
-}
-function mercatorLat(y) {
-  return ((2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180) / Math.PI;
-}
 function pointInRing(lx, ly, ring, bb) {
   if (lx < bb.minLx || lx > bb.maxLx || ly < bb.minLy || ly > bb.maxLy) return false;
   let hit = false;
@@ -156,8 +150,7 @@ for (let a = 0; a < areas.length; a++) {
 }
 
 const lonSpan = BB.lowerRight.longitude - BB.upperLeft.longitude;
-const yTop = mercatorY(BB.upperLeft.latitude);
-const yBot = mercatorY(BB.lowerRight.latitude);
+const latSpan = BB.upperLeft.latitude - BB.lowerRight.latitude;
 let minX = W;
 let maxX = 0;
 let minY = H;
@@ -165,8 +158,8 @@ let maxY = 0;
 for (const bb of ringBboxes) {
   const px0 = Math.floor(((bb.minLx / SCALE - BB.upperLeft.longitude) / lonSpan) * W);
   const px1 = Math.ceil(((bb.maxLx / SCALE - BB.upperLeft.longitude) / lonSpan) * W);
-  const py0 = Math.floor(((yTop - mercatorY(bb.maxLy / SCALE)) / (yTop - yBot)) * H);
-  const py1 = Math.ceil(((yTop - mercatorY(bb.minLy / SCALE)) / (yTop - yBot)) * H);
+  const py0 = Math.floor(((BB.upperLeft.latitude - bb.maxLy / SCALE) / latSpan) * H);
+  const py1 = Math.ceil(((BB.upperLeft.latitude - bb.minLy / SCALE) / latSpan) * H);
   if (px0 < minX) minX = px0;
   if (px1 > maxX) maxX = px1;
   if (py0 < minY) minY = py0;
@@ -179,7 +172,7 @@ maxY = Math.min(H - 1, maxY);
 
 const pixels = [];
 for (let y = minY; y <= maxY; y++) {
-  const lat = mercatorLat(yTop + ((y + 0.5) / H) * (yBot - yTop));
+  const lat = BB.upperLeft.latitude - ((y + 0.5) / H) * latSpan;
   for (let x = minX; x <= maxX; x++) {
     const lng = BB.upperLeft.longitude + ((x + 0.5) / W) * lonSpan;
     const lx = Math.round(lng * SCALE);

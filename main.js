@@ -1293,14 +1293,6 @@ function addRailLayers() {
   raisePlaceLabels();
 }
 
-function mercatorY(lat) {
-  return Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
-}
-
-function mercatorLat(y) {
-  return ((2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180) / Math.PI;
-}
-
 async function fetchRadarImage(url) {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -1312,8 +1304,7 @@ async function fetchRadarImage(url) {
   }
 }
 
-// Source rows are evenly spaced in latitude but the map stretches the texture evenly
-// in Mercator Y, so resample row by row to land every radar pixel in its true place.
+// MapLibre projects the image source from its geographic corner coordinates.
 function buildRadarCanvas(range, frame, clip) {
   return fetchRadarImage(frame.url).then((blob) =>
     createImageBitmap(blob).then((bitmap) => {
@@ -1325,36 +1316,23 @@ function buildRadarCanvas(range, frame, clip) {
         canvas.width = W;
         canvas.height = H;
         const ctx = canvas.getContext('2d');
-        const yTop = mercatorY(bb.upperLeft.latitude);
-        const yBot = mercatorY(bb.lowerRight.latitude);
-        const latSpan = bb.upperLeft.latitude - bb.lowerRight.latitude;
-        // Pixel-center latitude of each output row (rows are evenly spaced in Mercator Y).
-        const rowLat = new Float64Array(H);
-        for (let y = 0; y < H; y++) {
-          const lat = mercatorLat(yTop + ((y + 0.5) / H) * (yBot - yTop));
-          rowLat[y] = lat;
-          const srcY = clamp(((bb.upperLeft.latitude - lat) / latSpan) * H - 0.5, 0, H - 1);
-          ctx.drawImage(bitmap, 0, srcY, W, 1, 0, y, W, 1);
-        }
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(bitmap, 0, 0);
         const innerRange = CLIP_SOURCE[range];
         if (clip && innerRange) {
           const inner = boundaryBoxes[innerRange] || RADAR_BOUNDS[innerRange];
           const lonSpan = bb.lowerRight.longitude - bb.upperLeft.longitude;
-          // Shrink the target box inward by half an outer texel before selecting pixels to
-          // clear. Without this, texel-center quantization can push the hole edge a sliver
-          // *outside* the inner box, leaving a hairline base-map seam at the boundary. The
-          // eroded hole is always strictly covered by the inner image (whose map-drawn edge
-          // is sub-pixel exact), so the visible outer->inner edge is sub-pixel accurate.
-          const west = inner.upperLeft.longitude + lonSpan / W / 2;
-          const east = inner.lowerRight.longitude - lonSpan / W / 2;
-          const halfRow = (yTop - yBot) / H / 2;
-          const north = mercatorLat(mercatorY(inner.upperLeft.latitude) - halfRow);
-          const south = mercatorLat(mercatorY(inner.lowerRight.latitude) + halfRow);
+          const west = inner.upperLeft.longitude;
+          const east = inner.lowerRight.longitude;
+          const latSpan = bb.upperLeft.latitude - bb.lowerRight.latitude;
+          const north = inner.upperLeft.latitude;
+          const south = inner.lowerRight.latitude;
           let x0 = W,
             x1 = -1;
           for (let x = 0; x < W; x++) {
-            const lon = bb.upperLeft.longitude + ((x + 0.5) / W) * lonSpan;
-            if (lon >= west && lon <= east) {
+            const left = bb.upperLeft.longitude + (x / W) * lonSpan;
+            const right = bb.upperLeft.longitude + ((x + 1) / W) * lonSpan;
+            if (left >= west && right <= east) {
               if (x < x0) x0 = x;
               if (x > x1) x1 = x;
             }
@@ -1362,7 +1340,8 @@ function buildRadarCanvas(range, frame, clip) {
           let y0 = H,
             y1 = -1;
           for (let y = 0; y < H; y++) {
-            if (rowLat[y] <= north && rowLat[y] >= south) {
+            const lat = bb.upperLeft.latitude - ((y + 0.5) / H) * latSpan;
+            if (lat <= north && lat >= south) {
               if (y < y0) y0 = y;
               if (y > y1) y1 = y;
             }
@@ -2584,6 +2563,16 @@ const SG_RAIN_PIXEL_DATA = (() => {
   return pixels;
 })();
 const RAIN_PIXEL_KEY_MASK = (1 << 18) - 1;
+const SG_RAIN_PIXEL_AREAS = (() => {
+  const areas = new Uint8Array(480 * 480);
+  for (const packed of SG_RAIN_PIXEL_DATA) {
+    areas[packed & RAIN_PIXEL_KEY_MASK] = (packed >>> 18) + 1;
+  }
+  return areas;
+})();
+const RAIN_PIXEL_COUNT = SG_RAIN_PIXEL_DATA.length;
+const rainState = new Uint8Array(480 * 480);
+const rainMembers = new Uint32Array(RAIN_PIXEL_COUNT);
 function analyzeRadar(canvas) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
@@ -2596,7 +2585,8 @@ function analyzeRadar(canvas) {
   }));
   // State 1-3 is unvisited rain by level, 4-6 is visited noise, and 7-9 is
   // accepted component rain by level.
-  const state = new Uint8Array(W * H);
+  const state = rainState;
+  state.fill(0);
   for (let i = 0; i < SG_RAIN_PIXEL_DATA.length; i++) {
     const packed = SG_RAIN_PIXEL_DATA[i];
     const k = packed & RAIN_PIXEL_KEY_MASK;
@@ -2606,8 +2596,8 @@ function analyzeRadar(canvas) {
   }
   // Pass 2: 4-connected flood fill. A component is accepted when it covers
   // at least four orthogonally adjacent pixels; anything smaller is noise.
-  const members = new Uint32Array(SG_RAIN_PIXEL_DATA.length);
-  for (let i = 0; i < SG_RAIN_PIXEL_DATA.length; i++) {
+  const members = rainMembers;
+  for (let i = 0; i < RAIN_PIXEL_COUNT; i++) {
     const packed = SG_RAIN_PIXEL_DATA[i];
     const seed = packed & RAIN_PIXEL_KEY_MASK;
     if (state[seed] < 1 || state[seed] > 3) continue;
@@ -2623,11 +2613,37 @@ function analyzeRadar(canvas) {
       const right = x + 1 < W ? k + 1 : -1;
       const above = y > 0 ? k - W : -1;
       const below = y + 1 < H ? k + W : -1;
-      for (const n of [left, right, above, below]) {
-        if (n >= 0 && state[n] >= 1 && state[n] <= 3) {
-          state[n] += 3;
-          members[memberCount++] = n;
-        }
+      const area = SG_RAIN_PIXEL_AREAS[seed];
+      if (left >= 0 && state[left] >= 1 && state[left] <= 3 && SG_RAIN_PIXEL_AREAS[left] === area) {
+        state[left] += 3;
+        members[memberCount++] = left;
+      }
+      if (
+        right >= 0 &&
+        state[right] >= 1 &&
+        state[right] <= 3 &&
+        SG_RAIN_PIXEL_AREAS[right] === area
+      ) {
+        state[right] += 3;
+        members[memberCount++] = right;
+      }
+      if (
+        above >= 0 &&
+        state[above] >= 1 &&
+        state[above] <= 3 &&
+        SG_RAIN_PIXEL_AREAS[above] === area
+      ) {
+        state[above] += 3;
+        members[memberCount++] = above;
+      }
+      if (
+        below >= 0 &&
+        state[below] >= 1 &&
+        state[below] <= 3 &&
+        SG_RAIN_PIXEL_AREAS[below] === area
+      ) {
+        state[below] += 3;
+        members[memberCount++] = below;
       }
     }
     if (memberCount >= MIN_COMPONENT_PIXELS) {
@@ -2635,7 +2651,7 @@ function analyzeRadar(canvas) {
     }
   }
   // Pass 3: tally live pixels by area.
-  for (let i = 0; i < SG_RAIN_PIXEL_DATA.length; i++) {
+  for (let i = 0; i < RAIN_PIXEL_COUNT; i++) {
     const packed = SG_RAIN_PIXEL_DATA[i];
     const k = packed & RAIN_PIXEL_KEY_MASK;
     if (state[k] < 7) continue;
