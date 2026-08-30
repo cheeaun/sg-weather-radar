@@ -51,6 +51,19 @@
         <div class="scan">
           <div class="rain-summary" id="rain-summary" aria-live="polite"></div>
           <div class="scan-head">
+            <button
+              type="button"
+              class="donut playback-btn"
+              id="playback-btn"
+              aria-label="Play radar timeline"
+              title="Play radar timeline"
+              aria-pressed="false"
+            >
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                <path class="playback-play" d="m9 6 9 6-9 6Z" />
+                <path class="playback-stop" d="M8 8h8v8H8Z" />
+              </svg>
+            </button>
             <span
               class="donut"
               id="refresh-donut"

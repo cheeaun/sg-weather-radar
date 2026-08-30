@@ -654,6 +654,39 @@ body {
 .donut {
   display: inline-flex;
 }
+.playback-btn {
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  color: var(--bg);
+  background: var(--ink-strong);
+  border-radius: 50%;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    transform 0.2s ease;
+}
+.playback-btn:hover,
+.playback-btn:focus-visible {
+  color: var(--bg);
+  background: var(--ink-strong);
+}
+.playback-btn:active {
+  transform: scale(0.9);
+}
+.playback-btn svg {
+  fill: currentColor;
+}
+.playback-stop {
+  display: none;
+}
+.playback-btn[aria-pressed='true'] .playback-play {
+  display: none;
+}
+.playback-btn[aria-pressed='true'] .playback-stop {
+  display: block;
+}
 .donut svg {
   display: block;
 }

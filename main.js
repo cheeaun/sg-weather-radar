@@ -65,6 +65,7 @@ let map,
   currentIndex = 0;
 let pinnedSlot = null;
 let refreshTimer = null;
+let playbackTimer = null;
 let nextFetchAt = Date.now() + SLOT_MS;
 let pollRanges = [];
 let pollSlotMs = 0;
@@ -1223,6 +1224,18 @@ function addRailLayers() {
   if (!map || !styleReady || !railData || map.getSource('rail-lines')) return;
   map.addSource('rail-lines', { type: 'geojson', data: railData.lines });
   map.addSource('rail-stations', { type: 'geojson', data: railData.stations });
+  map.addLayer({
+    id: 'rail-line-outline',
+    type: 'line',
+    source: 'rail-lines',
+    minzoom: 10,
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color': '#fff',
+      'line-width': ['interpolate', ['linear'], ['zoom'], 10, 2.5, 14, 4],
+      'line-opacity': 0.8,
+    },
+  });
   map.addLayer({
     id: 'rail-line',
     type: 'line',
@@ -2793,22 +2806,57 @@ function tickIndexFromX(clientX) {
 const sliderTicks = document.getElementById('slider-ticks');
 sliderTicks.addEventListener('pointermove', (e) => {
   if (allTimestamps.length < 2) return;
+  if (playbackTimer) setPlayback(false);
   scheduleCommit(tickIndexFromX(e.clientX));
 });
 sliderTicks.addEventListener('pointerdown', (e) => {
   if (allTimestamps.length < 2) return;
+  setPlayback(false);
   commitIndexNow(tickIndexFromX(e.clientX));
 });
-timeSlider.addEventListener('input', (e) => scheduleCommit(parseInt(e.target.value)));
-timeSlider.addEventListener('change', (e) => commitIndexNow(parseInt(e.target.value)));
-timeSlider.addEventListener('pointerup', () => commitIndexNow(parseInt(timeSlider.value)));
-timeSlider.addEventListener('keyup', () => commitIndexNow(parseInt(timeSlider.value)));
+timeSlider.addEventListener('pointermove', () => {
+  if (playbackTimer) setPlayback(false);
+});
+timeSlider.addEventListener('input', (e) => {
+  setPlayback(false);
+  scheduleCommit(parseInt(e.target.value));
+});
+timeSlider.addEventListener('change', (e) => {
+  setPlayback(false);
+  commitIndexNow(parseInt(e.target.value));
+});
+timeSlider.addEventListener('pointerup', () => {
+  setPlayback(false);
+  commitIndexNow(parseInt(timeSlider.value));
+});
+timeSlider.addEventListener('keyup', () => {
+  setPlayback(false);
+  commitIndexNow(parseInt(timeSlider.value));
+});
 timeSlider.addEventListener('pointermove', (e) => {
   if (allTimestamps.length < 2) return;
   const rect = timeSlider.getBoundingClientRect();
   const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
   const index = Math.round(ratio * (allTimestamps.length - 1));
   scheduleCommit(index);
+});
+
+const playbackButton = document.getElementById('playback-btn');
+function setPlayback(on) {
+  clearInterval(playbackTimer);
+  playbackTimer = on
+    ? setInterval(() => {
+        if (allTimestamps.length < 2) return;
+        commitIndex((currentIndex + 1) % allTimestamps.length);
+      }, 1000)
+    : null;
+  playbackButton.setAttribute('aria-pressed', String(on));
+  playbackButton.setAttribute('aria-label', on ? 'Stop radar timeline' : 'Play radar timeline');
+  playbackButton.title = on ? 'Stop radar timeline' : 'Play radar timeline';
+}
+playbackButton.addEventListener('click', () => {
+  if (allTimestamps.length < 2) return;
+  setPlayback(!playbackTimer);
 });
 
 function restartCountdown() {
