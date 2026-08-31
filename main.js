@@ -1328,7 +1328,7 @@ function buildRadarCanvas(range, frame, clip) {
         const canvas = document.createElement('canvas');
         canvas.width = W;
         canvas.height = H;
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         ctx.imageSmoothingEnabled = false;
         ctx.drawImage(bitmap, 0, 0);
         const innerRange = CLIP_SOURCE[range];
@@ -1498,7 +1498,7 @@ function renderShapeImage(range, variant) {
   const canvas = document.createElement('canvas');
   canvas.width = SHAPE_SIZE * SHAPE_SCALE;
   canvas.height = SHAPE_SIZE * SHAPE_SCALE;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   ctx.scale(SHAPE_SCALE, SHAPE_SCALE);
   const cx = SHAPE_SIZE / 2;
   const cy = SHAPE_SIZE / 2;
@@ -1567,7 +1567,7 @@ function buildStripeImageData(color) {
   const canvas = document.createElement('canvas');
   canvas.width = N;
   canvas.height = N;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(tmp, 0, 0, N * S, N * S, 0, 0, N, N);
   return ctx.getImageData(0, 0, N, N);
@@ -1848,7 +1848,7 @@ function ensureLightningImage() {
   const canvas = document.createElement('canvas');
   canvas.width = 24 * SHAPE_SCALE;
   canvas.height = 24 * SHAPE_SCALE;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   ctx.scale(SHAPE_SCALE, SHAPE_SCALE);
   const path = new Path2D(LIGHTNING_BOLT_PATH);
   ctx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
