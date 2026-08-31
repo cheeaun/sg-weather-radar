@@ -1231,7 +1231,7 @@ function addRailLayers() {
     minzoom: 10,
     layout: { 'line-cap': 'round', 'line-join': 'round' },
     paint: {
-      'line-color': '#fff',
+      'line-color': boundaryTextHalo(),
       'line-width': ['interpolate', ['linear'], ['zoom'], 10, 2.5, 14, 4],
       'line-opacity': 0.8,
     },
