@@ -37,6 +37,7 @@ const OPACITY_STORAGE_KEY = 'sgwr-radar-opacity';
 const CLIP_STORAGE_KEY = 'sgwr-radar-clip';
 const LIGHTNING_STORAGE_KEY = 'sgwr-lightning';
 const WIND_STORAGE_KEY = 'sgwr-wind';
+const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -82,9 +83,13 @@ let radarOpacity = clamp(parseFloat(localStorage.getItem(OPACITY_STORAGE_KEY)), 
 let clipBoundaries = localStorage.getItem(CLIP_STORAGE_KEY) !== 'off';
 let showLightning = localStorage.getItem(LIGHTNING_STORAGE_KEY) === 'on';
 let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
+let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
 let lightningStrikes = [];
 let lightningLoading = null;
 const failedImages = new Set();
+const nowcastCanvases = new Map();
+let nowcastGeneration = 0;
+let nowcastControlButton = null;
 
 function clamp(v, min, max) {
   return Math.min(max, Math.max(min, v));
@@ -94,8 +99,9 @@ function slotOf(iso) {
   return Math.floor(new Date(iso).getTime() / SLOT_MS) * SLOT_MS;
 }
 
-function rangeShapeSVG(range) {
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><use href="#range-shape-${range}"/></svg>`;
+function rangeShapeSVG(range, future = false) {
+  const shape = future && range === 70 ? 'range-shape-70-future' : `range-shape-${range}`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><use href="#${shape}"/></svg>`;
 }
 
 function showError(msg) {
@@ -320,6 +326,56 @@ class WindToggleControl {
   }
 }
 
+class NowcastToggleControl {
+  onAdd(map) {
+    this._map = map;
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toggle-btn';
+    button.innerHTML =
+      '<svg class="toggle-icon nowcast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></svg>';
+    button.addEventListener('click', () => {
+      showNowcast = !showNowcast;
+      localStorage.setItem(NOWCAST_STORAGE_KEY, showNowcast ? 'on' : 'off');
+      this._updateButton();
+      if (showNowcast) {
+        Promise.allSettled([
+          loadWind({ forNowcast: true }),
+          refreshLightning({ forNowcast: true }),
+        ]).finally(() => {
+          if (showNowcast) recomputeNowcast();
+        });
+      } else {
+        recomputeNowcast();
+      }
+      showToast(showNowcast ? 'Showing 15-minute nowcast' : 'Hiding 15-minute nowcast');
+    });
+    this._button = button;
+    nowcastControlButton = button;
+    container.appendChild(button);
+    this._container = container;
+    this._updateButton();
+    return container;
+  }
+  _updateButton() {
+    const fit = modelFitPercent();
+    const fitText = fit == null ? 'model fit pending' : `model fit ${fit}% (rolling 1 h)`;
+    const label = 'Show 15-minute nowcast (70 km)';
+    this._button.title = `${fitText} · short-range rain estimate`;
+    this._button.setAttribute('aria-label', label);
+    this._button.setAttribute('aria-pressed', String(showNowcast));
+    this._button.classList.toggle('toggle-active', showNowcast);
+  }
+  onRemove() {
+    if (this._container) this._container.remove();
+    this._container = undefined;
+    this._map = undefined;
+    nowcastControlButton = null;
+  }
+}
+
 class LightningToggleControl {
   onAdd(map) {
     this._map = map;
@@ -474,6 +530,7 @@ function initMap() {
   map.addControl(new ClipToggleControl(), 'bottom-right');
   map.addControl(new WindToggleControl(), 'bottom-right');
   map.addControl(new LightningToggleControl(), 'bottom-right');
+  map.addControl(new NowcastToggleControl(), 'bottom-right');
   map.addControl(
     new maplibregl.GeolocateControl({
       positionOptions: { enableHighAccuracy: true },
@@ -688,8 +745,9 @@ async function loadLightningData(fetchFn) {
   return strikes.sort((a, b) => a.t - b.t);
 }
 
-async function refreshLightning() {
-  if (!showLightning || lightningLoading) return;
+async function refreshLightning({ forNowcast = false } = {}) {
+  if (!showLightning && !forNowcast) return null;
+  if (lightningLoading) return lightningLoading;
   lightningLoading = loadLightningData((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
     .then((strikes) => {
       lightningStrikes = strikes;
@@ -861,10 +919,13 @@ function applyRadarData(rangeResults, strikes) {
   }
   if (strikes) lightningStrikes = strikes;
 
-  const newSlots = rebuildTimeline();
   addBoundaryLayers();
-  updateSlider(newSlots);
-  showFrame(currentIndex);
+  if (showNowcast) recomputeNowcast();
+  else {
+    const newSlots = rebuildTimeline();
+    updateSlider(newSlots);
+    showFrame(currentIndex);
+  }
 
   const sig = radarSignature();
   if (lastRadarSignature !== null && sig !== lastRadarSignature) flashNewData();
@@ -893,9 +954,12 @@ function mergeRangeResults(rangeResults) {
     framesMap[range] = slots;
   }
   addBoundaryLayers();
-  const newSlots = rebuildTimeline();
-  updateSlider(newSlots);
-  showFrame(currentIndex);
+  if (showNowcast) recomputeNowcast();
+  else {
+    const newSlots = rebuildTimeline();
+    updateSlider(newSlots);
+    showFrame(currentIndex);
+  }
 }
 
 let fetchRadarBusy = false;
@@ -923,7 +987,7 @@ async function doFetchRadar() {
   try {
     const [rangeResults, strikes] = await Promise.all([
       loadRadarData(cacheReader),
-      showLightning ? loadLightningData(cacheReader).catch(() => null) : null,
+      showLightning || showNowcast ? loadLightningData(cacheReader).catch(() => null) : null,
     ]);
     if (RANGES.some((range) => rangeResults[range]?.frames.length)) {
       applyRadarData(rangeResults, strikes);
@@ -936,7 +1000,7 @@ async function doFetchRadar() {
   try {
     const [rangeResults, strikes] = await Promise.all([
       loadRadarData(apiFetch),
-      showLightning
+      showLightning || showNowcast
         ? loadLightningData(apiFetch).catch((e) => {
             console.error('Lightning fetch error:', e);
           })
@@ -966,7 +1030,7 @@ async function fetchAtSlot() {
   pollRanges = [];
   await fetchRadar();
   pollRanges = missingRangesFor(pollSlotMs);
-  if (showWind) loadWind();
+  if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
   scheduleNextRefresh();
 }
 
@@ -1031,10 +1095,42 @@ function computeTickMidpoints() {
   }
 }
 
+function positionEndpointLabels() {
+  const ticks = document.getElementById('slider-ticks').children;
+  const footer = document.querySelector('.scan-foot');
+  if (!ticks.length || !footer) return;
+  const footerRect = footer.getBoundingClientRect();
+  const positions = [];
+  for (let i = 0; i < ticks.length; i++) {
+    const rect = ticks[i].getBoundingClientRect();
+    positions.push(rect.left + rect.width / 2 - footerRect.left);
+  }
+  const liveSlot = newestLiveSlot(70);
+  const liveIndex = allTimestamps.findIndex(
+    (timestamp) => new Date(timestamp).getTime() === liveSlot,
+  );
+  const forecastSlot =
+    showNowcast && nowcastCanvases.size ? Math.max(...nowcastCanvases.keys()) : null;
+  const setPosition = (id, index, edge) => {
+    const element = document.getElementById(id);
+    if (!element || index < 0 || index >= positions.length) return;
+    element.style.left = `${positions[index]}px`;
+    element.dataset.edge = edge;
+  };
+  setPosition('time-oldest', 0, 'start');
+  setPosition(
+    'time-live',
+    liveIndex >= 0 ? liveIndex : positions.length - 1,
+    forecastSlot ? 'middle' : 'end',
+  );
+  setPosition('time-forecast', positions.length - 1, 'end');
+}
+
 function renderTicks(newSlots) {
   const container = document.getElementById('slider-ticks');
   container.replaceChildren();
   const n = allTimestamps.length;
+  const liveSlot70 = newestLiveSlot(70);
   for (let i = 0; i < n; i++) {
     const col = document.createElement('div');
     col.className = 'tick-col';
@@ -1042,40 +1138,79 @@ function renderTicks(newSlots) {
     for (const range of TICK_RANGES) {
       const shape = document.createElement('span');
       shape.className = 'tick-shape';
-      shape.innerHTML = rangeShapeSVG(range);
+      const future = range === 70 && slotMs > liveSlot70;
+      shape.innerHTML = rangeShapeSVG(range, future);
       const frame = framesMap[range]?.get(slotMs);
-      if (frame && !failedImages.has(frame.url)) shape.classList.add('on');
+      if (frame && !failedImages.has(frame.url)) {
+        shape.classList.add('on');
+        if (future) {
+          shape.classList.add('nowcast');
+          if (nowcastCanvases.get(slotMs) && hasForecastRain(nowcastCanvases.get(slotMs)))
+            shape.classList.add('rain');
+        }
+      }
       col.appendChild(shape);
     }
     if (newSlots && newSlots.has(slotMs)) col.classList.add('new');
     container.appendChild(col);
   }
   computeTickMidpoints();
+  positionEndpointLabels();
 }
 
 function updateSlider(newSlots) {
   const slider = document.getElementById('time-slider');
   slider.max = Math.max(0, allTimestamps.length - 1);
-  document.getElementById('time-oldest').textContent = allTimestamps.length
-    ? formatTime(allTimestamps[0])
-    : '--:--';
-  document.getElementById('time-latest').textContent = allTimestamps.length
-    ? formatTime(allTimestamps[allTimestamps.length - 1])
-    : '--:--';
+  const liveSlot = newestLiveSlot(70);
+  const forecastSlot =
+    showNowcast && Number.isFinite(liveSlot) && nowcastCanvases.size
+      ? Math.max(...nowcastCanvases.keys())
+      : null;
+  const hasForecast = Boolean(forecastSlot);
+  const oldestTime = allTimestamps.length ? formatTime(allTimestamps[0]) : '--:--';
+  const liveTime = Number.isFinite(liveSlot)
+    ? formatTime(new Date(liveSlot).toISOString())
+    : oldestTime;
+  document.getElementById('time-oldest').textContent = oldestTime;
+  document.getElementById('time-live').textContent = liveTime;
+  document.getElementById('time-forecast').textContent = forecastSlot
+    ? formatTime(new Date(forecastSlot).toISOString())
+    : '';
+  document.querySelector('.scan-foot').classList.toggle('has-forecast', hasForecast);
   renderTicks(newSlots);
   updateSliderUI(currentIndex);
 }
 
 function updateSliderUI(index) {
   const slider = document.getElementById('time-slider');
-  slider.value = index;
+  const max = Number(slider.max) || 0;
+  slider.value = clamp(Number(index) || 0, 0, max);
+  const ts = allTimestamps[index];
 
   const tickCols = document.getElementById('slider-ticks').children;
   for (let i = 0; i < tickCols.length; i++) tickCols[i].classList.toggle('active', i === index);
 
-  const ts = allTimestamps[index];
   document.getElementById('scan-time').textContent = ts ? formatTime(ts) : '--:--';
   document.getElementById('scan-date').textContent = ts ? formatDate(ts) : '--';
+  updateSliderCutoff();
+}
+
+function updateSliderCutoff() {
+  const slider = document.getElementById('time-slider');
+  const minTime = allTimestamps.length ? new Date(allTimestamps[0]).getTime() : 0;
+  const maxTime = allTimestamps.length
+    ? new Date(allTimestamps[allTimestamps.length - 1]).getTime()
+    : 0;
+  const hasForecast = showNowcast && nowcastCanvases.size && maxTime > minTime;
+  const liveEnd = hasForecast
+    ? clamp(((Date.now() - minTime) / (maxTime - minTime)) * 100, 0, 100)
+    : 100;
+  slider.style.setProperty('--slider-live-end', `${liveEnd}%`);
+  const index = Number(slider.value) || 0;
+  const ts = allTimestamps[index];
+  const forecast = Boolean(ts && new Date(ts).getTime() > Date.now());
+  slider.classList.toggle('forecast-active', forecast);
+  document.getElementById('scan-time').classList.toggle('forecast', forecast);
 }
 
 const RADAR_BLANK_PNG =
@@ -1319,6 +1454,11 @@ async function fetchRadarImage(url) {
 
 // MapLibre projects the image source from its geographic corner coordinates.
 function buildRadarCanvas(range, frame, clip) {
+  if (frame.nowcast) {
+    const entry = nowcastCanvases.get(new Date(frame.timestamp).getTime());
+    if (!entry) return Promise.reject(new Error('Nowcast frame unavailable'));
+    return Promise.resolve(entry.maxBlend);
+  }
   return fetchRadarImage(frame.url).then((blob) =>
     createImageBitmap(blob).then((bitmap) => {
       try {
@@ -1373,7 +1513,7 @@ function buildRadarCanvas(range, frame, clip) {
 // identity must be range+timestamp, not the (ever-changing) signed URL, or already-shown
 // frames get treated as new/not-yet-available on every refresh.
 function frameImageKey(range, frame, clip) {
-  return `${range}:${frame.timestamp}${clip ? '#clip' : ''}`;
+  return `${range}:${frame.timestamp}${frame.nowcast ? `:${frame.url}` : ''}${clip ? '#clip' : ''}`;
 }
 
 function prepareFrameImage(range, frame) {
@@ -2403,8 +2543,8 @@ function windInvalidateScreen() {
   for (let i = 0; i < windParticleCount; i++) windSx[i] = NaN;
 }
 
-async function loadWind() {
-  if (!showWind || (windField && Date.now() - windDataAt < 4 * 60 * 1000)) {
+async function loadWind({ forNowcast = false } = {}) {
+  if ((!showWind && !forNowcast) || (windField && Date.now() - windDataAt < 4 * 60 * 1000)) {
     // Fresh cache or hidden tab: the map's animation chain may have stalled, so nudge a frame.
     if (showWind && !windMotionQuery.matches && map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
     return;
@@ -2463,6 +2603,8 @@ async function loadWind() {
 
 window.addEventListener('resize', () => {
   computeTickMidpoints();
+  positionEndpointLabels();
+  updateSliderCutoff();
   if (!showWind) return;
   sizeWindCanvas();
   if (windMotionQuery.matches) renderWindStatic();
@@ -2514,6 +2656,19 @@ const REGION_LABELS = {
 };
 const MIN_COMPONENT_PIXELS = 4;
 const LEVEL_WORDS = { 1: 'Light', 2: 'Moderate', 3: 'Heavy' };
+const NOWCAST_SIZE = 480;
+const NOWCAST_FRAMES = 5;
+const NOWCAST_DECAY = 0.92;
+const NOWCAST_GROWTH_MAX = 0.3;
+const NOWCAST_MATCH_DISTANCE = 40;
+const NOWCAST_MATCH_OVERLAP = 0.3;
+const NOWCAST_SHEET_PIXELS = 4000;
+const NOWCAST_SHEET_SIGMA = 8;
+const NOWCAST_FIT_MAX_AGE = 60 * 60 * 1000;
+const NOWCAST_FIT_MAX_SAMPLES = 120;
+const NOWCAST_FIT_POOL = 10;
+const NOWCAST_FIT_MIN_PIXELS = 50;
+const nowcastFitSamples = [];
 
 // The scale bar in the masthead is the palette the radar images are quantized to;
 // map a pixel back to its position on that ramp to classify intensity.
@@ -2585,34 +2740,38 @@ const SG_RAIN_PIXEL_AREAS = (() => {
 })();
 const RAIN_PIXEL_COUNT = SG_RAIN_PIXEL_DATA.length;
 const rainState = new Uint8Array(480 * 480);
-const rainMembers = new Uint32Array(RAIN_PIXEL_COUNT);
-function analyzeRadar(canvas) {
+const rainMembers = new Uint32Array(480 * 480);
+function analyzeRainCells(canvas, fullFrame = false) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
   const H = canvas.height;
   const data = ctx.getImageData(0, 0, W, H).data;
-  const areas = SINGAPORE_AREAS.map(([name, region]) => ({
-    name,
-    region,
-    counts: [0, 0, 0, 0],
-  }));
+  const cells = [];
   // State 1-3 is unvisited rain by level, 4-6 is visited noise, and 7-9 is
   // accepted component rain by level.
   const state = rainState;
   state.fill(0);
-  for (let i = 0; i < SG_RAIN_PIXEL_DATA.length; i++) {
-    const packed = SG_RAIN_PIXEL_DATA[i];
-    const k = packed & RAIN_PIXEL_KEY_MASK;
-    const pi = k * 4;
-    const lvl = rainLevelForColor(data[pi], data[pi + 1], data[pi + 2]);
-    if (lvl) state[k] = lvl;
+  if (fullFrame) {
+    for (let k = 0; k < 480 * 480; k++) {
+      const pi = k * 4;
+      const lvl = rainLevelForColor(data[pi], data[pi + 1], data[pi + 2]);
+      if (lvl) state[k] = lvl;
+    }
+  } else {
+    for (let i = 0; i < SG_RAIN_PIXEL_DATA.length; i++) {
+      const packed = SG_RAIN_PIXEL_DATA[i];
+      const k = packed & RAIN_PIXEL_KEY_MASK;
+      const pi = k * 4;
+      const lvl = rainLevelForColor(data[pi], data[pi + 1], data[pi + 2]);
+      if (lvl) state[k] = lvl;
+    }
   }
   // Pass 2: 4-connected flood fill. A component is accepted when it covers
   // at least four orthogonally adjacent pixels; anything smaller is noise.
   const members = rainMembers;
-  for (let i = 0; i < RAIN_PIXEL_COUNT; i++) {
-    const packed = SG_RAIN_PIXEL_DATA[i];
-    const seed = packed & RAIN_PIXEL_KEY_MASK;
+  const seedCount = fullFrame ? 480 * 480 : RAIN_PIXEL_COUNT;
+  for (let si = 0; si < seedCount; si++) {
+    const seed = fullFrame ? si : SG_RAIN_PIXEL_DATA[si] & RAIN_PIXEL_KEY_MASK;
     if (state[seed] < 1 || state[seed] > 3) continue;
     let memberCount = 1;
     members[0] = seed;
@@ -2626,8 +2785,13 @@ function analyzeRadar(canvas) {
       const right = x + 1 < W ? k + 1 : -1;
       const above = y > 0 ? k - W : -1;
       const below = y + 1 < H ? k + W : -1;
-      const area = SG_RAIN_PIXEL_AREAS[seed];
-      if (left >= 0 && state[left] >= 1 && state[left] <= 3 && SG_RAIN_PIXEL_AREAS[left] === area) {
+      const area = fullFrame ? 1 : SG_RAIN_PIXEL_AREAS[seed];
+      if (
+        left >= 0 &&
+        state[left] >= 1 &&
+        state[left] <= 3 &&
+        (fullFrame || SG_RAIN_PIXEL_AREAS[left] === area)
+      ) {
         state[left] += 3;
         members[memberCount++] = left;
       }
@@ -2635,7 +2799,7 @@ function analyzeRadar(canvas) {
         right >= 0 &&
         state[right] >= 1 &&
         state[right] <= 3 &&
-        SG_RAIN_PIXEL_AREAS[right] === area
+        (fullFrame || SG_RAIN_PIXEL_AREAS[right] === area)
       ) {
         state[right] += 3;
         members[memberCount++] = right;
@@ -2644,7 +2808,7 @@ function analyzeRadar(canvas) {
         above >= 0 &&
         state[above] >= 1 &&
         state[above] <= 3 &&
-        SG_RAIN_PIXEL_AREAS[above] === area
+        (fullFrame || SG_RAIN_PIXEL_AREAS[above] === area)
       ) {
         state[above] += 3;
         members[memberCount++] = above;
@@ -2653,25 +2817,54 @@ function analyzeRadar(canvas) {
         below >= 0 &&
         state[below] >= 1 &&
         state[below] <= 3 &&
-        SG_RAIN_PIXEL_AREAS[below] === area
+        (fullFrame || SG_RAIN_PIXEL_AREAS[below] === area)
       ) {
         state[below] += 3;
         members[memberCount++] = below;
       }
     }
     if (memberCount >= MIN_COMPONENT_PIXELS) {
-      for (let m = 0; m < memberCount; m++) state[members[m]] += 3;
+      const pixels = new Uint32Array(memberCount);
+      const levels = new Uint8Array(memberCount);
+      let sumX = 0;
+      let sumY = 0;
+      let totalLevel = 0;
+      for (let m = 0; m < memberCount; m++) {
+        const pixel = members[m];
+        const level = state[pixel] - 3;
+        const x = pixel % W;
+        const y = (pixel - x) / W;
+        pixels[m] = pixel;
+        levels[m] = level;
+        sumX += x;
+        sumY += y;
+        totalLevel += level;
+        state[pixel] += 3;
+      }
+      cells.push({
+        pixels,
+        levels,
+        area: fullFrame ? -1 : SG_RAIN_PIXEL_AREAS[seed] - 1,
+        centroidX: sumX / memberCount,
+        centroidY: sumY / memberCount,
+        totalLevel,
+        mass: totalLevel,
+      });
     }
   }
-  // Pass 3: tally live pixels by area.
-  for (let i = 0; i < RAIN_PIXEL_COUNT; i++) {
-    const packed = SG_RAIN_PIXEL_DATA[i];
-    const k = packed & RAIN_PIXEL_KEY_MASK;
-    if (state[k] < 7) continue;
-    areas[packed >>> 18].counts[state[k] - 6]++;
+  return cells;
+}
+
+function analyzeRadar(canvas) {
+  const areas = SINGAPORE_AREAS.map(([name, region]) => ({
+    name,
+    region,
+    counts: [0, 0, 0, 0],
+  }));
+  for (const cell of analyzeRainCells(canvas)) {
+    const counts = areas[cell.area].counts;
+    for (const level of cell.levels) counts[level]++;
   }
-  // Every area with any live rain is reported; the component filter above
-  // already guarantees noise is gone.
   const rainyAreas = [];
   for (const a of areas) {
     const total = a.counts[1] + a.counts[2] + a.counts[3];
@@ -2680,6 +2873,743 @@ function analyzeRadar(canvas) {
     rainyAreas.push(hit);
   }
   return rainyAreas;
+}
+
+function cellOverlap(source, targetPixels, targetCount, dx, dy) {
+  let overlap = 0;
+  for (const pixel of source.pixels) {
+    const x = pixel % NOWCAST_SIZE;
+    const y = (pixel - x) / NOWCAST_SIZE;
+    const tx = x + Math.round(dx);
+    const ty = y + Math.round(dy);
+    if (tx >= 0 && tx < NOWCAST_SIZE && ty >= 0 && ty < NOWCAST_SIZE) {
+      if (targetPixels.has(ty * NOWCAST_SIZE + tx)) overlap++;
+    }
+  }
+  return overlap / Math.min(source.pixels.length, targetCount);
+}
+
+function pairCells(source, target) {
+  const targetSets = target.map((cell) => new Set(cell.pixels));
+  const candidates = [];
+  for (let si = 0; si < source.length; si++) {
+    for (let ti = 0; ti < target.length; ti++) {
+      const a = source[si];
+      const b = target[ti];
+      const dx = b.centroidX - a.centroidX;
+      const dy = b.centroidY - a.centroidY;
+      const distance = Math.hypot(dx, dy);
+      if (distance > NOWCAST_MATCH_DISTANCE) continue;
+      const overlap = cellOverlap(a, targetSets[ti], b.pixels.length, dx, dy);
+      if (overlap < NOWCAST_MATCH_OVERLAP && distance > 12) continue;
+      candidates.push({ si, ti, dx, dy, distance, overlap });
+    }
+  }
+  candidates.sort((a, b) => b.overlap - a.overlap || a.distance - b.distance);
+  const usedSource = new Set();
+  const usedTarget = new Set();
+  const pairs = [];
+  for (const candidate of candidates) {
+    if (usedSource.has(candidate.si) || usedTarget.has(candidate.ti)) continue;
+    usedSource.add(candidate.si);
+    usedTarget.add(candidate.ti);
+    pairs.push(candidate);
+  }
+  return pairs;
+}
+
+// Links cells backwards through frame pairs so each current cell gets a
+// lineage of per-step displacements and masses. Displacement stats come from
+// the median of up to NOWCAST_FRAMES - 1 deltas instead of a single pair, and
+// growth is a clamped exponential rate over the lineage's mass history.
+function trackCells(lineageCells) {
+  const frameCount = lineageCells.length;
+  const pairs = [];
+  for (let f = 1; f < frameCount; f++) pairs.push(pairCells(lineageCells[f - 1], lineageCells[f]));
+  // lineage[ci] holds {cellIndex, frameIndex} entries ordered oldest -> newest.
+  const lineages = [];
+  const tracks = new Map();
+  const lastPair = pairs[pairs.length - 1];
+  const fromC = new Map(lastPair.map((p) => [p.ti, p]));
+  for (let ci = 0; ci < lineageCells[frameCount - 1].length; ci++) {
+    const lineage = [{ cellIndex: ci, frameIndex: frameCount - 1 }];
+    let cursor = ci;
+    for (let f = pairs.length - 1; f >= 0; f--) {
+      const pair = pairs[f].find((p) => p.ti === cursor);
+      if (!pair) break;
+      cursor = pair.si;
+      lineage.push({ cellIndex: cursor, frameIndex: f });
+    }
+    lineage.reverse();
+    lineages.push(lineage);
+    const deltas = [];
+    const masses = [
+      {
+        mass: lineageCells[lineage[0].frameIndex][lineage[0].cellIndex].mass,
+        frameIndex: lineage[0].frameIndex,
+      },
+    ];
+    for (let e = 1; e < lineage.length; e++) {
+      const frameIndex = lineage[e].frameIndex;
+      const pair = pairs[frameIndex - 1].find((p) => p.ti === lineage[e].cellIndex);
+      if (pair) deltas.push({ dx: pair.dx, dy: pair.dy });
+      masses.push({
+        mass: lineageCells[frameIndex][lineage[e].cellIndex].mass,
+        frameIndex,
+      });
+    }
+    const dxs = deltas.map((d) => d.dx).sort((a, b) => a - b);
+    const dys = deltas.map((d) => d.dy).sort((a, b) => a - b);
+    const mid = dxs.length >> 1;
+    const medianDx = dxs.length
+      ? dxs.length % 2
+        ? dxs[mid]
+        : (dxs[mid - 1] + dxs[mid]) / 2
+      : null;
+    const medianDy = dys.length
+      ? dys.length % 2
+        ? dys[mid]
+        : (dys[mid - 1] + dys[mid]) / 2
+      : null;
+    const median = medianDx == null ? null : { dx: medianDx, dy: medianDy };
+    let sigma = 0;
+    if (median) {
+      for (const d of deltas)
+        sigma = Math.max(sigma, Math.hypot(d.dx - median.dx, d.dy - median.dy));
+    }
+    // Growth: exponential mass rate per 5-min step over the lineage, clamped.
+    const first = masses[0];
+    const last = masses[masses.length - 1];
+    let growth = 0;
+    if (first && last.mass > 0 && first.mass > 0 && last.frameIndex > first.frameIndex) {
+      growth = Math.log(last.mass / first.mass) / (last.frameIndex - first.frameIndex);
+      growth = clamp(growth, -NOWCAST_GROWTH_MAX, NOWCAST_GROWTH_MAX);
+    }
+    const d2Pair = lastPair.find((p) => p.ti === ci);
+    // d1 is the step that brought the cell into the second-to-last lineage frame.
+    const prev = lineage.length >= 2 ? lineage[lineage.length - 2] : null;
+    const d1Pair =
+      prev && prev.frameIndex >= 1
+        ? pairs[prev.frameIndex - 1].find((p) => p.ti === prev.cellIndex) || null
+        : null;
+    tracks.set(ci, {
+      d1: d1Pair ? { dx: d1Pair.dx, dy: d1Pair.dy } : null,
+      d2: d2Pair ? { dx: d2Pair.dx, dy: d2Pair.dy } : null,
+      median,
+      sigma,
+      growth,
+      matchedPrevious: deltas.length > 0,
+    });
+  }
+  return { tracks, pairs };
+}
+
+function pixelLngLat(pixel) {
+  const x = pixel % NOWCAST_SIZE;
+  const y = (pixel - x) / NOWCAST_SIZE;
+  const bb = RADAR_BOUNDS[70];
+  return {
+    lng:
+      bb.upperLeft.longitude +
+      ((x + 0.5) / NOWCAST_SIZE) * (bb.lowerRight.longitude - bb.upperLeft.longitude),
+    lat:
+      bb.upperLeft.latitude -
+      ((y + 0.5) / NOWCAST_SIZE) * (bb.upperLeft.latitude - bb.lowerRight.latitude),
+  };
+}
+
+function windDisplacement(pixel, steps) {
+  const { lng, lat } = pixelLngLat(pixel);
+  const w = sampleWind(lng, lat);
+  return {
+    dx:
+      (w.u * steps * 5 * 60) /
+      (111320 * Math.cos((lat * Math.PI) / 180)) /
+      ((RADAR_BOUNDS[70].lowerRight.longitude - RADAR_BOUNDS[70].upperLeft.longitude) /
+        NOWCAST_SIZE),
+    dy:
+      -(w.v * steps * 5 * 60) /
+      110540 /
+      ((RADAR_BOUNDS[70].upperLeft.latitude - RADAR_BOUNDS[70].lowerRight.latitude) / NOWCAST_SIZE),
+  };
+}
+
+function createField(cells, tracks, member, steps, dense = null) {
+  const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (let ci = 0; ci < cells.length; ci++) {
+    const track = tracks.get(ci);
+    let velocity = track?.[member];
+    const sheet =
+      member === 'median' &&
+      (cells[ci].pixels.length > NOWCAST_SHEET_PIXELS ||
+        track?.sigma > NOWCAST_SHEET_SIGMA ||
+        !track?.matchedPrevious);
+    if (sheet && dense) velocity = null;
+    for (const pixel of cells[ci].pixels) {
+      const displacement = velocity
+        ? { dx: velocity.dx * steps, dy: velocity.dy * steps }
+        : dense && sheet
+          ? { dx: dense.dx[pixel] * steps, dy: dense.dy[pixel] * steps }
+          : windDisplacement(pixel, steps);
+      dx[pixel] = displacement.dx;
+      dy[pixel] = displacement.dy;
+    }
+  }
+  return { dx, dy };
+}
+
+function fieldForWind(cells, steps) {
+  const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (const cell of cells) {
+    for (const pixel of cell.pixels) {
+      const displacement = windDisplacement(pixel, steps);
+      dx[pixel] = displacement.dx;
+      dy[pixel] = displacement.dy;
+    }
+  }
+  return { dx, dy };
+}
+
+function advectForward(canvas, cells, field, step, tracks) {
+  const src = canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
+  const output = new Uint8ClampedArray(src.length);
+  const outputLevel = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (let ci = 0; ci < cells.length; ci++) {
+    const cell = cells[ci];
+    const track = tracks?.get(ci);
+    // Per-cell fade: neutral decay, boosted or cancelled by the lineage's
+    // clamped mass-growth rate, so intensifying cells stop fading out.
+    const growth = track?.growth || 0;
+    const fade = clamp(NOWCAST_DECAY * Math.exp(growth), 0.3, 1.2) ** step;
+    const shift = growth > 0.25 ? 1 : growth < -0.25 ? -1 : 0;
+    for (let m = 0; m < cell.pixels.length; m++) {
+      const pixel = cell.pixels[m];
+      const x = pixel % NOWCAST_SIZE;
+      const y = (pixel - x) / NOWCAST_SIZE;
+      const dx = field.dx[pixel];
+      const dy = field.dy[pixel];
+      const tx = Math.round(x + dx);
+      const ty = Math.round(y + dy);
+      if (tx < 0 || tx >= NOWCAST_SIZE || ty < 0 || ty >= NOWCAST_SIZE) continue;
+      const dest = ty * NOWCAST_SIZE + tx;
+      const level = clamp(cell.levels[m] + shift, 1, 3);
+      if (level < outputLevel[dest]) continue;
+      const so = pixel * 4;
+      const o = dest * 4;
+      output[o] = src[so];
+      output[o + 1] = src[so + 1];
+      output[o + 2] = src[so + 2];
+      output[o + 3] = Math.round(src[so + 3] * fade);
+      outputLevel[dest] = level;
+    }
+  }
+  const out = document.createElement('canvas');
+  out.width = NOWCAST_SIZE;
+  out.height = NOWCAST_SIZE;
+  out.getContext('2d').putImageData(new ImageData(output, NOWCAST_SIZE, NOWCAST_SIZE), 0, 0);
+  return { canvas: out, levels: outputLevel };
+}
+
+function maxBlend(members) {
+  const output = new Uint8ClampedArray(NOWCAST_SIZE * NOWCAST_SIZE * 4);
+  const outputLevel = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (const member of members) {
+    const data = member.canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
+    for (let pixel = 0; pixel < outputLevel.length; pixel++) {
+      const level = member.levels[pixel];
+      if (!level || level < outputLevel[pixel]) continue;
+      const so = pixel * 4;
+      output.set(data.subarray(so, so + 4), so);
+      outputLevel[pixel] = level;
+    }
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = NOWCAST_SIZE;
+  canvas.height = NOWCAST_SIZE;
+  canvas.getContext('2d').putImageData(new ImageData(output, NOWCAST_SIZE, NOWCAST_SIZE), 0, 0);
+  return { canvas, levels: outputLevel };
+}
+
+function areaAtPixel(pixel) {
+  if (pixel < 0 || pixel >= SG_RAIN_PIXEL_AREAS.length) return -1;
+  return SG_RAIN_PIXEL_AREAS[pixel] - 1;
+}
+
+function areaVotes(members) {
+  const votes = new Uint8Array(SINGAPORE_AREAS.length);
+  for (const member of members) {
+    const seen = new Uint8Array(SINGAPORE_AREAS.length);
+    for (const packed of SG_RAIN_PIXEL_DATA) {
+      const pixel = packed & RAIN_PIXEL_KEY_MASK;
+      if (!member.levels[pixel]) continue;
+      const area = areaAtPixel(pixel);
+      if (area >= 0) seen[area] = 1;
+    }
+    for (let i = 0; i < seen.length; i++) votes[i] += seen[i];
+  }
+  return votes;
+}
+
+// Max-pools a level field over a square neighborhood so a near-miss forecast
+// still scores: pixel-exact Jaccard zeroes out on small advection errors.
+function neighborhoodMax(levels, radius) {
+  const tmp = new Uint8Array(levels.length);
+  const out = new Uint8Array(levels.length);
+  for (let y = 0; y < NOWCAST_SIZE; y++) {
+    const row = y * NOWCAST_SIZE;
+    for (let x = 0; x < NOWCAST_SIZE; x++) {
+      let m = 0;
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(NOWCAST_SIZE - 1, x + radius);
+      for (let xx = x0; xx <= x1; xx++) {
+        const v = levels[row + xx];
+        if (v > m) m = v;
+      }
+      tmp[row + x] = m;
+    }
+  }
+  for (let x = 0; x < NOWCAST_SIZE; x++) {
+    for (let y = 0; y < NOWCAST_SIZE; y++) {
+      let m = 0;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(NOWCAST_SIZE - 1, y + radius);
+      for (let yy = y0; yy <= y1; yy++) {
+        const v = tmp[yy * NOWCAST_SIZE + x];
+        if (v > m) m = v;
+      }
+      out[y * NOWCAST_SIZE + x] = m;
+    }
+  }
+  return out;
+}
+
+function pooledScore(aPool, bPool) {
+  let intersection = 0;
+  let union = 0;
+  for (let pixel = 0; pixel < aPool.length; pixel++) {
+    const ar = aPool[pixel] > 0;
+    const br = bPool[pixel] > 0;
+    if (ar && br) intersection++;
+    if (ar || br) union++;
+  }
+  return union ? intersection / union : null;
+}
+
+// b is always the actual-rain side; frames with too little real rain to judge
+// a forecast return null so they never inflate the rolling fit.
+function jaccardRain(a, b) {
+  let actual = 0;
+  for (let pixel = 0; pixel < b.levels.length; pixel++) if (b.levels[pixel]) actual++;
+  if (actual < NOWCAST_FIT_MIN_PIXELS) return null;
+  return pooledScore(
+    neighborhoodMax(a.levels, NOWCAST_FIT_POOL),
+    neighborhoodMax(b.levels, NOWCAST_FIT_POOL),
+  );
+}
+
+// Breaks up the nowcast's synchronous CPU work so paint stays responsive.
+const yieldToUI = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+// Search offsets smallest-magnitude first: texture-less blocks score 0 at
+// every offset, and without this ordering they'd match the first tried
+// offset (-12, -12) — phantom max motion that shreds uniform cells.
+const DENSE_OFFSETS = (() => {
+  const list = [];
+  for (let oy = -12; oy <= 12; oy++)
+    for (let ox = -12; ox <= 12; ox++) list.push([ox, oy, ox * ox + oy * oy]);
+  return list.sort((p, q) => p[2] - q[2]).map(([ox, oy]) => [ox, oy]);
+})();
+
+async function estimateDenseFlow(canvasB, canvasC, generation) {
+  const downsample = (canvas) => {
+    const data = canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
+    const field = new Uint8Array(240 * 240);
+    for (let y = 0; y < 240; y++) {
+      for (let x = 0; x < 240; x++) {
+        let level = 0;
+        for (let oy = 0; oy < 2; oy++) {
+          for (let ox = 0; ox < 2; ox++) {
+            const p = ((y * 2 + oy) * NOWCAST_SIZE + x * 2 + ox) * 4;
+            level = Math.max(level, rainLevelForColor(data[p], data[p + 1], data[p + 2]));
+          }
+        }
+        field[y * 240 + x] = level;
+      }
+    }
+    return field;
+  };
+  const a = downsample(canvasB);
+  const b = downsample(canvasC);
+  const bw = 40;
+  const bh = 40;
+  const flowX = new Float32Array(bw * bh);
+  const flowY = new Float32Array(bw * bh);
+  for (let by = 0; by < bh; by++) {
+    if (by && by % 8 === 0) {
+      await yieldToUI();
+      if (generation !== nowcastGeneration) return null;
+    }
+    for (let bx = 0; bx < bw; bx++) {
+      const x0 = bx * 6;
+      const y0 = by * 6;
+      let best = Infinity;
+      let bestX = 0;
+      let bestY = 0;
+      for (const [ox, oy] of DENSE_OFFSETS) {
+        if (x0 + ox < 0 || y0 + oy < 0 || x0 + ox + 5 >= 240 || y0 + oy + 5 >= 240) continue;
+        let score = 0;
+        for (let y = 0; y < 6; y++) {
+          for (let x = 0; x < 6; x++)
+            score += Math.abs(a[(y0 + y) * 240 + x0 + x] - b[(y0 + oy + y) * 240 + x0 + ox]);
+        }
+        if (score < best) {
+          best = score;
+          bestX = ox;
+          bestY = oy;
+          if (!best) break;
+        }
+      }
+      flowX[by * bw + bx] = bestX;
+      flowY[by * bw + bx] = bestY;
+    }
+  }
+  const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (let y = 0; y < NOWCAST_SIZE; y++) {
+    const gy = y / 12;
+    const y0 = Math.min(bh - 1, gy | 0);
+    const y1 = Math.min(bh - 1, y0 + 1);
+    const fy = gy - y0;
+    for (let x = 0; x < NOWCAST_SIZE; x++) {
+      const gx = x / 12;
+      const x0 = Math.min(bw - 1, gx | 0);
+      const x1 = Math.min(bw - 1, x0 + 1);
+      const fx = gx - x0;
+      const i00 = y0 * bw + x0;
+      const i10 = y0 * bw + x1;
+      const i01 = y1 * bw + x0;
+      const i11 = y1 * bw + x1;
+      dx[y * NOWCAST_SIZE + x] =
+        ((flowX[i00] * (1 - fx) + flowX[i10] * fx) * (1 - fy) +
+          (flowX[i01] * (1 - fx) + flowX[i11] * fx) * fy) *
+        2;
+      dy[y * NOWCAST_SIZE + x] =
+        ((flowY[i00] * (1 - fx) + flowY[i10] * fx) * (1 - fy) +
+          (flowY[i01] * (1 - fx) + flowY[i11] * fx) * fy) *
+        2;
+    }
+  }
+  const smoothedX = new Float32Array(dx);
+  const smoothedY = new Float32Array(dy);
+  for (let y = 1; y < NOWCAST_SIZE - 1; y++) {
+    for (let x = 1; x < NOWCAST_SIZE - 1; x++) {
+      const p = y * NOWCAST_SIZE + x;
+      smoothedX[p] =
+        (dx[p - NOWCAST_SIZE - 1] +
+          2 * dx[p - NOWCAST_SIZE] +
+          dx[p - NOWCAST_SIZE + 1] +
+          2 * dx[p - 1] +
+          4 * dx[p] +
+          2 * dx[p + 1] +
+          dx[p + NOWCAST_SIZE - 1] +
+          2 * dx[p + NOWCAST_SIZE] +
+          dx[p + NOWCAST_SIZE + 1]) /
+        16;
+      smoothedY[p] =
+        (dy[p - NOWCAST_SIZE - 1] +
+          2 * dy[p - NOWCAST_SIZE] +
+          dy[p - NOWCAST_SIZE + 1] +
+          2 * dy[p - 1] +
+          4 * dy[p] +
+          2 * dy[p + 1] +
+          dy[p + NOWCAST_SIZE - 1] +
+          2 * dy[p + NOWCAST_SIZE] +
+          dy[p + NOWCAST_SIZE + 1]) /
+        16;
+    }
+  }
+  return { dx: smoothedX, dy: smoothedY };
+}
+
+function staticMember(canvas, cells) {
+  const levels = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (const cell of cells) {
+    for (let i = 0; i < cell.pixels.length; i++) levels[cell.pixels[i]] = cell.levels[i];
+  }
+  return { canvas, levels };
+}
+
+function denseFieldForCells(cells, dense, steps) {
+  const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (const cell of cells) {
+    for (const pixel of cell.pixels) {
+      dx[pixel] = dense.dx[pixel] * steps;
+      dy[pixel] = dense.dy[pixel] * steps;
+    }
+  }
+  return { dx, dy };
+}
+
+function shortHash(values) {
+  let hash = 2166136261;
+  for (const value of values) {
+    const text = String(Math.round(value * 10) / 10);
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+  }
+  return (hash >>> 0).toString(36).slice(0, 8);
+}
+
+function newestLiveSlot(range) {
+  let latest = -Infinity;
+  for (const [slot, frame] of framesMap[range] || [])
+    if (!frame.nowcast && slot > latest) latest = slot;
+  return latest;
+}
+
+function forecastAreaHits(entry) {
+  const areas = SINGAPORE_AREAS.map(([name, region]) => ({
+    name,
+    region,
+    counts: [0, 0, 0, 0],
+  }));
+  for (const packed of SG_RAIN_PIXEL_DATA) {
+    const pixel = packed & RAIN_PIXEL_KEY_MASK;
+    const level = entry.maxBlendLevels[pixel];
+    if (level) areas[packed >>> 18].counts[level]++;
+  }
+  return areas
+    .map((area, index) => ({
+      ...area,
+      area: area.counts[1] + area.counts[2] + area.counts[3],
+      votes: entry.votes[index],
+    }))
+    .filter((area) => area.area && area.votes >= 2);
+}
+
+function hasForecastRain(entry) {
+  for (const packed of SG_RAIN_PIXEL_DATA) {
+    if (entry.maxBlendLevels[packed & RAIN_PIXEL_KEY_MASK]) return true;
+  }
+  return false;
+}
+
+function forecastLightningHints(cells, tracks) {
+  if (!lightningStrikes.length) return [];
+  const now = Date.now();
+  const incoming = new Set();
+  for (let i = 0; i < cells.length; i++) {
+    const track = tracks.get(i);
+    if (!track?.median) continue;
+    const cell = cells[i];
+    const x = Math.round(cell.centroidX + track.median.dx * 3);
+    const y = Math.round(cell.centroidY + track.median.dy * 3);
+    if (x >= 0 && x < NOWCAST_SIZE && y >= 0 && y < NOWCAST_SIZE) {
+      const area = areaAtPixel(y * NOWCAST_SIZE + x);
+      if (area >= 0) incoming.add(area);
+    }
+  }
+  const hinted = new Set();
+  for (const strike of lightningStrikes) {
+    if (strike.t <= now - LIGHTNING_MAX_AGE || strike.t > now) continue;
+    const bb = RADAR_BOUNDS[70];
+    const x = Math.floor(
+      ((strike.lng - bb.upperLeft.longitude) / (bb.lowerRight.longitude - bb.upperLeft.longitude)) *
+        NOWCAST_SIZE,
+    );
+    const y = Math.floor(
+      ((bb.upperLeft.latitude - strike.lat) / (bb.upperLeft.latitude - bb.lowerRight.latitude)) *
+        NOWCAST_SIZE,
+    );
+    const area = areaAtPixel(y * NOWCAST_SIZE + x);
+    if (area >= 0 && !incoming.has(area)) hinted.add(area);
+  }
+  return [...hinted];
+}
+
+// Scores each ensemble member's +5 min forecast for a slot against the live
+// frame that just arrived for that slot; logs per-member pooled Jaccard.
+function scoreMembers(actualSlot, entry) {
+  const frame = framesMap[70]?.get(actualSlot);
+  if (!entry?.members || entry.scored || !frame || frame.nowcast) return;
+  entry.scored = true;
+  prepareFrameImage(70, frame)
+    .then((canvas) => {
+      const actualLevels = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
+      for (const cell of analyzeRainCells(canvas, true))
+        for (let i = 0; i < cell.pixels.length; i++) actualLevels[cell.pixels[i]] = cell.levels[i];
+      const actualPool = neighborhoodMax(actualLevels, NOWCAST_FIT_POOL);
+      const names = ['median', 'd1', 'd2', 'wind', 'dense'];
+      const parts = entry.members.map((levels, i) => {
+        const s = pooledScore(neighborhoodMax(levels, NOWCAST_FIT_POOL), actualPool);
+        return `${names[i]}=${s == null ? 'n/a' : `${Math.round(s * 100)}%`}`;
+      });
+      console.log(`nowcast members @+5min: ${parts.join(' ')}`);
+    })
+    .catch(() => {});
+}
+
+function modelFitPercent() {
+  const cutoff = Date.now() - NOWCAST_FIT_MAX_AGE;
+  while (nowcastFitSamples.length && nowcastFitSamples[0].t < cutoff) nowcastFitSamples.shift();
+  if (!nowcastFitSamples.length) return null;
+  return Math.round(
+    (nowcastFitSamples.reduce((sum, sample) => sum + sample.j, 0) / nowcastFitSamples.length) * 100,
+  );
+}
+
+function recomputeNowcast() {
+  const generation = ++nowcastGeneration;
+  // The +5 min forecast made one slot ago targets the current live slot; keep
+  // its entry alive for member scoring before clear() wipes the maps.
+  const previousSlot = newestLiveSlot(70);
+  const previousEntry = nowcastCanvases.get(previousSlot);
+  const clear = () => {
+    nowcastCanvases.clear();
+    if (framesMap[70]) {
+      for (const [slot, frame] of framesMap[70]) if (frame.nowcast) framesMap[70].delete(slot);
+    }
+    if (framesByRange[70]) framesByRange[70] = framesByRange[70].filter((frame) => !frame.nowcast);
+    summaryShownKey = null;
+  };
+  const redraw = () => {
+    const newSlots = rebuildTimeline();
+    updateSlider(newSlots);
+    if (allTimestamps.length) showFrame(currentIndex);
+  };
+  clear();
+  const latest70 = newestLiveSlot(70);
+  const latestGlobal = Math.max(...RANGES.map((range) => newestLiveSlot(range)));
+  if (
+    !showNowcast ||
+    !Number.isFinite(latest70) ||
+    Date.now() - latest70 > 10 * 60 * 1000 ||
+    latest70 !== latestGlobal
+  ) {
+    redraw();
+    return Promise.resolve();
+  }
+  const liveFrames = [...(framesMap[70] || [])]
+    .filter(([, frame]) => !frame.nowcast)
+    .sort((a, b) => a[0] - b[0])
+    .slice(-NOWCAST_FRAMES)
+    .map(([, frame]) => frame);
+  if (liveFrames.length < 3) {
+    redraw();
+    return Promise.resolve();
+  }
+  const frames = liveFrames;
+  const run = Promise.all(frames.map((frame) => prepareFrameImage(70, frame)))
+    .then(async (canvases) => {
+      if (generation !== nowcastGeneration) return;
+      const canvasC = canvases[canvases.length - 1];
+      const canvasB = canvases[canvases.length - 2];
+      // Cells over the whole 70 km frame (sea and Johor included) so the
+      // forecast tracks weather approaching from outside Singapore.
+      const lineageCells = canvases.map((canvas) => analyzeRainCells(canvas, true));
+      const cellsC = lineageCells[lineageCells.length - 1];
+      const { tracks, pairs } = trackCells(lineageCells);
+      const dense = await estimateDenseFlow(canvasB, canvasC, generation);
+      if (!dense || generation !== nowcastGeneration) return;
+      const hashValues = [];
+      for (const track of tracks.values()) {
+        if (track.median) hashValues.push(track.median.dx, track.median.dy);
+      }
+      const seed = shortHash(hashValues);
+      scoreMembers(latest70, previousEntry);
+      // One-step validation: advect the second-to-last frame by the velocity
+      // that brought its cells in, then pooled-score against the actual frame.
+      const cellsB = lineageCells[lineageCells.length - 2];
+      const velocityPair = pairs[pairs.length - 2] || pairs[pairs.length - 1];
+      const validationTracks = new Map();
+      for (const pair of velocityPair)
+        validationTracks.set(pair.ti, { d1: { dx: pair.dx, dy: pair.dy } });
+      const validation = advectForward(
+        canvasB,
+        cellsB,
+        createField(cellsB, validationTracks, 'd1', 1),
+        1,
+        null,
+      );
+      const j = jaccardRain(validation, staticMember(canvasC, cellsC));
+      if (j != null) {
+        nowcastFitSamples.push({ t: Date.now(), j });
+        while (nowcastFitSamples.length > NOWCAST_FIT_MAX_SAMPLES) nowcastFitSamples.shift();
+      }
+      for (let step = 1; step <= 3; step++) {
+        if (step > 1) {
+          await yieldToUI();
+          if (generation !== nowcastGeneration) return;
+        }
+        const m0 = advectForward(
+          canvasC,
+          cellsC,
+          createField(cellsC, tracks, 'median', step, dense),
+          step,
+          tracks,
+        );
+        const m1 = advectForward(
+          canvasC,
+          cellsC,
+          createField(cellsC, tracks, 'd1', step),
+          step,
+          tracks,
+        );
+        const m2 = advectForward(
+          canvasC,
+          cellsC,
+          createField(cellsC, tracks, 'd2', step),
+          step,
+          tracks,
+        );
+        const m3 = advectForward(canvasC, cellsC, fieldForWind(cellsC, step), step, tracks);
+        const m4 = advectForward(
+          canvasC,
+          cellsC,
+          denseFieldForCells(cellsC, dense, step),
+          step,
+          tracks,
+        );
+        const blend = maxBlend([m0, m1, m2, m3, m4]);
+        const group = [m0, m1, m2, m3, m4];
+        const entry = {
+          median: m0.canvas,
+          maxBlend: blend.canvas,
+          maxBlendLevels: blend.levels,
+          votes: areaVotes(group),
+          hints: forecastLightningHints(cellsC, tracks),
+          members: group.map((m) => m.levels),
+        };
+        const slot = latest70 + step * SLOT_MS;
+        nowcastCanvases.set(slot, entry);
+        framesMap[70].set(slot, {
+          url: `nowcast:${slot}:${seed}`,
+          timestamp: new Date(slot).toISOString(),
+          nowcast: true,
+        });
+      }
+      framesByRange[70] = [...framesMap[70].values()].sort(
+        (a, b) => new Date(a.timestamp) - new Date(b.timestamp),
+      );
+      redraw();
+      if (nowcastControlButton) {
+        const fit = modelFitPercent();
+        const fitText = fit == null ? 'model fit pending' : `model fit ${fit}% (rolling 1 h)`;
+        nowcastControlButton.title = `${fitText} · short-range rain estimate`;
+      }
+    })
+    .catch((error) => {
+      if (generation === nowcastGeneration) {
+        console.error('Nowcast error:', error);
+        redraw();
+      }
+    });
+  return run;
 }
 
 function joinList(items) {
@@ -2737,6 +3667,18 @@ function summarizeRain(hits) {
   return `${word} rain ${parts.join(' & ')}.`;
 }
 
+function summarizeForecast(entry, minutes) {
+  const hits = forecastAreaHits(entry);
+  if (!hits.length) return null;
+  let text = summarizeRain(hits).replace(/\.$/, '');
+  if (entry.hints?.length) {
+    const names = entry.hints.map((index) => SINGAPORE_AREAS[index]?.[0]).filter(Boolean);
+    if (names.length)
+      text += `; lightning hint: possible new shower around ${joinList(names.slice(0, 3))}`;
+  }
+  return `In ${minutes} min — ${text}.`;
+}
+
 let summaryRequest = 0;
 let summaryShownKey = null;
 
@@ -2752,6 +3694,15 @@ function updateRainSummary() {
     summaryShownKey = null;
     el.textContent = '';
     el.classList.remove('show');
+    return;
+  }
+  if (frame.nowcast) {
+    const entry = nowcastCanvases.get(ts);
+    const minutes = Math.max(5, Math.round((ts - newestLiveSlot(70)) / 60000));
+    summaryShownKey = key;
+    const text = entry ? summarizeForecast(entry, minutes) : null;
+    el.textContent = text || '';
+    el.classList.toggle('show', Boolean(text));
     return;
   }
   const promise = frameImageCache.get(key) || prepareFrameImage(70, frame);
@@ -2878,6 +3829,7 @@ function tickCountdown() {
   el.querySelector('.donut-value').textContent = remaining;
   el.setAttribute('title', label);
   el.setAttribute('aria-label', label);
+  if (showNowcast && nowcastCanvases.size) updateSliderCutoff();
 }
 
 pruneApiCache();
@@ -2886,7 +3838,7 @@ fetchAtSlot();
 restartCountdown();
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
-  if (showWind) loadWind();
+  if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
   if (pollRanges.length) pollOnce();
   else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
 });

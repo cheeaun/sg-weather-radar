@@ -17,6 +17,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - MRT/LRT lines and stations overlay
 - Optional cloud-to-ground lightning overlay
 - Optional (off by default) wind particle animation driven by station wind readings
+- Optional (off by default) 15-minute rain nowcast: adds +5/+10/+15 min forecast slots to the timeline, computed client-side from the latest radar frames, station winds, and lightning strikes — rain approaching from outside Singapore (up to the 70 km radar edge) is included; implementation notes in [NOWCAST.md](NOWCAST.md)
 - System / light / dark themes with matching map styles
 - Adjustable radar opacity and boundary clipping
 - Geolocate and navigation controls
