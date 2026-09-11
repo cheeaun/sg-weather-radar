@@ -29,6 +29,7 @@ const PAST_HOURS = 1;
 const RANGES = [480, 240, 70];
 const SLOT_MS = 5 * 60 * 1000;
 const FETCH_PAD_MS = SLOT_MS * 3;
+const WINDOW_MS = PAST_HOURS * 60 * 60 * 1000 + FETCH_PAD_MS;
 const TICK_RANGES = [480, 240, 70];
 const LIGHTNING_MAX_AGE = 10 * 60 * 1000;
 
@@ -764,7 +765,7 @@ async function refreshLightning({ forNowcast = false } = {}) {
 
 async function loadRadarData(fetchFn, ranges = RANGES) {
   const now = sgtNow();
-  const cutoff = new Date(now.getTime() - PAST_HOURS * 60 * 60 * 1000 - FETCH_PAD_MS);
+  const cutoff = new Date(now.getTime() - WINDOW_MS);
   const today = sgtToday();
   const dateStrs = [today];
   if (cutoff < new Date(`${today}T00:00:00`)) dateStrs.unshift(sgtDayOffset(1));
@@ -793,14 +794,21 @@ async function loadRadarData(fetchFn, ranges = RANGES) {
           }
         }
 
-        return {
-          range,
-          bb,
-          frames: allRecords
-            .filter((r) => new Date(r.timestamp) >= cutoff && r.image && r.image.url)
+        const usable = allRecords.filter((r) => r.image && r.image.url);
+        let frames = [];
+        if (usable.length) {
+          // A lagging feed must still show its newest frames: anchor the window on
+          // the latest published frame instead of dropping everything as "expired".
+          let cutoffMs = cutoff.getTime();
+          const newest = Math.max(...usable.map((r) => new Date(r.timestamp).getTime()));
+          if (newest - WINDOW_MS < cutoffMs) cutoffMs = newest - WINDOW_MS;
+          frames = usable
+            .filter((r) => new Date(r.timestamp).getTime() >= cutoffMs)
             .map((r) => ({ url: r.image.url, timestamp: r.timestamp }))
-            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)),
-        };
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        }
+
+        return { range, bb, frames };
       } catch (e) {
         throw new Error(`Range ${range}km: ${e.message}`);
       }
