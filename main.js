@@ -1465,7 +1465,9 @@ function buildRadarCanvas(range, frame, clip) {
   if (frame.nowcast) {
     const entry = nowcastCanvases.get(new Date(frame.timestamp).getTime());
     if (!entry) return Promise.reject(new Error('Nowcast frame unavailable'));
-    return Promise.resolve(entry.maxBlend);
+    // Median member (post spatial-coherence) — max-blend is a 5-member mosaic
+    // and reads as digital noise at map zoom. Votes/summaries still use maxBlend.
+    return Promise.resolve(entry.display);
   }
   return fetchRadarImage(frame.url).then((blob) =>
     createImageBitmap(blob).then((bitmap) => {
@@ -1525,6 +1527,10 @@ function frameImageKey(range, frame, clip) {
 }
 
 function prepareFrameImage(range, frame) {
+  // Nowcast canvases live in nowcastCanvases; caching them here keyed by
+  // nowcast:slot:seed re-serves a stale bitmap after recompute when the seed
+  // (median deltas) is unchanged.
+  if (frame.nowcast) return buildRadarCanvas(range, frame, clipBoundaries);
   const key = frameImageKey(range, frame, clipBoundaries);
   let promise = frameImageCache.get(key);
   if (!promise) {
@@ -3080,6 +3086,38 @@ function fieldForWind(cells, steps) {
   return { dx, dy };
 }
 
+// Display-only field: small cells follow their median track; sheets follow the
+// smooth wind IDW so they shear. When wind is missing (API 429 / far from
+// stations) fall back to low-pass dense — not raw dense, which re-tears.
+function createDisplayField(cells, tracks, steps, dense = null) {
+  const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (let ci = 0; ci < cells.length; ci++) {
+    const track = tracks.get(ci);
+    const velocity = track?.median;
+    const sheet =
+      cells[ci].pixels.length > NOWCAST_SHEET_PIXELS ||
+      track?.sigma > NOWCAST_SHEET_SIGMA ||
+      !track?.matchedPrevious;
+    for (const pixel of cells[ci].pixels) {
+      if (sheet || !velocity) {
+        const w = windDisplacement(pixel, steps);
+        if (w.dx * w.dx + w.dy * w.dy < 0.01 && dense) {
+          dx[pixel] = dense.dx[pixel] * steps;
+          dy[pixel] = dense.dy[pixel] * steps;
+        } else {
+          dx[pixel] = w.dx;
+          dy[pixel] = w.dy;
+        }
+      } else {
+        dx[pixel] = velocity.dx * steps;
+        dy[pixel] = velocity.dy * steps;
+      }
+    }
+  }
+  return { dx, dy };
+}
+
 function advectForward(canvas, cells, field, step, tracks) {
   const src = canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
   const output = new Uint8ClampedArray(src.length);
@@ -3096,21 +3134,57 @@ function advectForward(canvas, cells, field, step, tracks) {
       const pixel = cell.pixels[m];
       const x = pixel % NOWCAST_SIZE;
       const y = (pixel - x) / NOWCAST_SIZE;
-      const dx = field.dx[pixel];
-      const dy = field.dy[pixel];
-      const tx = Math.round(x + dx);
-      const ty = Math.round(y + dy);
-      if (tx < 0 || tx >= NOWCAST_SIZE || ty < 0 || ty >= NOWCAST_SIZE) continue;
-      const dest = ty * NOWCAST_SIZE + tx;
+      const fx = x + field.dx[pixel];
+      const fy = y + field.dy[pixel];
+      const x0 = Math.floor(fx);
+      const y0 = Math.floor(fy);
+      const u = fx - x0;
+      const v = fy - y0;
       const level = clamp(cell.levels[m] + shift, 1, 3);
-      if (level < outputLevel[dest]) continue;
       const so = pixel * 4;
-      const o = dest * 4;
-      output[o] = src[so];
-      output[o + 1] = src[so + 1];
-      output[o + 2] = src[so + 2];
-      output[o + 3] = Math.round(src[so + 3] * fade);
-      outputLevel[dest] = level;
+      const r = src[so];
+      const g = src[so + 1];
+      const b = src[so + 2];
+      const a = Math.round(src[so + 3] * fade);
+      // Dominant bilinear corner at full alpha (no footprint expansion).
+      // Extra corners only when weight is strong (≥0.4) so shear still
+      // bridges without every pixel becoming a 2×2 stamp.
+      let bestW = 0;
+      let bestOx = 0;
+      let bestOy = 0;
+      const ws = [0, 0, 0, 0];
+      let wi = 0;
+      for (let oy = 0; oy <= 1; oy++) {
+        for (let ox = 0; ox <= 1; ox++) {
+          const w = (ox ? u : 1 - u) * (oy ? v : 1 - v);
+          ws[wi++] = w;
+          if (w > bestW) {
+            bestW = w;
+            bestOx = ox;
+            bestOy = oy;
+          }
+        }
+      }
+      wi = 0;
+      for (let oy = 0; oy <= 1; oy++) {
+        for (let ox = 0; ox <= 1; ox++) {
+          const w = ws[wi++];
+          const dominant = ox === bestOx && oy === bestOy;
+          if (!dominant && w < 0.4) continue;
+          if (w <= 0) continue;
+          const tx = x0 + ox;
+          const ty = y0 + oy;
+          if (tx < 0 || tx >= NOWCAST_SIZE || ty < 0 || ty >= NOWCAST_SIZE) continue;
+          const dest = ty * NOWCAST_SIZE + tx;
+          if (level < outputLevel[dest]) continue;
+          const o = dest * 4;
+          output[o] = r;
+          output[o + 1] = g;
+          output[o + 2] = b;
+          output[o + 3] = a;
+          outputLevel[dest] = level;
+        }
+      }
     }
   }
   const out = document.createElement('canvas');
@@ -3120,6 +3194,329 @@ function advectForward(canvas, cells, field, step, tracks) {
   return { canvas: out, levels: outputLevel };
 }
 
+// Rain-preserving 3×3 coherence: only delete isolated speckles, fill holes when
+// neighbors dominate, snap color to the neighborhood's majority rain level.
+// Never turns a connected rain pixel empty — a plain mode filter eats interiors.
+function spatialCoherence(canvas, levels) {
+  const W = NOWCAST_SIZE;
+  const src = canvas.getContext('2d').getImageData(0, 0, W, W);
+  const px = src.data;
+  let curLevels = levels;
+  let curPx = new Uint8ClampedArray(px);
+  for (let pass = 0; pass < 2; pass++) {
+    const outLevels = curLevels.slice();
+    const outPx = curPx.slice();
+    for (let y = 1; y < W - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const p = y * W + x;
+        let n4 = 0;
+        let n8 = 0;
+        let maxL = 0;
+        let maxP = -1;
+        let maxA = -1;
+        const counts = [0, 0, 0, 0];
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const q = (y + oy) * W + (x + ox);
+            const l = curLevels[q];
+            counts[l]++;
+            if (!l) continue;
+            if (ox === 0 && oy === 0) continue;
+            n8++;
+            if (ox === 0 || oy === 0) n4++;
+            const a = curPx[q * 4 + 3];
+            if (l > maxL || (l === maxL && a > maxA)) {
+              maxL = l;
+              maxP = q;
+              maxA = a;
+            }
+          }
+        }
+        const self = curLevels[p];
+        if (self) {
+          if (n4 === 0) {
+            outLevels[p] = 0;
+            outPx[p * 4] = outPx[p * 4 + 1] = outPx[p * 4 + 2] = outPx[p * 4 + 3] = 0;
+            continue;
+          }
+          let modeL = 0;
+          let modeC = 0;
+          for (let l = 3; l >= 1; l--) {
+            if (counts[l] > modeC || (counts[l] === modeC && l > modeL)) {
+              modeC = counts[l];
+              modeL = l;
+            }
+          }
+          if (modeL && modeL !== self) {
+            let srcP = -1;
+            for (let oy = -1; oy <= 1 && srcP < 0; oy++) {
+              for (let ox = -1; ox <= 1; ox++) {
+                const q = (y + oy) * W + (x + ox);
+                if (curLevels[q] === modeL) {
+                  srcP = q;
+                  break;
+                }
+              }
+            }
+            if (srcP >= 0) {
+              outLevels[p] = modeL;
+              outPx[p * 4] = curPx[srcP * 4];
+              outPx[p * 4 + 1] = curPx[srcP * 4 + 1];
+              outPx[p * 4 + 2] = curPx[srcP * 4 + 2];
+              outPx[p * 4 + 3] = Math.max(curPx[p * 4 + 3], curPx[srcP * 4 + 3]);
+            }
+          }
+        } else if ((n8 >= 5 && maxL >= 2) || (n4 >= 2 && n8 >= 4 && maxL >= 2)) {
+          outLevels[p] = maxL;
+          if (maxP >= 0) {
+            outPx[p * 4] = curPx[maxP * 4];
+            outPx[p * 4 + 1] = curPx[maxP * 4 + 1];
+            outPx[p * 4 + 2] = curPx[maxP * 4 + 2];
+            outPx[p * 4 + 3] = curPx[maxP * 4 + 3];
+          }
+        }
+      }
+    }
+    curLevels = outLevels;
+    curPx = outPx;
+  }
+  const out = document.createElement('canvas');
+  out.width = W;
+  out.height = W;
+  out.getContext('2d').putImageData(new ImageData(curPx, W, W), 0, 0);
+  return { canvas: out, levels: curLevels };
+}
+
+// Binary morphological close seals multi-pixel holes that 3×3 fills miss
+// after sheared advection. Dilate-then-erode restores outer shape.
+function fillHoles(canvas, levels, radius = 2) {
+  const W = NOWCAST_SIZE;
+  const px = canvas.getContext('2d').getImageData(0, 0, W, W).data;
+  const mask = new Uint8Array(W * W);
+  for (let i = 0; i < mask.length; i++) mask[i] = levels[i] ? 1 : 0;
+  const dil = new Uint8Array(W * W);
+  for (let y = 0; y < W; y++) {
+    for (let x = 0; x < W; x++) {
+      let m = 0;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(W - 1, y + radius);
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(W - 1, x + radius);
+      outer: for (let yy = y0; yy <= y1; yy++) {
+        for (let xx = x0; xx <= x1; xx++) {
+          if (mask[yy * W + xx]) {
+            m = 1;
+            break outer;
+          }
+        }
+      }
+      dil[y * W + x] = m;
+    }
+  }
+  const closed = new Uint8Array(W * W);
+  for (let y = 0; y < W; y++) {
+    for (let x = 0; x < W; x++) {
+      let m = 1;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(W - 1, y + radius);
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(W - 1, x + radius);
+      outer: for (let yy = y0; yy <= y1; yy++) {
+        for (let xx = x0; xx <= x1; xx++) {
+          if (!dil[yy * W + xx]) {
+            m = 0;
+            break outer;
+          }
+        }
+      }
+      closed[y * W + x] = m;
+    }
+  }
+  const outLevels = levels.slice();
+  const outPx = new Uint8ClampedArray(px);
+  for (let y = 0; y < W; y++) {
+    for (let x = 0; x < W; x++) {
+      const p = y * W + x;
+      if (levels[p] || !closed[p]) continue;
+      // Inverse-distance weighted colors so filled gaps blend with the rim
+      // instead of stamping one neighbor's color as a flat rectangle.
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let a = 0;
+      let lAcc = 0;
+      let wSum = 0;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(W - 1, y + radius);
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(W - 1, x + radius);
+      for (let yy = y0; yy <= y1; yy++) {
+        for (let xx = x0; xx <= x1; xx++) {
+          const q = yy * W + xx;
+          if (!levels[q]) continue;
+          const dy = yy - y;
+          const dx = xx - x;
+          const w = 1 / (dy * dy + dx * dx + 0.25);
+          r += px[q * 4] * w;
+          g += px[q * 4 + 1] * w;
+          b += px[q * 4 + 2] * w;
+          a += px[q * 4 + 3] * w;
+          lAcc += levels[q] * w;
+          wSum += w;
+        }
+      }
+      if (wSum <= 0) continue;
+      outLevels[p] = clamp(Math.round(lAcc / wSum), 1, 3);
+      outPx[p * 4] = r / wSum;
+      outPx[p * 4 + 1] = g / wSum;
+      outPx[p * 4 + 2] = b / wSum;
+      outPx[p * 4 + 3] = a / wSum;
+    }
+  }
+  const out = document.createElement('canvas');
+  out.width = W;
+  out.height = W;
+  out.getContext('2d').putImageData(new ImageData(outPx, W, W), 0, 0);
+  return { canvas: out, levels: outLevels };
+}
+
+// Flood empty space from the image border; anything empty still unvisited is
+// an enclosed hole (including large axis-aligned voids). Fills those with
+// IDW rim colors without touching open exterior.
+function fillEnclosedHoles(canvas, levels) {
+  const W = NOWCAST_SIZE;
+  const px = canvas.getContext('2d').getImageData(0, 0, W, W).data;
+  const emptyOpen = new Uint8Array(W * W);
+  const queue = new Int32Array(W * W);
+  let qn = 0;
+  const seed = (p) => {
+    if (levels[p] || emptyOpen[p]) return;
+    emptyOpen[p] = 1;
+    queue[qn++] = p;
+  };
+  for (let x = 0; x < W; x++) {
+    seed(x);
+    seed((W - 1) * W + x);
+  }
+  for (let y = 0; y < W; y++) {
+    seed(y * W);
+    seed(y * W + (W - 1));
+  }
+  let head = 0;
+  while (head < qn) {
+    const p = queue[head++];
+    const x = p % W;
+    const y = (p - x) / W;
+    if (x > 0) seed(p - 1);
+    if (x + 1 < W) seed(p + 1);
+    if (y > 0) seed(p - W);
+    if (y + 1 < W) seed(p + W);
+  }
+  let curLevels = levels.slice();
+  let curPx = new Uint8ClampedArray(px);
+  // Grow inward so deep interior pixels pick up already-filled rim colors.
+  for (let pass = 0; pass < 48; pass++) {
+    const outLevels = curLevels.slice();
+    const outPx = curPx.slice();
+    let filled = 0;
+    for (let y = 1; y < W - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        const p = y * W + x;
+        if (curLevels[p] || emptyOpen[p]) continue;
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let a = 0;
+        let lAcc = 0;
+        let wSum = 0;
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const q = (y + oy) * W + (x + ox);
+            const l = curLevels[q];
+            if (!l) continue;
+            const w = 1 / (ox * ox + oy * oy + 0.25);
+            r += curPx[q * 4] * w;
+            g += curPx[q * 4 + 1] * w;
+            b += curPx[q * 4 + 2] * w;
+            a += curPx[q * 4 + 3] * w;
+            lAcc += l * w;
+            wSum += w;
+          }
+        }
+        if (wSum <= 0) continue;
+        outLevels[p] = clamp(Math.round(lAcc / wSum), 1, 3);
+        outPx[p * 4] = r / wSum;
+        outPx[p * 4 + 1] = g / wSum;
+        outPx[p * 4 + 2] = b / wSum;
+        outPx[p * 4 + 3] = a / wSum;
+        filled++;
+      }
+    }
+    curLevels = outLevels;
+    curPx = outPx;
+    if (!filled) break;
+  }
+  const out = document.createElement('canvas');
+  out.width = W;
+  out.height = W;
+  out.getContext('2d').putImageData(new ImageData(curPx, W, W), 0, 0);
+  return { canvas: out, levels: curLevels };
+}
+
+// Drop diagonal-only speckles and fill 1-px holes inside rain. Keeps real
+// edges intact — unlike a plain dilate/erode close, which inflates blobs.
+function cleanBlend(blend) {
+  const W = NOWCAST_SIZE;
+  const { levels, canvas } = blend;
+  const data = canvas.getContext('2d').getImageData(0, 0, W, W);
+  const px = data.data;
+  const outLevels = levels.slice();
+  const outPx = new Uint8ClampedArray(px);
+  for (let y = 1; y < W - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const p = y * W + x;
+      let n4 = 0;
+      let n8 = 0;
+      let maxL = 0;
+      let maxP = -1;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const q = (y + oy) * W + (x + ox);
+          const l = levels[q];
+          if (!l) continue;
+          if (ox === 0 && oy === 0) {
+            maxL = l;
+            maxP = q;
+            continue;
+          }
+          n8++;
+          if (ox === 0 || oy === 0) n4++;
+          if (l > maxL) {
+            maxL = l;
+            maxP = q;
+          }
+        }
+      }
+      const self = levels[p];
+      if (self) {
+        if (n4 === 0) {
+          outLevels[p] = 0;
+          outPx[p * 4] = outPx[p * 4 + 1] = outPx[p * 4 + 2] = outPx[p * 4 + 3] = 0;
+        }
+      } else if (n4 >= 2 && n8 >= 4 && maxP >= 0) {
+        outLevels[p] = maxL;
+        outPx[p * 4] = px[maxP * 4];
+        outPx[p * 4 + 1] = px[maxP * 4 + 1];
+        outPx[p * 4 + 2] = px[maxP * 4 + 2];
+        outPx[p * 4 + 3] = px[maxP * 4 + 3];
+      }
+    }
+  }
+  canvas.getContext('2d').putImageData(new ImageData(outPx, W, W), 0, 0);
+  blend.levels = outLevels;
+  return blend;
+}
+
 function maxBlend(members) {
   const output = new Uint8ClampedArray(NOWCAST_SIZE * NOWCAST_SIZE * 4);
   const outputLevel = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
@@ -3127,7 +3524,8 @@ function maxBlend(members) {
     const data = member.canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
     for (let pixel = 0; pixel < outputLevel.length; pixel++) {
       const level = member.levels[pixel];
-      if (!level || level < outputLevel[pixel]) continue;
+      // First member wins ties so median colors beat the noisier dense member.
+      if (!level || level <= outputLevel[pixel]) continue;
       const so = pixel * 4;
       output.set(data.subarray(so, so + 4), so);
       outputLevel[pixel] = level;
@@ -3137,7 +3535,8 @@ function maxBlend(members) {
   canvas.width = NOWCAST_SIZE;
   canvas.height = NOWCAST_SIZE;
   canvas.getContext('2d').putImageData(new ImageData(output, NOWCAST_SIZE, NOWCAST_SIZE), 0, 0);
-  return { canvas, levels: outputLevel };
+  const cleaned = cleanBlend({ canvas, levels: outputLevel });
+  return spatialCoherence(cleaned.canvas, cleaned.levels);
 }
 
 function areaAtPixel(pixel) {
@@ -3309,36 +3708,51 @@ async function estimateDenseFlow(canvasB, canvasC, generation) {
         2;
     }
   }
-  const smoothedX = new Float32Array(dx);
-  const smoothedY = new Float32Array(dy);
-  for (let y = 1; y < NOWCAST_SIZE - 1; y++) {
-    for (let x = 1; x < NOWCAST_SIZE - 1; x++) {
-      const p = y * NOWCAST_SIZE + x;
-      smoothedX[p] =
-        (dx[p - NOWCAST_SIZE - 1] +
-          2 * dx[p - NOWCAST_SIZE] +
-          dx[p - NOWCAST_SIZE + 1] +
-          2 * dx[p - 1] +
-          4 * dx[p] +
-          2 * dx[p + 1] +
-          dx[p + NOWCAST_SIZE - 1] +
-          2 * dx[p + NOWCAST_SIZE] +
-          dx[p + NOWCAST_SIZE + 1]) /
-        16;
-      smoothedY[p] =
-        (dy[p - NOWCAST_SIZE - 1] +
-          2 * dy[p - NOWCAST_SIZE] +
-          dy[p - NOWCAST_SIZE + 1] +
-          2 * dy[p - 1] +
-          4 * dy[p] +
-          2 * dy[p + 1] +
-          dy[p + NOWCAST_SIZE - 1] +
-          2 * dy[p + NOWCAST_SIZE] +
-          dy[p + NOWCAST_SIZE + 1]) /
-        16;
+  // Low-pass the flow: 4× box average then bilinear upsample. A few 3×3
+  // Gaussians leave 12-px block-grid tears; this removes block structure
+  // while keeping large-scale shear so cells deform instead of sliding.
+  const lw = NOWCAST_SIZE / 4;
+  const lx = new Float32Array(lw * lw);
+  const ly = new Float32Array(lw * lw);
+  for (let y = 0; y < lw; y++) {
+    for (let x = 0; x < lw; x++) {
+      let sx = 0;
+      let sy = 0;
+      for (let oy = 0; oy < 4; oy++) {
+        for (let ox = 0; ox < 4; ox++) {
+          const p = (y * 4 + oy) * NOWCAST_SIZE + (x * 4 + ox);
+          sx += dx[p];
+          sy += dy[p];
+        }
+      }
+      lx[y * lw + x] = sx / 16;
+      ly[y * lw + x] = sy / 16;
     }
   }
-  return { dx: smoothedX, dy: smoothedY };
+  const outX = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  const outY = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  for (let y = 0; y < NOWCAST_SIZE; y++) {
+    const gy = y / 4;
+    const y0 = Math.min(lw - 1, gy | 0);
+    const y1 = Math.min(lw - 1, y0 + 1);
+    const fy = gy - y0;
+    for (let x = 0; x < NOWCAST_SIZE; x++) {
+      const gx = x / 4;
+      const x0 = Math.min(lw - 1, gx | 0);
+      const x1 = Math.min(lw - 1, x0 + 1);
+      const fx = gx - x0;
+      const i00 = y0 * lw + x0;
+      const i10 = y0 * lw + x1;
+      const i01 = y1 * lw + x0;
+      const i11 = y1 * lw + x1;
+      const p = y * NOWCAST_SIZE + x;
+      outX[p] =
+        (lx[i00] * (1 - fx) + lx[i10] * fx) * (1 - fy) + (lx[i01] * (1 - fx) + lx[i11] * fx) * fy;
+      outY[p] =
+        (ly[i00] * (1 - fx) + ly[i10] * fx) * (1 - fy) + (ly[i01] * (1 - fx) + ly[i11] * fx) * fy;
+    }
+  }
+  return { dx: outX, dy: outY };
 }
 
 function staticMember(canvas, cells) {
@@ -3407,7 +3821,7 @@ function hasForecastRain(entry) {
   return false;
 }
 
-function forecastLightningHints(cells, tracks) {
+function forecastLightningHints(cells, tracks, step) {
   if (!lightningStrikes.length) return [];
   const now = Date.now();
   const incoming = new Set();
@@ -3415,8 +3829,8 @@ function forecastLightningHints(cells, tracks) {
     const track = tracks.get(i);
     if (!track?.median) continue;
     const cell = cells[i];
-    const x = Math.round(cell.centroidX + track.median.dx * 3);
-    const y = Math.round(cell.centroidY + track.median.dy * 3);
+    const x = Math.round(cell.centroidX + track.median.dx * step);
+    const y = Math.round(cell.centroidY + track.median.dy * step);
     if (x >= 0 && x < NOWCAST_SIZE && y >= 0 && y < NOWCAST_SIZE) {
       const area = areaAtPixel(y * NOWCAST_SIZE + x);
       if (area >= 0) incoming.add(area);
@@ -3561,6 +3975,13 @@ function recomputeNowcast() {
           step,
           tracks,
         );
+        const displaySource = advectForward(
+          canvasC,
+          cellsC,
+          createDisplayField(cellsC, tracks, step, dense),
+          step,
+          tracks,
+        );
         const m1 = advectForward(
           canvasC,
           cellsC,
@@ -3585,12 +4006,15 @@ function recomputeNowcast() {
         );
         const blend = maxBlend([m0, m1, m2, m3, m4]);
         const group = [m0, m1, m2, m3, m4];
+        const coherent = spatialCoherence(displaySource.canvas, displaySource.levels);
+        // Seal tiny gaps first so large voids count as enclosed, then fill them.
+        const smallGaps = fillHoles(coherent.canvas, coherent.levels);
         const entry = {
-          median: m0.canvas,
+          display: fillEnclosedHoles(smallGaps.canvas, smallGaps.levels).canvas,
           maxBlend: blend.canvas,
           maxBlendLevels: blend.levels,
           votes: areaVotes(group),
-          hints: forecastLightningHints(cellsC, tracks),
+          hints: forecastLightningHints(cellsC, tracks, step),
           members: group.map((m) => m.levels),
         };
         const slot = latest70 + step * SLOT_MS;

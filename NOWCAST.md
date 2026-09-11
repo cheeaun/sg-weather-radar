@@ -95,13 +95,39 @@ over canvases already in `frameImageCache`.
   rejections — always check the full `console` log when the nowcast is
   silently absent.
 - **Pooled-metric inflation**: see support floor above.
+- **Raw dense on the map**: dense's 12-px block grid tears sheet cells into
+  axis-aligned rectangles (sharp voids showing the basemap). Display must
+  use wind IDW (or low-pass dense), never raw dense. A few Gaussian passes
+  are not enough — 4× box-average + bilinear upsample is.
+- **Naive 3×3 mode filter / canvas blur on display**: mode eats interiors
+  into white holes; blur thins alpha so the basemap shows through as pale
+  rectangles. Fills must be rain-preserving (delete only isolated speckles).
+- **Uniform-color hole fill**: stamping one max-level neighbor's RGBA into a
+  multi-pixel hole paints a flat rectangle. Use IDW rim colors.
+- **Full 4-corner bilinear splat**: every pixel becomes a 2×2 stamp → light
+  rain over-populates on +5. Splat the dominant corner; extra corners only
+  when weight ≥ 0.4.
+- **Stale nowcast cache**: `frameImageKey` includes `nowcast:slot:seed`; a
+  recompute with unchanged median deltas re-served the old bitmap. Nowcast
+  frames bypass `frameImageCache`.
+- **Lightning hints always +15**: `forecastLightningHints` hardcoded ×3
+  steps on every slot. Pass `step` through.
 
-## Remaining jaggedness (known, accepted)
+## Transport & blend cleanup
 
-Transport is nearest-neighbor (`round(x + dx)` per pixel). Where the
-displacement field has a real gradient, rows stretch into dotted edges or
-compress. Only visible at genuine rain edges; fix would be bilinear splat
-weights. Only do it if it's visibly offensive in heavy rain.
+Transport is bilinear splat of the **dominant** corner at full fade alpha;
+extra corners only when weight ≥ 0.4 (bridges shear without turning every
+pixel into a 2×2 stamp — full-footprint splat made light rain over-populate
+on +5). Spatial fills require a moderate-or-heavier neighbor (`maxL >= 2`)
+so light fringes don't bloat. Dense flow is low-passed (4× box + bilinear).
+
+**Map display** uses a dedicated `createDisplayField`: small cells follow
+their median track; sheets follow the **wind IDW** (smooth shear, no block
+grid). If wind is missing (API 429 / mask 0) sheets fall back to **low-pass
+dense** (4× box average + bilinear upsample) — never raw dense, which
+re-tears into axis-aligned rectangles. Raw dense stays in the ensemble for
+votes. Pipeline: `advectForward(displayField)` → `spatialCoherence` →
+`fillHoles` → `fillEnclosedHoles`. Nowcast frames bypass `frameImageCache`.
 
 ## Tuning constants (main.js, NOWCAST_* block)
 

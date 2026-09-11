@@ -17,3 +17,4 @@ dist/
 
 # local tooling artifacts (browser automation logs/screenshots)
 .playwright-mcp/
+.playwright-cli/
