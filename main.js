@@ -91,6 +91,13 @@ const failedImages = new Set();
 const nowcastCanvases = new Map();
 let nowcastGeneration = 0;
 let nowcastControlButton = null;
+// Rain-near-me: live only while geolocation tracking is active.
+let rainNearTracking = false;
+let rainNearLng = null;
+let rainNearLat = null;
+let rainNearShown = false;
+// Nearest-rain connector endpoints when the local line is in rain mode.
+let rainNearHit = null;
 
 function clamp(v, min, max) {
   return Math.min(max, Math.max(min, v));
@@ -529,14 +536,37 @@ function initMap() {
   map.addControl(new WindToggleControl(), 'bottom-right');
   map.addControl(new LightningToggleControl(), 'bottom-right');
   map.addControl(new NowcastToggleControl(), 'bottom-right');
-  map.addControl(
-    new maplibregl.GeolocateControl({
-      positionOptions: { enableHighAccuracy: true },
-      trackUserLocation: true,
-      showUserHeading: true,
-    }),
-    'bottom-right',
-  );
+  const geolocateControl = new maplibregl.GeolocateControl({
+    positionOptions: { enableHighAccuracy: true },
+    trackUserLocation: true,
+    showUserHeading: true,
+  });
+  geolocateControl.on('geolocate', (e) => {
+    rainNearTracking = true;
+    rainNearLng = e.coords.longitude;
+    rainNearLat = e.coords.latitude;
+    updateRainNearCircle();
+    updateRainNearLink();
+    updateRainSummary({ force: true });
+  });
+  geolocateControl.on('trackuserlocationend', () => {
+    // Panning drops to BACKGROUND and keeps the watch; only an explicit stop is OFF.
+    if (
+      document
+        .querySelector('.maplibregl-ctrl-geolocate')
+        ?.classList.contains('maplibregl-ctrl-geolocate-background')
+    )
+      return;
+    rainNearTracking = false;
+    rainNearLng = null;
+    rainNearLat = null;
+    rainNearShown = false;
+    rainNearHit = null;
+    updateRainNearCircle();
+    updateRainNearLink();
+    updateRainSummary({ force: true });
+  });
+  map.addControl(geolocateControl, 'bottom-right');
   map.addControl(panelControl('.masthead'), 'top-left');
   map.addControl(panelControl('.console'), 'bottom-left');
   map.addControl(panelControl('.settings-btn'), 'top-right');
@@ -560,8 +590,11 @@ function initMap() {
     addWindLayer();
     addBoundaryLayers();
     addLightningLayer();
+    addRainNearCircleLayer();
+    addRainNearLinkLayer();
     raisePlaceLabels();
   });
+  map.on('moveend', updateRainNearLinkLabelVisibility);
   applyTheme();
 }
 
@@ -4071,16 +4104,283 @@ function summarizeForecast(entry, minutes) {
 let summaryRequest = 0;
 let summaryShownKey = null;
 
-function updateRainSummary() {
+// ~5 km/h walk; 15 min ≈ 1.25 km ≈ 4–5 radar pixels (~290 m/px).
+const WALK_M_PER_MIN = 83.3;
+const RAIN_NEAR_ENTER_MIN = 15;
+const RAIN_NEAR_EXIT_MIN = 18;
+const RAIN_NEAR_M_PER_PX =
+  110540 *
+  ((RADAR_BOUNDS[70].upperLeft.latitude - RADAR_BOUNDS[70].lowerRight.latitude) / NOWCAST_SIZE);
+const RAIN_NEAR_ARROWS = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'];
+
+function lngLatToRadarPixel(lng, lat) {
+  const bb = RADAR_BOUNDS[70];
+  return {
+    x: Math.floor(
+      ((lng - bb.upperLeft.longitude) / (bb.lowerRight.longitude - bb.upperLeft.longitude)) *
+        NOWCAST_SIZE,
+    ),
+    y: Math.floor(
+      ((bb.upperLeft.latitude - lat) / (bb.upperLeft.latitude - bb.lowerRight.latitude)) *
+        NOWCAST_SIZE,
+    ),
+  };
+}
+
+function rainNearWalkMinutes(px) {
+  return Math.max(1, Math.round((px * RAIN_NEAR_M_PER_PX) / WALK_M_PER_MIN));
+}
+
+function bearingArrow(fromX, fromY, toX, toY) {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  if (dx === 0 && dy === 0) return '↑';
+  const bearing = Math.atan2(dx, -dy);
+  const octant = ((Math.round(bearing / (Math.PI / 4)) % 8) + 8) % 8;
+  return RAIN_NEAR_ARROWS[octant];
+}
+
+function scanLocalRain(canvas, ux, uy, radiusPx) {
+  const W = canvas.width;
+  const H = canvas.height;
+  if (ux < 0 || uy < 0 || ux >= W || uy >= H) return null;
+  const x0 = Math.max(0, ux - radiusPx);
+  const y0 = Math.max(0, uy - radiusPx);
+  const x1 = Math.min(W - 1, ux + radiusPx);
+  const y1 = Math.min(H - 1, uy + radiusPx);
+  const bw = x1 - x0 + 1;
+  const data = canvas.getContext('2d').getImageData(x0, y0, bw, y1 - y0 + 1).data;
+  const levelAt = (x, y) => {
+    const i = ((y - y0) * bw + (x - x0)) * 4;
+    return rainLevelForColor(data[i], data[i + 1], data[i + 2]);
+  };
+  const onUser = levelAt(ux, uy) > 0;
+  let bestRain = null;
+  let bestDry = null;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dist = Math.hypot(x - ux, y - uy);
+      if (dist > radiusPx) continue;
+      const level = levelAt(x, y);
+      if (level > 0) {
+        if (
+          !bestRain ||
+          dist < bestRain.dist ||
+          (dist === bestRain.dist && level > bestRain.level)
+        ) {
+          bestRain = { dist, x, y, level };
+        }
+      } else if (dist > 0 && (!bestDry || dist < bestDry.dist)) {
+        bestDry = { dist, x, y };
+      }
+    }
+  }
+  return { onUser, bestRain, bestDry };
+}
+
+function rainNearRadiusKm() {
+  return (RAIN_NEAR_ENTER_MIN * WALK_M_PER_MIN) / 1000;
+}
+
+function addRainNearCircleLayer() {
+  if (!map || !styleReady) return;
+  if (map.getSource('rain-near-circle')) {
+    updateRainNearCircle();
+    return;
+  }
+  map.addSource('rain-near-circle', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  map.addLayer({
+    id: 'rain-near-circle',
+    type: 'line',
+    source: 'rain-near-circle',
+    layout: { visibility: 'none', 'line-cap': 'butt', 'line-join': 'round' },
+    paint: {
+      // Same blue as MapLibre's user-location puck.
+      'line-color': '#1da1f2',
+      'line-width': 1.5,
+      'line-dasharray': [2, 2],
+      'line-opacity': 0.85,
+    },
+  });
+  updateRainNearCircle();
+}
+
+function updateRainNearCircle() {
+  if (
+    !map ||
+    !styleReady ||
+    !map.getSource('rain-near-circle') ||
+    !map.getLayer('rain-near-circle')
+  )
+    return;
+  const visible = rainNearTracking && rainNearLng != null && rainNearLat != null;
+  map.setLayoutProperty('rain-near-circle', 'visibility', visible ? 'visible' : 'none');
+  const ring = visible
+    ? circlePolygon(rainNearLng, rainNearLat, rainNearRadiusKm()).coordinates[0]
+    : null;
+  map.getSource('rain-near-circle').setData({
+    type: 'FeatureCollection',
+    features: ring
+      ? [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: ring } }]
+      : [],
+  });
+}
+
+// Returns a local awareness line, or null to leave the island-wide summary alone.
+function rainNearLine(canvas) {
+  rainNearHit = null;
+  if (!rainNearTracking || rainNearLng == null || rainNearLat == null) {
+    rainNearShown = false;
+    updateRainNearLink();
+    return null;
+  }
+  const { x: ux, y: uy } = lngLatToRadarPixel(rainNearLng, rainNearLat);
+  const enterPx = (RAIN_NEAR_ENTER_MIN * WALK_M_PER_MIN) / RAIN_NEAR_M_PER_PX;
+  const exitPx = (RAIN_NEAR_EXIT_MIN * WALK_M_PER_MIN) / RAIN_NEAR_M_PER_PX;
+  const limit = rainNearShown ? exitPx : enterPx;
+  const result = scanLocalRain(canvas, ux, uy, Math.ceil(limit));
+  if (!result) {
+    rainNearShown = false;
+    updateRainNearLink();
+    return null;
+  }
+  let line = null;
+  if (!result.onUser) {
+    const hit = result.bestRain;
+    if (hit && hit.dist <= limit) {
+      const arrow = bearingArrow(ux, uy, hit.x, hit.y);
+      const word = LEVEL_WORDS[hit.level].toLowerCase();
+      line = `Rain ~${rainNearWalkMinutes(hit.dist)} min ${arrow} · ${word}.`;
+      const to = pixelLngLat(hit.y * NOWCAST_SIZE + hit.x);
+      rainNearHit = {
+        fromLng: rainNearLng,
+        fromLat: rainNearLat,
+        toLng: to.lng,
+        toLat: to.lat,
+        minutes: rainNearWalkMinutes(hit.dist),
+      };
+    }
+  } else if (result.bestDry && result.bestDry.dist <= limit) {
+    const arrow = bearingArrow(ux, uy, result.bestDry.x, result.bestDry.y);
+    line = `Clear ~${rainNearWalkMinutes(result.bestDry.dist)} min ${arrow}.`;
+  }
+  rainNearShown = Boolean(line);
+  updateRainNearLink();
+  return line;
+}
+
+function addRainNearLinkLayer() {
+  if (!map || !styleReady) return;
+  if (map.getSource('rain-near-link')) {
+    updateRainNearLink();
+    return;
+  }
+  map.addSource('rain-near-link', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  map.addLayer({
+    id: 'rain-near-link',
+    type: 'line',
+    source: 'rain-near-link',
+    layout: { visibility: 'none', 'line-cap': 'butt' },
+    paint: {
+      'line-color': '#0b6ea8',
+      'line-width': 1.75,
+      'line-dasharray': [4, 3],
+      'line-opacity': 0.9,
+    },
+  });
+  map.addLayer({
+    id: 'rain-near-link-label',
+    type: 'symbol',
+    source: 'rain-near-link',
+    filter: ['==', ['geometry-type'], 'Point'],
+    layout: {
+      visibility: 'none',
+      'text-field': ['get', 'minutes'],
+      'text-font': ['Noto Sans Bold'],
+      'text-size': 11,
+      'text-allow-overlap': false,
+      'text-ignore-placement': false,
+    },
+    paint: {
+      'text-color': '#0b6ea8',
+      'text-halo-color': boundaryTextHalo(),
+      'text-halo-width': 2,
+    },
+  });
+  updateRainNearLink();
+}
+
+function updateRainNearLink() {
+  if (!map || !styleReady || !map.getSource('rain-near-link') || !map.getLayer('rain-near-link'))
+    return;
+  const visible = Boolean(rainNearHit);
+  map.setLayoutProperty('rain-near-link', 'visibility', visible ? 'visible' : 'none');
+  map.getSource('rain-near-link').setData({
+    type: 'FeatureCollection',
+    features: visible
+      ? [
+          {
+            type: 'Feature',
+            properties: { minutes: `${rainNearHit.minutes} min` },
+            geometry: {
+              type: 'LineString',
+              coordinates: [
+                [rainNearHit.fromLng, rainNearHit.fromLat],
+                [rainNearHit.toLng, rainNearHit.toLat],
+              ],
+            },
+          },
+          {
+            type: 'Feature',
+            properties: { minutes: `${rainNearHit.minutes} min` },
+            geometry: {
+              type: 'Point',
+              coordinates: [
+                (rainNearHit.fromLng + rainNearHit.toLng) / 2,
+                (rainNearHit.fromLat + rainNearHit.toLat) / 2,
+              ],
+            },
+          },
+        ]
+      : [],
+  });
+  updateRainNearLinkLabelVisibility();
+}
+
+function updateRainNearLinkLabelVisibility() {
+  if (!map || !styleReady || !map.getLayer('rain-near-link-label')) return;
+  if (!rainNearHit) {
+    map.setLayoutProperty('rain-near-link-label', 'visibility', 'none');
+    return;
+  }
+  const a = map.project([rainNearHit.fromLng, rainNearHit.fromLat]);
+  const b = map.project([rainNearHit.toLng, rainNearHit.toLat]);
+  const screenLen = Math.hypot(a.x - b.x, a.y - b.y);
+  map.setLayoutProperty('rain-near-link-label', 'visibility', screenLen < 48 ? 'none' : 'visible');
+}
+
+function updateRainSummary({ force = false } = {}) {
   const el = document.getElementById('rain-summary');
   const ts = allTimestamps[currentIndex] ? new Date(allTimestamps[currentIndex]).getTime() : null;
   const frame = ts != null ? framesMap[70]?.get(ts) : null;
   const key =
     frame && !failedImages.has(frame.url) ? frameImageKey(70, frame, clipBoundaries) : null;
-  if (key === summaryShownKey) return;
+  const liveSlot = newestLiveSlot(70);
+  const isLive = !frame?.nowcast && ts != null && ts === liveSlot;
+  const posSig = rainNearTracking && rainNearLng != null ? `${rainNearLng},${rainNearLat}` : '';
+  const cacheKey =
+    key == null ? null : isLive ? `${key}|${posSig}|${rainNearShown ? 1 : 0}` : `${key}||0`;
+  if (!force && cacheKey === summaryShownKey) return;
   const req = ++summaryRequest;
   if (!key) {
     summaryShownKey = null;
+    rainNearShown = false;
     el.textContent = '';
     el.classList.remove('show');
     return;
@@ -4088,7 +4388,7 @@ function updateRainSummary() {
   if (frame.nowcast) {
     const entry = nowcastCanvases.get(ts);
     const minutes = Math.max(5, Math.round((ts - newestLiveSlot(70)) / 60000));
-    summaryShownKey = key;
+    summaryShownKey = cacheKey;
     const text = entry ? summarizeForecast(entry, minutes) : null;
     el.textContent = text || '';
     el.classList.toggle('show', Boolean(text));
@@ -4098,9 +4398,18 @@ function updateRainSummary() {
   promise
     .then((canvas) => {
       if (req !== summaryRequest) return;
-      summaryShownKey = key;
+      if (isLive) {
+        const local = rainNearLine(canvas);
+        if (local) {
+          summaryShownKey = `${key}|${posSig}|1`;
+          el.textContent = local;
+          el.classList.add('show');
+          return;
+        }
+      }
       const rainyAreas = analyzeRadar(canvas);
       const text = rainyAreas.length ? summarizeRain(rainyAreas) : null;
+      summaryShownKey = isLive ? `${key}|${posSig}|0` : `${key}||0`;
       el.textContent = text || '';
       el.classList.toggle('show', !!text);
     })
