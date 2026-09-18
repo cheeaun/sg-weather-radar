@@ -110,8 +110,6 @@ over canvases already in `frameImageCache`.
 - **Stale nowcast cache**: `frameImageKey` includes `nowcast:slot:seed`; a
   recompute with unchanged median deltas re-served the old bitmap. Nowcast
   frames bypass `frameImageCache`.
-- **Lightning hints always +15**: `forecastLightningHints` hardcoded ×3
-  steps on every slot. Pass `step` through.
 
 ## Transport & blend cleanup
 

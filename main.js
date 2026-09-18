@@ -342,10 +342,7 @@ class NowcastToggleControl {
       localStorage.setItem(NOWCAST_STORAGE_KEY, showNowcast ? 'on' : 'off');
       this._updateButton();
       if (showNowcast) {
-        Promise.allSettled([
-          loadWind({ forNowcast: true }),
-          refreshLightning({ forNowcast: true }),
-        ]).finally(() => {
+        loadWind({ forNowcast: true }).finally(() => {
           if (showNowcast) recomputeNowcast();
         });
       } else {
@@ -746,8 +743,8 @@ async function loadLightningData(fetchFn) {
   return strikes.sort((a, b) => a.t - b.t);
 }
 
-async function refreshLightning({ forNowcast = false } = {}) {
-  if (!showLightning && !forNowcast) return null;
+async function refreshLightning() {
+  if (!showLightning) return null;
   if (lightningLoading) return lightningLoading;
   lightningLoading = loadLightningData((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
     .then((strikes) => {
@@ -995,7 +992,7 @@ async function doFetchRadar() {
   try {
     const [rangeResults, strikes] = await Promise.all([
       loadRadarData(cacheReader),
-      showLightning || showNowcast ? loadLightningData(cacheReader).catch(() => null) : null,
+      showLightning ? loadLightningData(cacheReader).catch(() => null) : null,
     ]);
     if (RANGES.some((range) => rangeResults[range]?.frames.length)) {
       applyRadarData(rangeResults, strikes);
@@ -1008,7 +1005,7 @@ async function doFetchRadar() {
   try {
     const [rangeResults, strikes] = await Promise.all([
       loadRadarData(apiFetch),
-      showLightning || showNowcast
+      showLightning
         ? loadLightningData(apiFetch).catch((e) => {
             console.error('Lightning fetch error:', e);
           })
@@ -3821,39 +3818,6 @@ function hasForecastRain(entry) {
   return false;
 }
 
-function forecastLightningHints(cells, tracks, step) {
-  if (!lightningStrikes.length) return [];
-  const now = Date.now();
-  const incoming = new Set();
-  for (let i = 0; i < cells.length; i++) {
-    const track = tracks.get(i);
-    if (!track?.median) continue;
-    const cell = cells[i];
-    const x = Math.round(cell.centroidX + track.median.dx * step);
-    const y = Math.round(cell.centroidY + track.median.dy * step);
-    if (x >= 0 && x < NOWCAST_SIZE && y >= 0 && y < NOWCAST_SIZE) {
-      const area = areaAtPixel(y * NOWCAST_SIZE + x);
-      if (area >= 0) incoming.add(area);
-    }
-  }
-  const hinted = new Set();
-  for (const strike of lightningStrikes) {
-    if (strike.t <= now - LIGHTNING_MAX_AGE || strike.t > now) continue;
-    const bb = RADAR_BOUNDS[70];
-    const x = Math.floor(
-      ((strike.lng - bb.upperLeft.longitude) / (bb.lowerRight.longitude - bb.upperLeft.longitude)) *
-        NOWCAST_SIZE,
-    );
-    const y = Math.floor(
-      ((bb.upperLeft.latitude - strike.lat) / (bb.upperLeft.latitude - bb.lowerRight.latitude)) *
-        NOWCAST_SIZE,
-    );
-    const area = areaAtPixel(y * NOWCAST_SIZE + x);
-    if (area >= 0 && !incoming.has(area)) hinted.add(area);
-  }
-  return [...hinted];
-}
-
 // Scores each ensemble member's +5 min forecast for a slot against the live
 // frame that just arrived for that slot; logs per-member pooled Jaccard.
 function scoreMembers(actualSlot, entry) {
@@ -4014,7 +3978,6 @@ function recomputeNowcast() {
           maxBlend: blend.canvas,
           maxBlendLevels: blend.levels,
           votes: areaVotes(group),
-          hints: forecastLightningHints(cellsC, tracks, step),
           members: group.map((m) => m.levels),
         };
         const slot = latest70 + step * SLOT_MS;
@@ -4102,13 +4065,7 @@ function summarizeRain(hits) {
 function summarizeForecast(entry, minutes) {
   const hits = forecastAreaHits(entry);
   if (!hits.length) return null;
-  let text = summarizeRain(hits).replace(/\.$/, '');
-  if (entry.hints?.length) {
-    const names = entry.hints.map((index) => SINGAPORE_AREAS[index]?.[0]).filter(Boolean);
-    if (names.length)
-      text += `; lightning hint: possible new shower around ${joinList(names.slice(0, 3))}`;
-  }
-  return `In ${minutes} min — ${text}.`;
+  return `In ${minutes} min — ${summarizeRain(hits)}`;
 }
 
 let summaryRequest = 0;
