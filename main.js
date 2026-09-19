@@ -1,5 +1,7 @@
 import 'maplibre-gl/dist/maplibre-gl.css';
 import * as maplibregl from 'maplibre-gl';
+import '@scritto/core/ssr.css';
+import '@scritto/core';
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 // MRT/LRT lines + stations from cheeaun/sgraildata, compiled to rail.json by
 // scripts/build-rail-data.mjs (delta-encoded int coords at 1e-5 deg). Imported
@@ -144,7 +146,7 @@ function setBusy(on) {
         busyShowTimer = null;
         if (busyCount > 0) {
           el.querySelector('.donut-progress').style.animationDuration = '0.8s';
-          el.querySelector('.donut-value').textContent = '…';
+          setRoll(document.getElementById('donut-roll'), '…', ROLL_DONUT);
           el.setAttribute('title', 'Loading…');
           el.setAttribute('aria-label', 'Loading…');
           el.classList.add('loading');
@@ -179,11 +181,115 @@ function formatTime(iso) {
   const hour = parts.find((p) => p.type === 'hour').value;
   const minute = parts.find((p) => p.type === 'minute').value;
   const dayPeriod = parts.find((p) => p.type === 'dayPeriod').value.toLowerCase();
-  return `${hour}.${minute} ${dayPeriod}`;
+  // nbsp keeps scritto from wrapping "3.45 pm" when a label is edge-aligned.
+  return `${hour}.${minute} ${dayPeriod}`;
 }
 
 function formatDate(iso) {
-  return dateFormatter.format(new Date(iso));
+  return dateFormatter.format(new Date(iso)).replace(/ /g, ' ');
+}
+
+// First write is silent so the page doesn't animate empty hosts in; later
+// writes roll. Timeline duration stays under the 1s playback step so ghosts
+// don't stack; summary uses Scritto defaults (550ms, no bounce).
+const ROLL_TIMELINE = { transition: { duration: 700 }, bounce: true };
+const ROLL_SUMMARY = { transition: { duration: 550 }, bounce: false };
+// Donut ticks every 1s; keep the roll shorter than that gap.
+const ROLL_DONUT = { transition: { duration: 350 }, bounce: false };
+
+function setRoll(el, next, options = ROLL_TIMELINE) {
+  if (!el) return;
+  const text = next ?? '';
+  if (typeof el.update !== 'function') {
+    el.textContent = text;
+    return;
+  }
+  if (el._scrittoReady !== true) {
+    el.setOptions(options);
+    el.value = text;
+    el._scrittoReady = true;
+    return;
+  }
+  el.update(text);
+}
+
+const SUMMARY_HEIGHT_MS = 350;
+
+function naturalSummaryHeight(host, show) {
+  if (!show) return 0;
+  const flow = host.querySelector('.rain-summary-flow');
+  if (!flow) return 0;
+  // Measure the flow only. Toggling host height to `auto` mid-update makes the
+  // box flash to full content height before the animation starts.
+  return Math.ceil(flow.getBoundingClientRect().height + 0.25);
+}
+
+function measureSummaryHeight(host, rollEl, show) {
+  return new Promise((resolve) => {
+    const run = () => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve(naturalSummaryHeight(host, show)));
+      });
+    };
+    if (!rollEl || typeof rollEl.update !== 'function') {
+      run();
+      return;
+    }
+    let settled = false;
+    const onAfter = (event) => {
+      if (event.detail?.phase !== 'after') return;
+      settled = true;
+      rollEl.removeEventListener('scrittochange', onAfter);
+      run();
+    };
+    rollEl.addEventListener('scrittochange', onAfter);
+    setTimeout(() => {
+      if (settled) return;
+      rollEl.removeEventListener('scrittochange', onAfter);
+      run();
+    }, 60);
+  });
+}
+
+// Outer div owns height; scritto-flow inside is free to reflow without fighting the box.
+function applyRainSummary(host, rollEl, text) {
+  if (!host || !rollEl) return;
+  const show = Boolean(text);
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const startH = host.getBoundingClientRect().height;
+  host._heightAnim?.cancel();
+  host._heightAnim = null;
+  host._heightToken = (host._heightToken || 0) + 1;
+  const token = host._heightToken;
+
+  // Pin before the roll so the host can't flash to the new content height.
+  host.style.height = `${startH}px`;
+  setRoll(rollEl, text || '', ROLL_SUMMARY);
+  host.classList.toggle('show', show);
+
+  measureSummaryHeight(host, rollEl, show).then((endH) => {
+    if (host._heightToken !== token) return;
+
+    if (reduce || Math.abs(endH - startH) < 0.5) {
+      host.style.height = show ? 'auto' : '0px';
+      return;
+    }
+
+    const anim = host.animate([{ height: `${startH}px` }, { height: `${endH}px` }], {
+      duration: SUMMARY_HEIGHT_MS,
+      easing: 'cubic-bezier(0.32, 0.72, 0, 1)',
+      fill: 'forwards',
+    });
+    host._heightAnim = anim;
+    anim.finished
+      .then(() => {
+        if (host._heightAnim !== anim || host._heightToken !== token) return;
+        host._heightAnim = null;
+        host.style.height = show ? 'auto' : '0px';
+        anim.cancel();
+      })
+      .catch(() => {});
+  });
 }
 
 function sgtNow() {
@@ -1209,11 +1315,12 @@ function updateSlider(newSlots) {
   const liveTime = Number.isFinite(liveSlot)
     ? formatTime(new Date(liveSlot).toISOString())
     : oldestTime;
-  document.getElementById('time-oldest').textContent = oldestTime;
-  document.getElementById('time-live').textContent = liveTime;
-  document.getElementById('time-forecast').textContent = forecastSlot
-    ? formatTime(new Date(forecastSlot).toISOString())
-    : '';
+  setRoll(document.getElementById('time-oldest'), oldestTime);
+  setRoll(document.getElementById('time-live'), liveTime);
+  const forecastEl = document.getElementById('time-forecast');
+  const forecastTime = forecastSlot ? formatTime(new Date(forecastSlot).toISOString()) : '';
+  setRoll(forecastEl, forecastTime);
+  if (forecastEl) forecastEl.hidden = !forecastTime;
   document.querySelector('.scan-foot').classList.toggle('has-forecast', hasForecast);
   renderTicks(newSlots);
   updateSliderUI(currentIndex);
@@ -1228,8 +1335,8 @@ function updateSliderUI(index) {
   const tickCols = document.getElementById('slider-ticks').children;
   for (let i = 0; i < tickCols.length; i++) tickCols[i].classList.toggle('active', i === index);
 
-  document.getElementById('scan-time').textContent = ts ? formatTime(ts) : '--:--';
-  document.getElementById('scan-date').textContent = ts ? formatDate(ts) : '--';
+  setRoll(document.getElementById('scan-time'), ts ? formatTime(ts) : '--:--');
+  setRoll(document.getElementById('scan-date'), ts ? formatDate(ts) : '--');
   updateSliderCutoff();
 }
 
@@ -4366,7 +4473,8 @@ function updateRainNearLinkLabelVisibility() {
 }
 
 function updateRainSummary({ force = false } = {}) {
-  const el = document.getElementById('rain-summary');
+  const host = document.getElementById('rain-summary');
+  const rollEl = document.getElementById('rain-summary-text');
   const ts = allTimestamps[currentIndex] ? new Date(allTimestamps[currentIndex]).getTime() : null;
   const frame = ts != null ? framesMap[70]?.get(ts) : null;
   const key =
@@ -4381,8 +4489,7 @@ function updateRainSummary({ force = false } = {}) {
   if (!key) {
     summaryShownKey = null;
     rainNearShown = false;
-    el.textContent = '';
-    el.classList.remove('show');
+    applyRainSummary(host, rollEl, '');
     return;
   }
   if (frame.nowcast) {
@@ -4390,8 +4497,7 @@ function updateRainSummary({ force = false } = {}) {
     const minutes = Math.max(5, Math.round((ts - newestLiveSlot(70)) / 60000));
     summaryShownKey = cacheKey;
     const text = entry ? summarizeForecast(entry, minutes) : null;
-    el.textContent = text || '';
-    el.classList.toggle('show', Boolean(text));
+    applyRainSummary(host, rollEl, text || '');
     return;
   }
   const promise = frameImageCache.get(key) || prepareFrameImage(70, frame);
@@ -4402,16 +4508,14 @@ function updateRainSummary({ force = false } = {}) {
         const local = rainNearLine(canvas);
         if (local) {
           summaryShownKey = `${key}|${posSig}|1`;
-          el.textContent = local;
-          el.classList.add('show');
+          applyRainSummary(host, rollEl, local);
           return;
         }
       }
       const rainyAreas = analyzeRadar(canvas);
       const text = rainyAreas.length ? summarizeRain(rainyAreas) : null;
       summaryShownKey = isLive ? `${key}|${posSig}|0` : `${key}||0`;
-      el.textContent = text || '';
-      el.classList.toggle('show', !!text);
+      applyRainSummary(host, rollEl, text || '');
     })
     .catch(() => {});
 }
@@ -4524,7 +4628,7 @@ function tickCountdown() {
   if (el.classList.contains('loading')) return;
   const remaining = Math.max(0, Math.ceil((nextFetchAt - Date.now()) / 1000));
   const label = `Next update in ${remaining}s`;
-  el.querySelector('.donut-value').textContent = remaining;
+  setRoll(document.getElementById('donut-roll'), String(remaining), ROLL_DONUT);
   el.setAttribute('title', label);
   el.setAttribute('aria-label', label);
   if (showNowcast && nowcastCanvases.size) updateSliderCutoff();

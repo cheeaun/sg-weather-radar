@@ -57,7 +57,11 @@
     <div class="panel console">
       <div class="console-top">
         <div class="scan">
-          <div class="rain-summary" id="rain-summary" aria-live="polite"></div>
+          <div class="rain-summary" id="rain-summary" aria-live="polite">
+            <scritto-flow class="rain-summary-flow">
+              <scritto-text id="rain-summary-text"></scritto-text>
+            </scritto-flow>
+          </div>
           <div class="scan-head">
             <button
               type="button"
@@ -81,19 +85,13 @@
               <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
                 <circle class="donut-track" cx="12" cy="12" r="9" />
                 <circle class="donut-progress" cx="12" cy="12" r="9" />
-                <text
-                  class="donut-value"
-                  x="12"
-                  y="12"
-                  text-anchor="middle"
-                  dominant-baseline="central"
-                >
-                  --
-                </text>
               </svg>
+              <span class="donut-roll-wrap" aria-hidden="true">
+                <scritto-text class="donut-roll" id="donut-roll"></scritto-text>
+              </span>
             </span>
-            <span class="scan-date" id="scan-date">--</span>
-            <span class="scan-time" id="scan-time">--:--</span>
+            <scritto-text class="scan-date" id="scan-date"></scritto-text>
+            <scritto-text class="scan-time" id="scan-time"></scritto-text>
           </div>
           <div class="slider-ticks" id="slider-ticks" aria-hidden="true"></div>
           <input
@@ -105,9 +103,9 @@
             aria-label="Radar image time"
           />
           <div class="scan-foot">
-            <span id="time-oldest">--:--</span>
-            <span id="time-live">--:--</span>
-            <span id="time-forecast">--:--</span>
+            <scritto-text id="time-oldest"></scritto-text>
+            <scritto-text id="time-live"></scritto-text>
+            <scritto-text id="time-forecast" hidden></scritto-text>
           </div>
         </div>
       </div>

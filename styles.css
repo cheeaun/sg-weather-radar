@@ -661,7 +661,11 @@ body {
   text-overflow: ellipsis;
 }
 .donut {
+  position: relative;
   display: inline-flex;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
 }
 .playback-btn {
   align-items: center;
@@ -719,6 +723,31 @@ body {
   font-size: 7px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+.donut-roll-wrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  overflow: hidden;
+}
+.donut-roll {
+  display: inline-block !important;
+  width: auto !important;
+  max-width: 22px;
+  font-size: 7px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap !important;
+  pointer-events: none;
+  /* Scritto writes layout compensation inline during a roll; keep the host centered. */
+  margin-inline: 0 !important;
+  text-align: center !important;
+  transform: none !important;
 }
 @keyframes donut-drain {
   from {
@@ -779,6 +808,24 @@ body {
   gap: 8px;
   flex-wrap: wrap;
 }
+scritto-text {
+  display: inline-block;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: inherit;
+}
+.rain-summary-flow,
+.rain-summary-flow:not(:defined) {
+  display: block;
+  /* Flow wants gutters for its edge fade; keep the outer box as the height stage. */
+  padding-inline: 2px;
+}
+.rain-summary-flow scritto-text,
+.rain-summary-flow scritto-text:not(:defined) {
+  display: inline;
+  white-space: normal !important;
+  font-variant-numeric: normal;
+}
 .scan-date {
   font-size: 16px;
   color: var(--muted);
@@ -819,7 +866,8 @@ body {
 }
 
 .rain-summary {
-  max-height: 0;
+  display: block;
+  height: 0;
   opacity: 0;
   overflow: hidden;
   margin-bottom: -4px;
@@ -828,13 +876,13 @@ body {
   line-height: 1.35;
   color: var(--muted);
   letter-spacing: 0.01em;
+  white-space: normal;
+  /* Height is driven by JS so 1↔2 line changes ease; opacity/margin stay CSS. */
   transition:
-    max-height 0.35s cubic-bezier(0.32, 0.72, 0, 1),
     opacity 0.35s cubic-bezier(0.32, 0.72, 0, 1),
     margin-bottom 0.35s cubic-bezier(0.32, 0.72, 0, 1);
 }
 .rain-summary.show {
-  max-height: 4em;
   opacity: 1;
   margin-bottom: 0;
 }
@@ -997,15 +1045,17 @@ body {
   font-variant-numeric: tabular-nums;
   margin-top: -3px;
 }
-.scan-foot > span {
+.scan-foot > :is(span, scritto-text) {
   position: absolute;
   transform: translateX(-50%);
   white-space: nowrap;
+  width: max-content;
+  min-width: max-content;
 }
-.scan-foot > span[data-edge='start'] {
+.scan-foot > :is(span, scritto-text)[data-edge='start'] {
   transform: none;
 }
-.scan-foot > span[data-edge='end'] {
+.scan-foot > :is(span, scritto-text)[data-edge='end'] {
   transform: translateX(-100%);
 }
 .scan-foot:not(.has-forecast) #time-live {
@@ -1014,16 +1064,13 @@ body {
 .scan-foot:not(.has-forecast) #time-oldest {
   display: block;
 }
-.scan-foot:not(.has-forecast) #time-forecast {
-  display: none;
-}
 .scan-foot.has-forecast #time-live {
   display: block;
 }
 .scan-foot.has-forecast #time-forecast {
   display: block;
 }
-#time-forecast:empty {
+#time-forecast[hidden] {
   display: none;
 }
 
