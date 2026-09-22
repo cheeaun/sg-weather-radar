@@ -34,11 +34,15 @@ const FETCH_PAD_MS = SLOT_MS * 3;
 const WINDOW_MS = PAST_HOURS * 60 * 60 * 1000 + FETCH_PAD_MS;
 const TICK_RANGES = [480, 240, 70];
 const LIGHTNING_MAX_AGE = 10 * 60 * 1000;
+const FLOOD_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+// Soft end when PUB never sends a Cancel (instruction text says avoid ~1 hour).
+const FLOOD_AUTO_END_MS = 60 * 60 * 1000;
 
 const THEME_STORAGE_KEY = 'sgwr-theme';
 const OPACITY_STORAGE_KEY = 'sgwr-radar-opacity';
 const CLIP_STORAGE_KEY = 'sgwr-radar-clip';
 const LIGHTNING_STORAGE_KEY = 'sgwr-lightning';
+const FLOOD_STORAGE_KEY = 'sgwr-floods';
 const WIND_STORAGE_KEY = 'sgwr-wind';
 const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
 const API_CACHE_PREFIX = 'sgwr-api:';
@@ -85,10 +89,13 @@ const darkModeQuery = matchMedia('(prefers-color-scheme: dark)');
 let radarOpacity = clamp(parseFloat(localStorage.getItem(OPACITY_STORAGE_KEY)), 0.1, 1) || 0.75;
 let clipBoundaries = localStorage.getItem(CLIP_STORAGE_KEY) !== 'off';
 let showLightning = localStorage.getItem(LIGHTNING_STORAGE_KEY) === 'on';
+let showFloods = localStorage.getItem(FLOOD_STORAGE_KEY) === 'on';
 let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
 let lightningStrikes = [];
 let lightningLoading = null;
+let floodAlerts = [];
+let floodLoading = null;
 const failedImages = new Set();
 const nowcastCanvases = new Map();
 let nowcastGeneration = 0;
@@ -523,6 +530,40 @@ class LightningToggleControl {
   }
 }
 
+class FloodToggleControl {
+  onAdd(map) {
+    this._map = map;
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toggle-btn';
+    button.title = 'Show flood alerts (broadcast radius)';
+    button.setAttribute('aria-label', 'Show flood alerts');
+    button.setAttribute('aria-pressed', String(showFloods));
+    button.classList.toggle('toggle-active', showFloods);
+    button.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 7c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M2 12c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M2 17c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/></svg>';
+    button.addEventListener('click', () => {
+      showFloods = !showFloods;
+      localStorage.setItem(FLOOD_STORAGE_KEY, showFloods ? 'on' : 'off');
+      button.classList.toggle('toggle-active', showFloods);
+      button.setAttribute('aria-pressed', String(showFloods));
+      renderFloods();
+      refreshFloods();
+      showToast(showFloods ? 'Showing flood alerts' : 'Hiding flood alerts');
+    });
+    container.appendChild(button);
+    this._container = container;
+    return container;
+  }
+  onRemove() {
+    if (this._container) this._container.remove();
+    this._container = undefined;
+    this._map = undefined;
+  }
+}
+
 function resolvedTheme() {
   if (themePreference === 'system') return darkModeQuery.matches ? 'dark' : 'light';
   return themePreference;
@@ -641,6 +682,7 @@ function initMap() {
   map.addControl(new ClipToggleControl(), 'bottom-right');
   map.addControl(new WindToggleControl(), 'bottom-right');
   map.addControl(new LightningToggleControl(), 'bottom-right');
+  map.addControl(new FloodToggleControl(), 'bottom-right');
   map.addControl(new NowcastToggleControl(), 'bottom-right');
   const geolocateControl = new maplibregl.GeolocateControl({
     positionOptions: { enableHighAccuracy: true },
@@ -696,6 +738,7 @@ function initMap() {
     addWindLayer();
     addBoundaryLayers();
     addLightningLayer();
+    addFloodLayers();
     addRainNearCircleLayer();
     addRainNearLinkLayer();
     raisePlaceLabels();
@@ -899,6 +942,107 @@ async function refreshLightning() {
   return lightningLoading;
 }
 
+async function fetchFloodDay(dateStr, paginationToken, fetchFn) {
+  const url = apiURL('/weather/flood-alerts', { date: dateStr, paginationToken });
+  const json = await fetchFn(url);
+  assertApiOk(json, url);
+  return json;
+}
+
+function ingestFloodRecords(records) {
+  const alerts = new Map();
+  const cancels = [];
+  for (const rec of records) {
+    const item = rec.item || {};
+    const readings = item.readings || [];
+    if (!readings.length) continue;
+    const t = new Date(rec.datetime).getTime();
+    const msgType = item.msgType || 'Alert';
+    const id = item.identifier || `${rec.datetime}`;
+    if (msgType === 'Cancel') {
+      // references: sender,identifier,sentTime — ends the matching Alert
+      const refId = (item.references || '').split(',').map((s) => s.trim())[1];
+      if (refId) cancels.push({ refId, t });
+      continue;
+    }
+    // Map only Alert (and the rare missing-msgType case); Cancel never draws.
+    if (msgType !== 'Alert') continue;
+    readings.forEach((reading, i) => {
+      const circle = reading.area?.circle || [];
+      if (circle.length < 3) return;
+      const lat = parseFloat(circle[0]);
+      const lng = parseFloat(circle[1]);
+      const radiusKm = parseFloat(circle[2]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radiusKm)) return;
+      alerts.set(`${id}#${i}`, {
+        id: `${id}#${i}`,
+        lat,
+        lng,
+        radiusKm,
+        headline: reading.headline || 'Flood alert',
+        description: (reading.description || '').replace(/\s+/g, ' ').trim(),
+        areaDesc: reading.area?.areaDesc || '',
+        severity: reading.severity || '',
+        startsAt: t,
+        endsAt: null,
+      });
+    });
+  }
+  for (const { refId, t } of cancels) {
+    for (const alert of alerts.values()) {
+      if (alert.id.startsWith(`${refId}#`) && (alert.endsAt == null || t < alert.endsAt)) {
+        alert.endsAt = t;
+      }
+    }
+  }
+  for (const alert of alerts.values()) {
+    if (alert.endsAt == null) alert.endsAt = alert.startsAt + FLOOD_AUTO_END_MS;
+  }
+  return [...alerts.values()].sort((a, b) => a.startsAt - b.startsAt);
+}
+
+async function loadFloodData(fetchFn) {
+  const now = sgtNow();
+  const cutoff = now.getTime() - FLOOD_LOOKBACK_MS;
+  const today = sgtToday();
+  const dateStrs = [today];
+  if (cutoff < new Date(`${today}T00:00:00`).getTime()) dateStrs.unshift(sgtDayOffset(1));
+  const records = [];
+
+  for (const dateStr of dateStrs) {
+    let token = null;
+    let keepPaginating = true;
+    while (keepPaginating) {
+      const json = await fetchFloodDay(dateStr, token, fetchFn);
+      const data = json.data;
+      const recs = data.records || [];
+      records.push(...recs);
+      token = data.paginationToken;
+      const oldest = recs.length ? new Date(recs[recs.length - 1].datetime).getTime() : 0;
+      if (!token || !recs.length || oldest < cutoff) keepPaginating = false;
+    }
+  }
+
+  return ingestFloodRecords(records.filter((r) => new Date(r.datetime).getTime() >= cutoff));
+}
+
+async function refreshFloods() {
+  if (!showFloods) return null;
+  if (floodLoading) return floodLoading;
+  floodLoading = loadFloodData((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
+    .then((alerts) => {
+      floodAlerts = alerts;
+      renderFloods();
+    })
+    .catch((e) => {
+      console.error('Flood fetch error:', e);
+    })
+    .finally(() => {
+      floodLoading = null;
+    });
+  return floodLoading;
+}
+
 async function loadRadarData(fetchFn, ranges = RANGES) {
   const now = sgtNow();
   const cutoff = new Date(now.getTime() - WINDOW_MS);
@@ -1031,7 +1175,7 @@ function rebuildTimeline() {
   return newSlots;
 }
 
-function applyRadarData(rangeResults, strikes) {
+function applyRadarData(rangeResults, strikes, floods) {
   const prevBoxes = boundaryBoxes;
   const prevFrames = framesByRange;
   boundaryBoxes = {};
@@ -1062,6 +1206,7 @@ function applyRadarData(rangeResults, strikes) {
     framesMap[range] = slots;
   }
   if (strikes) lightningStrikes = strikes;
+  if (floods) floodAlerts = floods;
 
   addBoundaryLayers();
   if (showNowcast) recomputeNowcast();
@@ -1129,12 +1274,13 @@ async function doFetchRadar() {
   const cacheReader = (url) => readApiCache(url)?.data ?? cacheMiss;
 
   try {
-    const [rangeResults, strikes] = await Promise.all([
+    const [rangeResults, strikes, floods] = await Promise.all([
       loadRadarData(cacheReader),
       showLightning ? loadLightningData(cacheReader).catch(() => null) : null,
+      showFloods ? loadFloodData(cacheReader).catch(() => null) : null,
     ]);
     if (RANGES.some((range) => rangeResults[range]?.frames.length)) {
-      applyRadarData(rangeResults, strikes);
+      applyRadarData(rangeResults, strikes, floods);
       rendered = true;
     }
   } catch (e) {}
@@ -1142,15 +1288,20 @@ async function doFetchRadar() {
   // Network pass is strictly fresher than the cache pass, so its result is always applied;
   // last-known-frame guards in applyRadarData absorb any transient upstream gaps.
   try {
-    const [rangeResults, strikes] = await Promise.all([
+    const [rangeResults, strikes, floods] = await Promise.all([
       loadRadarData(apiFetch),
       showLightning
         ? loadLightningData(apiFetch).catch((e) => {
             console.error('Lightning fetch error:', e);
           })
         : null,
+      showFloods
+        ? loadFloodData(apiFetch).catch((e) => {
+            console.error('Flood fetch error:', e);
+          })
+        : null,
     ]);
-    applyRadarData(rangeResults, strikes);
+    applyRadarData(rangeResults, strikes, floods);
   } catch (e) {
     if (!rendered) {
       console.error('Fetch error:', e);
@@ -1175,6 +1326,7 @@ async function fetchAtSlot() {
   await fetchRadar();
   pollRanges = missingRangesFor(pollSlotMs);
   if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
+  if (showFloods) refreshFloods();
   scheduleNextRefresh();
 }
 
@@ -2196,6 +2348,185 @@ function renderLightning() {
   );
 }
 
+function ensureFloodImage() {
+  if (map.hasImage('flood-mark')) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = 24 * SHAPE_SCALE;
+  canvas.height = 24 * SHAPE_SCALE;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.scale(SHAPE_SCALE, SHAPE_SCALE);
+  // Open wave strokes: black halo first, then white — same read as the lightning bolt.
+  const waves = new Path2D(
+    'M3 8c2.2-2 4.3-2 6.5 0s4.3 2 6.5 0 4.3-2 5 0M3 13c2.2-2 4.3-2 6.5 0s4.3 2 6.5 0 4.3-2 5 0M3 18c2.2-2 4.3-2 6.5 0s4.3 2 6.5 0 4.3-2 5 0',
+  );
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
+  ctx.lineWidth = 3.5;
+  ctx.stroke(waves);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.8;
+  ctx.stroke(waves);
+  map.addImage('flood-mark', ctx.getImageData(0, 0, canvas.width, canvas.height), {
+    pixelRatio: SHAPE_SCALE,
+  });
+}
+
+function addFloodLayers() {
+  if (!map || map.getSource('flood-circles')) return;
+  ensureFloodImage();
+  map.addSource('flood-circles', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  map.addSource('flood-icons', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  map.addLayer({
+    id: 'flood-circle-fill',
+    type: 'fill',
+    source: 'flood-circles',
+    layout: { visibility: 'none' },
+    paint: {
+      'fill-color': '#fff',
+      'fill-opacity': 0.2,
+    },
+  });
+  map.addLayer({
+    id: 'flood-circle-line',
+    type: 'line',
+    source: 'flood-circles',
+    layout: { visibility: 'none', 'line-cap': 'butt', 'line-join': 'round' },
+    paint: {
+      'line-color': 'rgba(0, 0, 0, 0.9)',
+      'line-width': 1.5,
+      'line-dasharray': [2, 2],
+      'line-opacity': 0.9,
+    },
+  });
+  map.addLayer({
+    id: 'flood-icon',
+    type: 'symbol',
+    source: 'flood-icons',
+    layout: {
+      'icon-image': 'flood-mark',
+      'icon-anchor': 'center',
+      'icon-allow-overlap': true,
+      'icon-size': [
+        'match',
+        ['get', 'severity'],
+        'Extreme',
+        1.35,
+        'Severe',
+        1.15,
+        'Moderate',
+        1,
+        'Minor',
+        0.85,
+        1,
+      ],
+      'text-field': ['get', 'areaDesc'],
+      'text-font': ['Noto Sans Regular'],
+      'text-size': 11,
+      // Alternate sides so stacked nearby alerts don't print on top of each other.
+      'text-anchor': [
+        'match',
+        ['get', 'labelSide'],
+        'below',
+        'top',
+        'above',
+        'bottom',
+        'right',
+        'left',
+        'top',
+      ],
+      'text-offset': [
+        'match',
+        ['get', 'labelSide'],
+        'below',
+        ['literal', [0, 1.1]],
+        'above',
+        ['literal', [0, -1.1]],
+        'right',
+        ['literal', [1.1, 0]],
+        'left',
+        ['literal', [-1.1, 0]],
+        ['literal', [0, 1.1]],
+      ],
+      'text-max-width': 14,
+      'text-optional': true,
+      'text-allow-overlap': false,
+      'symbol-z-order': 'auto',
+      // More severe alerts claim their label first in the collision pass.
+      'symbol-sort-key': [
+        'match',
+        ['get', 'severity'],
+        'Extreme',
+        0,
+        'Severe',
+        1,
+        'Moderate',
+        2,
+        'Minor',
+        3,
+        4,
+      ],
+    },
+    paint: {
+      'text-color': boundaryTextColor(),
+      'text-halo-color': boundaryTextHalo(),
+      'text-halo-width': 2,
+    },
+  });
+  renderFloods();
+}
+
+function floodsAtTime(ts) {
+  return floodAlerts.filter((a) => a.startsAt <= ts && (a.endsAt == null || a.endsAt > ts));
+}
+
+// Trim boilerplate so long street ranges stay readable and collide less.
+function floodLabelText(areaDesc) {
+  return (areaDesc || '')
+    .replace(/^At\s+/i, '')
+    .replace(/,\s*Singapore\s*$/i, '')
+    .trim();
+}
+
+const FLOOD_LABEL_SIDES = ['below', 'above', 'right', 'left'];
+
+function renderFloods() {
+  if (!map || !map.getSource('flood-circles') || !map.getLayer('flood-icon')) return;
+  const ts = allTimestamps.length ? new Date(allTimestamps[currentIndex]).getTime() : Date.now();
+  const active = showFloods ? floodsAtTime(ts) : [];
+  const circleFeatures = [];
+  const iconFeatures = [];
+  active.forEach((a, i) => {
+    circleFeatures.push({
+      type: 'Feature',
+      properties: { id: a.id, severity: a.severity },
+      geometry: circlePolygon(a.lng, a.lat, a.radiusKm),
+    });
+    iconFeatures.push({
+      type: 'Feature',
+      properties: {
+        id: a.id,
+        severity: a.severity,
+        areaDesc: floodLabelText(a.areaDesc),
+        labelSide: FLOOD_LABEL_SIDES[i % FLOOD_LABEL_SIDES.length],
+      },
+      geometry: { type: 'Point', coordinates: [a.lng, a.lat] },
+    });
+  });
+  map.getSource('flood-circles').setData({ type: 'FeatureCollection', features: circleFeatures });
+  map.getSource('flood-icons').setData({ type: 'FeatureCollection', features: iconFeatures });
+  const visible = active.length ? 'visible' : 'none';
+  map.setLayoutProperty('flood-circle-fill', 'visibility', visible);
+  map.setLayoutProperty('flood-circle-line', 'visibility', visible);
+  map.setLayoutProperty('flood-icon', 'visibility', visible);
+}
+
 // Particles draw with the 2D API onto an offscreen canvas (trails persist via destination-in
 // fades); a custom layer uploads it as a texture so wind lives inside the map's layer stack.
 const windCanvas = document.createElement('canvas');
@@ -2788,6 +3119,7 @@ function showFrame(index) {
     applyRadarFrame(range, framesMap[range]?.get(slotMs));
   }
   renderLightning();
+  renderFloods();
   updateBoundaryAvailability();
   prefetchFrames(index);
 
