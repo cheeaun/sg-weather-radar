@@ -16,36 +16,48 @@ over canvases already in `frameImageCache`.
 1. **Input**: last `NOWCAST_FRAMES` (5) live 70km frames, oldest → newest.
    The 70km feed publishes early, so the feature is gated on
    `latest70 === latestGlobal` (all ranges caught up) and
-   `Date.now() - latest70 <= 10 min` (no stale feed).
+   `Date.now() - latest70 <= 10 min` (no stale feed). Only the newest run of
+   **consecutive** 5-min slots is used (stops at the first gap); all deltas,
+   growth and dense offsets assume one 5-min step per pair, so a missing frame
+   would otherwise double the velocity. Fewer than 3 consecutive → no nowcast.
 2. **Cell detection**: `analyzeRainCells(canvas, true)` — full-frame mode.
    Flood fill over the whole 480×480 frame (sea + Johor included) so
    approaching weather outside Singapore is tracked. Cells get `area: -1`;
    summaries/votes stay Singapore-only via `SG_RAIN_PIXEL_DATA` lookups.
    `rainMembers` buffer is sized to the full frame (a squall can exceed the
    SG land-pixel count — do not shrink it back).
-3. **Tracking**: `trackCells(lineageCells)` links each current cell backwards
+3. **Edge cells**: `analyzeRainCells` flags cells within 2 px of the frame
+   (`edge`); `pairCells` marks pairs involving one. Edge pairs are excluded
+   from deltas (median/d1/d2 and the rolling-fit validation), and lineages
+   touching the edge get growth 0 — the centroid of a cell entering/leaving
+   view shifts with no real motion (it once dragged an east-edge cell west).
+   **Tracking**: `trackCells(lineageCells)` links each current cell backwards
    through every consecutive frame pair (`pairCells` on each pair). Each cell
    gets: median delta over up to 4 samples, `sigma` = max deviation from that
    median, and `growth` = clamped (±0.3) exponential mass rate per 5-min step
-   over the lineage. d1/d2 (last two single-pair deltas) are kept as separate
-   ensemble members for diversity.
-4. **Dense flow**: `estimateDenseFlow(canvasB, canvasC, generation)` —
-   12-px block matching on the 240px downsample. Search offsets are ordered
+   over the lineage. (The d1/d2 single-pair members were removed: 14–20 pts
+   under persistence at every lead over 22 frames on 23 Sep.)
+4. **Dense flow**: `estimateDenseFlow(canvases, generation)` —
+   12-px block matching on the 240px downsample, averaged over the last two
+   frame pairs. Blocks with no texture (all dry, or one uniform level) are
+   **unknown**, not zero motion; they are filled by normalized convolution
+   from textured blocks within `DENSE_FILL_RADIUS` (3 blocks), else the
+   global mean. Upsampling is aligned to block centres (12·b + 6). Search offsets are ordered
    smallest-magnitude first (`DENSE_OFFSETS`) with an early exit on score 0;
    see "tie-break bug" below. Async, yields every 8 block rows, checks
    `nowcastGeneration` after each yield.
 5. **Members** (per forecast step 1–3, each an `advectForward` output):
    - `median` — lineage median delta × step; large/erratic/unmatched cells
      ("sheet" cells) use dense flow instead.
-   - `d1`, `d2` — the two most recent single-pair deltas.
    - `wind` — `windDisplacement` (m/s → px via meters-per-degree over the
      70km box; **seconds, not milliseconds** — see bugs below).
    - `dense` — dense flow × step.
    Fade is per-cell: `(0.92 · e^growth)` clamped to [0.3, 1.2], raised to
    `step`; plus a ±1 level shift when |growth| > 0.25. Growing cells stop
    fading; dying cells fade faster.
-6. **Blend**: `maxBlend` (per-pixel max level) is what renders on the map;
-   `areaVotes` (≥2 of 5 members) + `summarizeRain` produce the summary text.
+6. **Output**: the `lookback` member (see below) renders on the map and
+   drives ticks + `summarizeRain` via `entry.summaryLevels`. (`maxBlend`
+   over the members was removed: 8–10 pts under persistence, over-predicts.)
    Entries stored in `nowcastCanvases` keyed by slot ms; sentinel frames
    `nowcast:<slot>:<seed>` (seed = shortHash of median deltas) go into
    `framesMap[70]` so the timeline/slider treat them like frames.
@@ -56,24 +68,43 @@ over canvases already in `frameImageCache`.
 
 ## Verification
 
-- **Rolling fit** (button tooltip, "model fit N% (rolling 1 h)"): one-step
-  validation — advect frame[-2] by the velocity that brought its cells in,
-  then `jaccardRain(validation, actual)`. Samples are `{t, j}` pruned past
-  `NOWCAST_FIT_MAX_AGE` (1 h), cap `NOWCAST_FIT_MAX_SAMPLES`.
-- **`jaccardRain` is neighborhood-pooled**: both fields max-pooled by
-  `NOWCAST_FIT_POOL` (10 px ≈ 1.5 km) before scoring. Pixel-exact Jaccard
-  zeroed out on small advection errors (a shifted 20-px cell = 0%).
-- **Support floor**: `NOWCAST_FIT_MIN_PIXELS` (50). Frames with less actual
-  rain return `null` and are skipped — otherwise "no rain anywhere" pairs
-  scored a perfect 1.0 and inflated the average. During dry spells the fit
-  just stops updating ("pending").
-- **Per-member scoring**: each entry stores `members` (level arrays). When a
-  forecast slot becomes live, `scoreMembers` pooled-scores all 5 members'
-  +5 min output against the actual frame and logs
-  `nowcast members @+5min: median=N% d1=N% d2=N% wind=N% dense=N%`.
-  This is the A/B experiment loop — no separate deploys needed to compare
-  member changes. Results so far: wind member often leads during steady
-  flow (after being literally blank pre-units-fix).
+Metric: pooled Jaccard (`jaccardRain`). Both fields max-pooled by
+`NOWCAST_FIT_POOL` (4 px ≈ 1.2 km; the 70km canvas is ~290 m/px) before
+scoring. Was 10 px (≈2.9 km, not 1.5 km as previously documented) — wider
+than a typical 5-min displacement, so no-motion persistence scored about as
+well as advection. A pair is skipped (null) only when **both** forecast and
+actual have < `NOWCAST_FIT_MIN_PIXELS` (50) rain pixels; a forecast that paints
+rain on a dry frame scores 0 (false alarm).
+
+- **Rolling fit** (button tooltip, "model fit N% vs M% no-motion (K frames,
+  rolling 1 h)"): one-step validation — advect frame[-2] by the velocity that
+  brought its cells in, score vs the actual; baseline = frame[-2] unmoved.
+  Samples are `{slot, model, persistence}`, **one per live slot**
+  (`recordFitSample` replaces by slot — recompute also runs on repeat polls,
+  wind loads and toggles). Model below no-motion = advection is hurting.
+- **Per-member verification** (`nowcastPending` → `verifyPendingNowcasts`):
+  every run registers each step's member levels keyed `${targetSlot}:${lead}`:
+  `median wind dense` + `display` (old forward-splat map output) + `lookback`
+  (what the map and summary show) + `lookbackNoDecay` (same motion, no level
+  decay / small-cell drop — isolates decay error) + `persistence` (latest
+  frame unmoved). When a target
+  slot goes live, all leads (+5/+10/+15) aimed at it are scored against it,
+  logged (`nowcast members @+Nmin: …`) and persisted to localStorage
+  `sgwr-nowcast-scores` (`{slot, lead, pool, s:{member: j}}`, deduped by
+  slot+lead, capped at `NOWCAST_SCORES_MAX`). Pending entries at or before the
+  live slot are dropped; the map is cleared when the toggle is off.
+- **Persistence across reloads**: pending forecasts are saved to localStorage
+  `sgwr-nowcast-pending` (levels run-length encoded, base64 Uint16 pairs;
+  shared arrays such as `persistence` encoded once; entries older than 30 min
+  dropped on load) and fit samples to `sgwr-nowcast-fit`, so dev reloads no
+  longer lose +10/+15 scores. Quota errors fall back to in-memory only.
+- **Score versions**: records carry `v` (`NOWCAST_SCORE_VERSION`, now 2;
+  missing = 1). Bump it whenever forecast logic changes; `nowcastScores()`
+  shows the current version by default (`nowcastScores({ v: 1 })` for older).
+- **`nowcastScores()`** in the console: `console.table` of mean score per
+  lead × member over the persisted history, plus mean points vs persistence.
+  This is the A/B loop — no deploys needed to compare member changes. Filter
+  by `{pool}` if the pool radius changes.
 
 ## Bugs found & fixed (do not regress)
 
@@ -121,11 +152,45 @@ so light fringes don't bloat. Dense flow is low-passed (4× box + bilinear).
 
 **Map display** uses a dedicated `createDisplayField`: small cells follow
 their median track; sheets follow the **wind IDW** (smooth shear, no block
-grid). If wind is missing (API 429 / mask 0) sheets fall back to **low-pass
-dense** (4× box average + bilinear upsample) — never raw dense, which
+grid) topped up by low-pass dense × `(1 − mask)`. Station wind u/v are
+pre-multiplied by the coverage mask (→ 0 ~24 km beyond the stations), so
+without the top-up far sheets (Strait, Johor) stalled. Wind missing (API 429)
+→ mask 0 → pure **low-pass dense** (4× box average + bilinear upsample) — never raw dense, which
 re-tears into axis-aligned rectangles. Raw dense stays in the ensemble for
 votes. Pipeline: `advectForward(displayField)` → `spatialCoherence` →
 `fillHoles` → `fillEnclosedHoles`. Nowcast frames bypass `frameImageCache`.
+
+## Look-back member (map default)
+
+The map renders **`lookbackNoDecay`** (look-back motion, no decay), and
+ticks/summaries use the same levels (`entry.summaryLevels`) so the text
+matches what is drawn. `lookback` (same motion + level decay + small-cell
+drop) was the map field briefly but made light rain visibly vanish at
++10/+15 (whole light fringes of weakening cells dropped at once, small cells
+removed); it stays scored so decay can be judged on evidence. Switched
+after it beat the old forward-splat `display` at +5/+10 on early scores and
+removed its smeared/speckled look. There is no flag back to the old output;
+`display` is still computed only so it keeps being scored.
+
+- `buildLookbackField`: one smooth per-5-min motion field on a 60×60 grid
+  (8 px cells) by normalized convolution — trusted cell median tracks (w 1/px,
+  0.5 for sheets > `NOWCAST_SHEET_PIXELS`), low-pass dense at rain pixels
+  (w 0.5), station wind × mask (w 0.2/px), 2× box blur radius 3, plus a weak
+  global-mean prior so empty regions drift with the overall flow.
+- `createLookback`: semi-Lagrangian — each output pixel traces back one step
+  per lead along the field (incremental, bilinear field sample, nearest source
+  pixel so palette colors stay exact). Traced outside the frame → dry.
+- **Decay (the `lookback` member only; not on the map)** is in the levels, not alpha: per cell, cumulative log mass change
+  `step · (ln NOWCAST_DECAY + growth)`, one level per halving (`round(Δ/ln 2)`,
+  clamped to [-3, 0]); level ≤ 0 → dropped. Recolored within the new level's
+  palette band (`recolorToLevel`, relative band position kept, checked against
+  `rainLevelForColor`). **Never upgrades**: merges inflate lineage growth (a
+  squall absorbing neighbours "doubles"), and +1 turned whole sheets heavier.
+  Cells smaller than `LOOKBACK_MIN_CELL_PIXELS[step]` (0/6/12/24) are dropped.
+- No forward splat → no holes → none of the fill passes; real dry gaps stay dry.
+- Next: once +15 scores over a few rain events confirm it, delete the legacy
+  path (`createDisplayField`, `spatialCoherence`, `fillHoles`,
+  `fillEnclosedHoles`) and the `display` member.
 
 ## Tuning constants (main.js, NOWCAST_* block)
 
@@ -138,16 +203,19 @@ votes. Pipeline: `advectForward(displayField)` → `spatialCoherence` →
 | NOWCAST_MATCH_OVERLAP | 0.3 | min pixel overlap for a pair (unless ≤12px away) |
 | NOWCAST_SHEET_PIXELS | 4000 | cells bigger than this prefer dense flow |
 | NOWCAST_SHEET_SIGMA | 8 | median delta distrust threshold (px) |
-| NOWCAST_FIT_POOL | 10 | metric max-pool radius (px; ~1.5 km) |
-| NOWCAST_FIT_MIN_PIXELS | 50 | min actual rain pixels to score a frame |
+| NOWCAST_FIT_POOL | 4 | metric max-pool radius (px; ~1.2 km at ~290 m/px) |
+| NOWCAST_FIT_MIN_PIXELS | 50 | skip scoring when both sides have fewer rain pixels |
+| NOWCAST_SCORES_MAX | 216 | persisted verification records (~6 h of scored frames, 3 leads each) |
 | NOWCAST_FIT_MAX_AGE / _SAMPLES | 1 h / 120 | rolling window |
 
 ## TODO — candidate improvements, in the order worth trying
 
 1. **Watch the member scores across a few rain events.** The
-   `nowcast members @+5min` log is the evidence base. If a member
+   `nowcastScores()` table (persisted per-lead scores vs persistence) is the evidence base. If a member
    consistently scores worst, consider dropping or re-weighting it
-   (maxBlend is max-based so a bad member mostly pollutes via votes).
+   First pass done (23 Sep): d1, d2 and blend removed. Open question:
+   `lookback` at +15 had big losses (−6 to −10) while `median` stayed within
+   −5 — compare `lookback` vs `lookbackNoDecay` to see if decay is the cause.
 2. **Use the lineage median in createField's sheet fallback for growth** —
    growth is only applied via fade/level-shift; footprint dilation/erosion
    (grow/shrink the cell mask by the rate) would show intensity change
@@ -155,11 +223,9 @@ votes. Pipeline: `advectForward(displayField)` → `spatialCoherence` →
 3. **Cell splitting/merging handling** — pairCells is one-to-one; a squall
    line that splits between frames currently breaks tracking for both
    children. Allow one-to-many for large sources (area-weighted).
-4. **Score at +10/+15 min too**, not just +5 (scoreMembers only fires when a
-   slot first goes live; later steps could be scored when *their* slot
-   arrives by reusing the stored member canvases per step).
-5. **Adaptive vote threshold** — `votes >= 2` of 5 was picked blind; with the
-   metric in place, sweep 1..4 on a rainy day and read the pooled scores.
+4. ~~Score at +10/+15 min too~~ — done (`nowcastPending`).
+5. ~~Adaptive vote threshold~~ — obsolete: member votes no longer gate the
+   summary (`areaVotes` removed).
 6. **Precompute frames for the validation member** — validation advects
    frame[-2]; if it used the lineage median instead of raw d1, the rolling
    fit would reflect what the median member actually does.
@@ -184,7 +250,8 @@ votes. Pipeline: `advectForward(displayField)` → `spatialCoherence` →
   or stale feed (both logged nowhere — add a console.log temporarily).
 - "model fit pending" forever → rain below `NOWCAST_FIT_MIN_PIXELS`, or
   fewer than 3 live frames (timeline needs 5-min-aligned history).
-- Fit stuck at a number but no member logs → `scoreMembers` only fires when
-  a previously-forecast slot becomes live (5-min cadence).
+- Fit stuck at a number but no member logs → `verifyPendingNowcasts` only
+  scores when a previously-forecast slot becomes live (5-min cadence), and
+  skips pairs where both sides are near-dry.
 - Check state in page: `document.querySelector('.nowcast-icon').closest('button').title`
   (tooltip = fit), `document.querySelectorAll('.tick-shape.nowcast').length`.

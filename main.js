@@ -1529,6 +1529,15 @@ const frameImageCache = new Map();
 const FRAME_CACHE_MAX = RANGES.length * Math.ceil((PAST_HOURS * 60 * 60 * 1000) / SLOT_MS + 2);
 const radarShownKey = new Map();
 const radarPendingKey = new Map();
+// Ranges whose pending frame has been loading longer than RADAR_STRIPE_DELAY_MS.
+// Until then the previous image stays up without the "no radar" hatch, so
+// scrubbing over cached frames doesn't flash stripes for a frame or two
+// (the stripe GeoJSON goes through a worker and can paint before the swap).
+const radarSlowPending = new Set();
+const radarSlowTimers = new Map();
+const RADAR_STRIPE_DELAY_MS = 250;
+// True while showFrame applies all ranges; availability is recomputed once after.
+let radarAvailabilityDeferred = false;
 
 function bbCoordinatesOf(bb) {
   return [
@@ -1764,8 +1773,7 @@ function buildRadarCanvas(range, frame, clip) {
   if (frame.nowcast) {
     const entry = nowcastCanvases.get(new Date(frame.timestamp).getTime());
     if (!entry) return Promise.reject(new Error('Nowcast frame unavailable'));
-    // Median member (post spatial-coherence) — max-blend is a 5-member mosaic
-    // and reads as digital noise at map zoom. Votes/summaries still use maxBlend.
+    // Look-back field; summaries use the same levels (summaryLevels).
     return Promise.resolve(entry.display);
   }
   return fetchRadarImage(frame.url).then((blob) =>
@@ -1851,7 +1859,13 @@ function applyRadarFrame(range, frame) {
   const source = map && styleReady && map.getSource(`radar-${range}`);
   if (!source) return;
   const layerId = `radar-${range}`;
+  const clearSlow = () => {
+    clearTimeout(radarSlowTimers.get(range));
+    radarSlowTimers.delete(range);
+    radarSlowPending.delete(range);
+  };
   const hide = () => {
+    clearSlow();
     radarShownKey.delete(range);
     radarPendingKey.delete(range);
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
@@ -1867,10 +1881,22 @@ function applyRadarFrame(range, frame) {
   map.setLayoutProperty(layerId, 'visibility', 'visible');
   source.setCoordinates(bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]));
   if (radarShownKey.get(range) === key) {
+    clearSlow();
+    radarPendingKey.delete(range);
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'visible');
     return;
   }
   radarPendingKey.set(range, key);
+  clearSlow();
+  radarSlowTimers.set(
+    range,
+    setTimeout(() => {
+      radarSlowTimers.delete(range);
+      if (radarPendingKey.get(range) !== key) return;
+      radarSlowPending.add(range);
+      updateBoundaryAvailability();
+    }, RADAR_STRIPE_DELAY_MS),
+  );
   setBusy(true);
   prepareFrameImage(range, frame)
     .then((canvas) => {
@@ -1878,6 +1904,8 @@ function applyRadarFrame(range, frame) {
       if (!src || radarPendingKey.get(range) !== key) return;
       src.updateImage({ image: canvas });
       radarShownKey.set(range, key);
+      radarPendingKey.delete(range);
+      clearSlow();
       updateBoundaryAvailability();
     })
     .catch(() => {
@@ -2227,11 +2255,16 @@ function computeAvailability() {
   for (const range of RANGES) {
     const frame = slotMs !== null ? framesMap[range]?.get(slotMs) : null;
     const key = frame && frameImageKey(range, frame, clipBoundaries);
-    // Available only once the frame's image is actually rendered (not merely fetched),
-    // so the striped placeholder stays visible through the loading window.
-    available[range] = Boolean(
-      frame && !failedImages.has(frame.url) && radarShownKey.get(range) === key,
-    );
+    // Available once the frame's image is rendered. While it is still loading,
+    // the previous image stays up and counts as available for a short grace
+    // period (RADAR_STRIPE_DELAY_MS); only slow loads, or a range with nothing
+    // shown yet, get the striped placeholder.
+    const shown = radarShownKey.get(range) === key;
+    const briefLoad =
+      radarPendingKey.get(range) === key &&
+      radarShownKey.has(range) &&
+      !radarSlowPending.has(range);
+    available[range] = Boolean(frame && !failedImages.has(frame.url) && (shown || briefLoad));
   }
   return available;
 }
@@ -2261,6 +2294,7 @@ function stripeFeatures(available) {
 }
 
 function updateBoundaryAvailability() {
+  if (radarAvailabilityDeferred) return;
   if (!map || !map.getSource('radar-boundaries') || !map.getSource('radar-boundary-labels')) return;
   const available = computeAvailability();
   for (const range of RANGES) {
@@ -3125,8 +3159,17 @@ function showFrame(index) {
   currentIndex = index;
   const slotMs = new Date(allTimestamps[index]).getTime();
 
-  for (const range of RANGES) {
-    applyRadarFrame(range, framesMap[range]?.get(slotMs));
+  // Apply every range before recomputing the hatch. RANGES runs 480 → 240 →
+  // 70; at a forecast slot 480/240 have no frame and hide() immediately,
+  // which used to recompute availability while 70 still held the previous
+  // slot's key — so 70 briefly counted as "no radar" and got hatched.
+  radarAvailabilityDeferred = true;
+  try {
+    for (const range of RANGES) {
+      applyRadarFrame(range, framesMap[range]?.get(slotMs));
+    }
+  } finally {
+    radarAvailabilityDeferred = false;
   }
   renderLightning();
   renderFloods();
@@ -3159,9 +3202,21 @@ const NOWCAST_SHEET_PIXELS = 4000;
 const NOWCAST_SHEET_SIGMA = 8;
 const NOWCAST_FIT_MAX_AGE = 60 * 60 * 1000;
 const NOWCAST_FIT_MAX_SAMPLES = 120;
-const NOWCAST_FIT_POOL = 10;
+// ~290 m/px on the 70km canvas, so 4 px ≈ 1.2 km. Keep this below a typical
+// 5-min displacement (~8 px at 30 km/h) or no-motion persistence scores as
+// well as advection and the metric can't tell members apart.
+const NOWCAST_FIT_POOL = 4;
 const NOWCAST_FIT_MIN_PIXELS = 50;
+const NOWCAST_SCORES_KEY = 'sgwr-nowcast-scores';
+// ~6 h of scored frames: up to 3 records (+5/+10/+15) per 5-min frame.
+const NOWCAST_SCORES_MAX = 6 * 12 * 3;
+// Bump when the forecast logic changes so nowcastScores() doesn't average
+// old and new behaviour. v1 = pre edge/dense/decay changes (no `v` field).
+const NOWCAST_SCORE_VERSION = 2;
+// Rolling fit samples: {slot, model, persistence}, one per live 70km slot.
 const nowcastFitSamples = [];
+// Forecasts awaiting verification, keyed `${targetSlot}:${lead}`.
+const nowcastPending = new Map();
 
 // The scale bar in the masthead is the palette the radar images are quantized to;
 // map a pixel back to its position on that ramp to classify intensity.
@@ -3322,11 +3377,13 @@ function analyzeRainCells(canvas, fullFrame = false) {
       let sumX = 0;
       let sumY = 0;
       let totalLevel = 0;
+      let edge = false;
       for (let m = 0; m < memberCount; m++) {
         const pixel = members[m];
         const level = state[pixel] - 3;
         const x = pixel % W;
         const y = (pixel - x) / W;
+        if (x <= 1 || y <= 1 || x >= W - 2 || y >= H - 2) edge = true;
         pixels[m] = pixel;
         levels[m] = level;
         sumX += x;
@@ -3342,6 +3399,9 @@ function analyzeRainCells(canvas, fullFrame = false) {
         centroidY: sumY / memberCount,
         totalLevel,
         mass: totalLevel,
+        // Cut by the radar frame: its centroid shifts as more of it enters or
+        // leaves view, so its centroid motion and mass trend are fake.
+        edge,
       });
     }
   }
@@ -3395,7 +3455,7 @@ function pairCells(source, target) {
       if (distance > NOWCAST_MATCH_DISTANCE) continue;
       const overlap = cellOverlap(a, targetSets[ti], b.pixels.length, dx, dy);
       if (overlap < NOWCAST_MATCH_OVERLAP && distance > 12) continue;
-      candidates.push({ si, ti, dx, dy, distance, overlap });
+      candidates.push({ si, ti, dx, dy, distance, overlap, edge: a.edge || b.edge });
     }
   }
   candidates.sort((a, b) => b.overlap - a.overlap || a.distance - b.distance);
@@ -3422,8 +3482,6 @@ function trackCells(lineageCells) {
   // lineage[ci] holds {cellIndex, frameIndex} entries ordered oldest -> newest.
   const lineages = [];
   const tracks = new Map();
-  const lastPair = pairs[pairs.length - 1];
-  const fromC = new Map(lastPair.map((p) => [p.ti, p]));
   for (let ci = 0; ci < lineageCells[frameCount - 1].length; ci++) {
     const lineage = [{ cellIndex: ci, frameIndex: frameCount - 1 }];
     let cursor = ci;
@@ -3445,7 +3503,7 @@ function trackCells(lineageCells) {
     for (let e = 1; e < lineage.length; e++) {
       const frameIndex = lineage[e].frameIndex;
       const pair = pairs[frameIndex - 1].find((p) => p.ti === lineage[e].cellIndex);
-      if (pair) deltas.push({ dx: pair.dx, dy: pair.dy });
+      if (pair && !pair.edge) deltas.push({ dx: pair.dx, dy: pair.dy });
       masses.push({
         mass: lineageCells[frameIndex][lineage[e].cellIndex].mass,
         frameIndex,
@@ -3474,20 +3532,18 @@ function trackCells(lineageCells) {
     const first = masses[0];
     const last = masses[masses.length - 1];
     let growth = 0;
-    if (first && last.mass > 0 && first.mass > 0 && last.frameIndex > first.frameIndex) {
+    const touchesEdge = lineage.some((e) => lineageCells[e.frameIndex][e.cellIndex].edge);
+    if (
+      !touchesEdge &&
+      first &&
+      last.mass > 0 &&
+      first.mass > 0 &&
+      last.frameIndex > first.frameIndex
+    ) {
       growth = Math.log(last.mass / first.mass) / (last.frameIndex - first.frameIndex);
       growth = clamp(growth, -NOWCAST_GROWTH_MAX, NOWCAST_GROWTH_MAX);
     }
-    const d2Pair = lastPair.find((p) => p.ti === ci);
-    // d1 is the step that brought the cell into the second-to-last lineage frame.
-    const prev = lineage.length >= 2 ? lineage[lineage.length - 2] : null;
-    const d1Pair =
-      prev && prev.frameIndex >= 1
-        ? pairs[prev.frameIndex - 1].find((p) => p.ti === prev.cellIndex) || null
-        : null;
     tracks.set(ci, {
-      d1: d1Pair ? { dx: d1Pair.dx, dy: d1Pair.dy } : null,
-      d2: d2Pair ? { dx: d2Pair.dx, dy: d2Pair.dy } : null,
       median,
       sigma,
       growth,
@@ -3515,6 +3571,8 @@ function windDisplacement(pixel, steps) {
   const { lng, lat } = pixelLngLat(pixel);
   const w = sampleWind(lng, lat);
   return {
+    // Station-coverage mask (0 far from stations); u/v are already scaled by it.
+    m: w.m,
     dx:
       (w.u * steps * 5 * 60) /
       (111320 * Math.cos((lat * Math.PI) / 180)) /
@@ -3566,8 +3624,10 @@ function fieldForWind(cells, steps) {
 }
 
 // Display-only field: small cells follow their median track; sheets follow the
-// smooth wind IDW so they shear. When wind is missing (API 429 / far from
-// stations) fall back to low-pass dense — not raw dense, which re-tears.
+// smooth wind IDW so they shear. Wind u/v are pre-multiplied by the station
+// mask, so far from stations (Strait, Johor) the wind fades to ~0 and a squall
+// would stall; top up with low-pass dense by (1 - mask). Missing wind
+// (API 429) → mask 0 → pure low-pass dense — never raw dense, which re-tears.
 function createDisplayField(cells, tracks, steps, dense = null) {
   const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
   const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
@@ -3581,13 +3641,9 @@ function createDisplayField(cells, tracks, steps, dense = null) {
     for (const pixel of cells[ci].pixels) {
       if (sheet || !velocity) {
         const w = windDisplacement(pixel, steps);
-        if (w.dx * w.dx + w.dy * w.dy < 0.01 && dense) {
-          dx[pixel] = dense.dx[pixel] * steps;
-          dy[pixel] = dense.dy[pixel] * steps;
-        } else {
-          dx[pixel] = w.dx;
-          dy[pixel] = w.dy;
-        }
+        const rest = dense ? 1 - clamp(w.m, 0, 1) : 0;
+        dx[pixel] = w.dx + (rest ? dense.dx[pixel] * steps * rest : 0);
+        dy[pixel] = w.dy + (rest ? dense.dy[pixel] * steps * rest : 0);
       } else {
         dx[pixel] = velocity.dx * steps;
         dy[pixel] = velocity.dy * steps;
@@ -3942,102 +3998,6 @@ function fillEnclosedHoles(canvas, levels) {
   return { canvas: out, levels: curLevels };
 }
 
-// Drop diagonal-only speckles and fill 1-px holes inside rain. Keeps real
-// edges intact — unlike a plain dilate/erode close, which inflates blobs.
-function cleanBlend(blend) {
-  const W = NOWCAST_SIZE;
-  const { levels, canvas } = blend;
-  const data = canvas.getContext('2d').getImageData(0, 0, W, W);
-  const px = data.data;
-  const outLevels = levels.slice();
-  const outPx = new Uint8ClampedArray(px);
-  for (let y = 1; y < W - 1; y++) {
-    for (let x = 1; x < W - 1; x++) {
-      const p = y * W + x;
-      let n4 = 0;
-      let n8 = 0;
-      let maxL = 0;
-      let maxP = -1;
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const q = (y + oy) * W + (x + ox);
-          const l = levels[q];
-          if (!l) continue;
-          if (ox === 0 && oy === 0) {
-            maxL = l;
-            maxP = q;
-            continue;
-          }
-          n8++;
-          if (ox === 0 || oy === 0) n4++;
-          if (l > maxL) {
-            maxL = l;
-            maxP = q;
-          }
-        }
-      }
-      const self = levels[p];
-      if (self) {
-        if (n4 === 0) {
-          outLevels[p] = 0;
-          outPx[p * 4] = outPx[p * 4 + 1] = outPx[p * 4 + 2] = outPx[p * 4 + 3] = 0;
-        }
-      } else if (n4 >= 2 && n8 >= 4 && maxP >= 0) {
-        outLevels[p] = maxL;
-        outPx[p * 4] = px[maxP * 4];
-        outPx[p * 4 + 1] = px[maxP * 4 + 1];
-        outPx[p * 4 + 2] = px[maxP * 4 + 2];
-        outPx[p * 4 + 3] = px[maxP * 4 + 3];
-      }
-    }
-  }
-  canvas.getContext('2d').putImageData(new ImageData(outPx, W, W), 0, 0);
-  blend.levels = outLevels;
-  return blend;
-}
-
-function maxBlend(members) {
-  const output = new Uint8ClampedArray(NOWCAST_SIZE * NOWCAST_SIZE * 4);
-  const outputLevel = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
-  for (const member of members) {
-    const data = member.canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
-    for (let pixel = 0; pixel < outputLevel.length; pixel++) {
-      const level = member.levels[pixel];
-      // First member wins ties so median colors beat the noisier dense member.
-      if (!level || level <= outputLevel[pixel]) continue;
-      const so = pixel * 4;
-      output.set(data.subarray(so, so + 4), so);
-      outputLevel[pixel] = level;
-    }
-  }
-  const canvas = document.createElement('canvas');
-  canvas.width = NOWCAST_SIZE;
-  canvas.height = NOWCAST_SIZE;
-  canvas.getContext('2d').putImageData(new ImageData(output, NOWCAST_SIZE, NOWCAST_SIZE), 0, 0);
-  const cleaned = cleanBlend({ canvas, levels: outputLevel });
-  return spatialCoherence(cleaned.canvas, cleaned.levels);
-}
-
-function areaAtPixel(pixel) {
-  if (pixel < 0 || pixel >= SG_RAIN_PIXEL_AREAS.length) return -1;
-  return SG_RAIN_PIXEL_AREAS[pixel] - 1;
-}
-
-function areaVotes(members) {
-  const votes = new Uint8Array(SINGAPORE_AREAS.length);
-  for (const member of members) {
-    const seen = new Uint8Array(SINGAPORE_AREAS.length);
-    for (const packed of SG_RAIN_PIXEL_DATA) {
-      const pixel = packed & RAIN_PIXEL_KEY_MASK;
-      if (!member.levels[pixel]) continue;
-      const area = areaAtPixel(pixel);
-      if (area >= 0) seen[area] = 1;
-    }
-    for (let i = 0; i < seen.length; i++) votes[i] += seen[i];
-  }
-  return votes;
-}
-
 // Max-pools a level field over a square neighborhood so a near-miss forecast
 // still scores: pixel-exact Jaccard zeroes out on small advection errors.
 function neighborhoodMax(levels, radius) {
@@ -4083,15 +4043,24 @@ function pooledScore(aPool, bPool) {
   return union ? intersection / union : null;
 }
 
-// b is always the actual-rain side; frames with too little real rain to judge
-// a forecast return null so they never inflate the rolling fit.
-function jaccardRain(a, b) {
-  let actual = 0;
-  for (let pixel = 0; pixel < b.levels.length; pixel++) if (b.levels[pixel]) actual++;
-  if (actual < NOWCAST_FIT_MIN_PIXELS) return null;
+function rainPixelCount(levels) {
+  let n = 0;
+  for (let pixel = 0; pixel < levels.length; pixel++) if (levels[pixel]) n++;
+  return n;
+}
+
+// b is always the actual-rain side. Skipped (null) only when BOTH sides are
+// near-dry: "no rain anywhere" pairs would score a free 1.0, but a forecast
+// that paints rain onto a dry frame is a real false alarm and must score 0.
+function jaccardRain(a, b, actualPool = null) {
+  if (
+    rainPixelCount(b.levels) < NOWCAST_FIT_MIN_PIXELS &&
+    rainPixelCount(a.levels) < NOWCAST_FIT_MIN_PIXELS
+  )
+    return null;
   return pooledScore(
     neighborhoodMax(a.levels, NOWCAST_FIT_POOL),
-    neighborhoodMax(b.levels, NOWCAST_FIT_POOL),
+    actualPool || neighborhoodMax(b.levels, NOWCAST_FIT_POOL),
   );
 }
 
@@ -4108,7 +4077,13 @@ const DENSE_OFFSETS = (() => {
   return list.sort((p, q) => p[2] - q[2]).map(([ox, oy]) => [ox, oy]);
 })();
 
-async function estimateDenseFlow(canvasB, canvasC, generation) {
+// Block matching over the last up-to-2 frame pairs (averaged). Blocks with no
+// texture — all dry, or one uniform level (aperture problem) — match equally
+// well at every offset and used to report zero motion, dragging the flow to 0
+// around and inside rain areas. They are now unknown and filled from nearby
+// textured blocks (normalized convolution), else the global mean.
+const DENSE_FILL_RADIUS = 3; // blocks (~24 km)
+async function estimateDenseFlow(canvases, generation) {
   const downsample = (canvas) => {
     const data = canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
     const field = new Uint8Array(240 * 240);
@@ -4126,50 +4101,94 @@ async function estimateDenseFlow(canvasB, canvasC, generation) {
     }
     return field;
   };
-  const a = downsample(canvasB);
-  const b = downsample(canvasC);
+  const fields = canvases.slice(-3).map(downsample);
   const bw = 40;
   const bh = 40;
+  const sumX = new Float32Array(bw * bh);
+  const sumY = new Float32Array(bw * bh);
+  const count = new Float32Array(bw * bh);
+  for (let f = 1; f < fields.length; f++) {
+    const a = fields[f - 1];
+    const b = fields[f];
+    for (let by = 0; by < bh; by++) {
+      if (by % 8 === 0) {
+        await yieldToUI();
+        if (generation !== nowcastGeneration) return null;
+      }
+      for (let bx = 0; bx < bw; bx++) {
+        const x0 = bx * 6;
+        const y0 = by * 6;
+        let lo = 3;
+        let hi = 0;
+        for (let y = 0; y < 6; y++) {
+          for (let x = 0; x < 6; x++) {
+            const v = a[(y0 + y) * 240 + x0 + x];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+          }
+        }
+        if (lo === hi) continue; // no texture: motion unknowable here
+        let best = Infinity;
+        let bestX = 0;
+        let bestY = 0;
+        for (const [ox, oy] of DENSE_OFFSETS) {
+          if (x0 + ox < 0 || y0 + oy < 0 || x0 + ox + 5 >= 240 || y0 + oy + 5 >= 240) continue;
+          let score = 0;
+          for (let y = 0; y < 6 && score < best; y++) {
+            for (let x = 0; x < 6; x++)
+              score += Math.abs(a[(y0 + y) * 240 + x0 + x] - b[(y0 + oy + y) * 240 + x0 + ox]);
+          }
+          if (score < best) {
+            best = score;
+            bestX = ox;
+            bestY = oy;
+            if (!best) break;
+          }
+        }
+        const i = by * bw + bx;
+        sumX[i] += bestX;
+        sumY[i] += bestY;
+        count[i]++;
+      }
+    }
+  }
+  let gx = 0;
+  let gy = 0;
+  let gn = 0;
+  for (let i = 0; i < count.length; i++) {
+    gx += sumX[i];
+    gy += sumY[i];
+    gn += count[i];
+  }
+  const meanX = gn ? gx / gn : 0;
+  const meanY = gn ? gy / gn : 0;
+  const bx2 = boxBlurGrid(sumX, bw, DENSE_FILL_RADIUS);
+  const by2 = boxBlurGrid(sumY, bw, DENSE_FILL_RADIUS);
+  const bn2 = boxBlurGrid(count, bw, DENSE_FILL_RADIUS);
   const flowX = new Float32Array(bw * bh);
   const flowY = new Float32Array(bw * bh);
-  for (let by = 0; by < bh; by++) {
-    if (by && by % 8 === 0) {
-      await yieldToUI();
-      if (generation !== nowcastGeneration) return null;
-    }
-    for (let bx = 0; bx < bw; bx++) {
-      const x0 = bx * 6;
-      const y0 = by * 6;
-      let best = Infinity;
-      let bestX = 0;
-      let bestY = 0;
-      for (const [ox, oy] of DENSE_OFFSETS) {
-        if (x0 + ox < 0 || y0 + oy < 0 || x0 + ox + 5 >= 240 || y0 + oy + 5 >= 240) continue;
-        let score = 0;
-        for (let y = 0; y < 6; y++) {
-          for (let x = 0; x < 6; x++)
-            score += Math.abs(a[(y0 + y) * 240 + x0 + x] - b[(y0 + oy + y) * 240 + x0 + ox]);
-        }
-        if (score < best) {
-          best = score;
-          bestX = ox;
-          bestY = oy;
-          if (!best) break;
-        }
-      }
-      flowX[by * bw + bx] = bestX;
-      flowY[by * bw + bx] = bestY;
+  for (let i = 0; i < count.length; i++) {
+    if (count[i]) {
+      flowX[i] = sumX[i] / count[i];
+      flowY[i] = sumY[i] / count[i];
+    } else if (bn2[i] > 0) {
+      flowX[i] = bx2[i] / bn2[i];
+      flowY[i] = by2[i] / bn2[i];
+    } else {
+      flowX[i] = meanX;
+      flowY[i] = meanY;
     }
   }
   const dx = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
   const dy = new Float32Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  // Block centres sit at 12·b + 6 px; sample relative to them.
   for (let y = 0; y < NOWCAST_SIZE; y++) {
-    const gy = y / 12;
+    const gy = clamp((y - 6) / 12, 0, bh - 1);
     const y0 = Math.min(bh - 1, gy | 0);
     const y1 = Math.min(bh - 1, y0 + 1);
     const fy = gy - y0;
     for (let x = 0; x < NOWCAST_SIZE; x++) {
-      const gx = x / 12;
+      const gx = clamp((x - 6) / 12, 0, bw - 1);
       const x0 = Math.min(bw - 1, gx | 0);
       const x1 = Math.min(bw - 1, x0 + 1);
       const fx = gx - x0;
@@ -4234,6 +4253,263 @@ async function estimateDenseFlow(canvasB, canvasC, generation) {
   return { dx: outX, dy: outY };
 }
 
+// ---- Look-back (semi-Lagrangian) member --------------------------------
+// One smooth motion field + backward sampling: every output pixel traces back
+// along the field and copies the source pixel it came from. No forward splat,
+// so no holes to patch and no invented rain in real dry gaps. This is the
+// map field. The old forward-splat output is still computed and scored as
+// `display` until it's deleted.
+const LOOKBACK_GRID = 8; // coarse field cell size (px)
+const LOOKBACK_N = NOWCAST_SIZE / LOOKBACK_GRID; // 60
+const LOOKBACK_BLUR = 3; // box radius in coarse cells (~7 km), 2 passes
+
+function boxBlurGrid(src, n, radius) {
+  const tmp = new Float32Array(src.length);
+  const out = new Float32Array(src.length);
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      let s = 0;
+      for (let xx = Math.max(0, x - radius); xx <= Math.min(n - 1, x + radius); xx++)
+        s += src[y * n + xx];
+      tmp[y * n + x] = s;
+    }
+  }
+  for (let x = 0; x < n; x++) {
+    for (let y = 0; y < n; y++) {
+      let s = 0;
+      for (let yy = Math.max(0, y - radius); yy <= Math.min(n - 1, y + radius); yy++)
+        s += tmp[yy * n + x];
+      out[y * n + x] = s;
+    }
+  }
+  return out;
+}
+
+// Per-5-min motion (px) on a coarse grid, by normalized convolution of sparse
+// evidence: trusted cell median tracks (w 1/px), low-pass dense at rain pixels
+// (w 0.5/px), station wind × coverage mask (w 0.2/px), and a weak global-mean
+// prior so empty regions still drift with the overall flow.
+function buildLookbackField(cells, tracks, dense) {
+  const n = LOOKBACK_N;
+  const G = LOOKBACK_GRID;
+  const sx = new Float32Array(n * n);
+  const sy = new Float32Array(n * n);
+  const sw = new Float32Array(n * n);
+  let gx = 0;
+  let gy = 0;
+  let gw = 0;
+  const add = (pixel, vx, vy, w) => {
+    const x = pixel % NOWCAST_SIZE;
+    const c = (((pixel - x) / NOWCAST_SIZE / G) | 0) * n + ((x / G) | 0);
+    sx[c] += vx * w;
+    sy[c] += vy * w;
+    sw[c] += w;
+    gx += vx * w;
+    gy += vy * w;
+    gw += w;
+  };
+  for (let ci = 0; ci < cells.length; ci++) {
+    const cell = cells[ci];
+    const track = tracks.get(ci);
+    const trusted = track?.median && track.matchedPrevious && track.sigma <= NOWCAST_SHEET_SIGMA;
+    // Big sheets' centroids are less reliable than small cells'.
+    const wTrack = trusted ? (cell.pixels.length > NOWCAST_SHEET_PIXELS ? 0.5 : 1) : 0;
+    for (const pixel of cell.pixels) {
+      if (wTrack) add(pixel, track.median.dx, track.median.dy, wTrack);
+      add(pixel, dense.dx[pixel], dense.dy[pixel], 0.5);
+    }
+  }
+  if (windField) {
+    for (let cy = 0; cy < n; cy++) {
+      for (let cx = 0; cx < n; cx++) {
+        const pixel = (cy * G + (G >> 1)) * NOWCAST_SIZE + cx * G + (G >> 1);
+        const w = windDisplacement(pixel, 1);
+        const weight = 0.2 * clamp(w.m, 0, 1) * G * G;
+        if (!weight) continue;
+        const c = cy * n + cx;
+        sx[c] += w.dx * weight;
+        sy[c] += w.dy * weight;
+        sw[c] += weight;
+      }
+    }
+  }
+  const meanX = gw ? gx / gw : 0;
+  const meanY = gw ? gy / gw : 0;
+  let bx = sx;
+  let by = sy;
+  let bw = sw;
+  for (let pass = 0; pass < 2; pass++) {
+    bx = boxBlurGrid(bx, n, LOOKBACK_BLUR);
+    by = boxBlurGrid(by, n, LOOKBACK_BLUR);
+    bw = boxBlurGrid(bw, n, LOOKBACK_BLUR);
+  }
+  const prior = 4; // ≈ 4 px of evidence per coarse cell
+  const fx = new Float32Array(n * n);
+  const fy = new Float32Array(n * n);
+  for (let c = 0; c < n * n; c++) {
+    fx[c] = (bx[c] + meanX * prior) / (bw[c] + prior);
+    fy[c] = (by[c] + meanY * prior) / (bw[c] + prior);
+  }
+  return { fx, fy };
+}
+
+function sampleLookbackField(field, x, y) {
+  const n = LOOKBACK_N;
+  const gx = clamp((x - LOOKBACK_GRID / 2) / LOOKBACK_GRID, 0, n - 1.0001);
+  const gy = clamp((y - LOOKBACK_GRID / 2) / LOOKBACK_GRID, 0, n - 1.0001);
+  const x0 = gx | 0;
+  const y0 = gy | 0;
+  const tx = gx - x0;
+  const ty = gy - y0;
+  const i = y0 * n + x0;
+  const lerp = (a) =>
+    (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + n] * (1 - tx) + a[i + n + 1] * tx) * ty;
+  return [lerp(field.fx), lerp(field.fy)];
+}
+
+// Min cell size (px) kept at lead step 0..3; smaller cells are dropped.
+const LOOKBACK_MIN_CELL_PIXELS = [0, 6, 12, 24];
+// Palette bands per level, matching rainLevelForColor's thresholds.
+const LEVEL_BANDS = [null, [0, 0.485], [0.485, 0.667], [0.667, 1]];
+
+function rainPositionForColor(r, g, b) {
+  let best = Infinity;
+  let t = 0;
+  for (const [stop, [sr, sg, sb]] of radarScaleStops()) {
+    const d = (r - sr) ** 2 + (g - sg) ** 2 + (b - sb) ** 2;
+    if (d < best) {
+      best = d;
+      t = stop;
+    }
+  }
+  return t;
+}
+
+function colorAtPosition(t) {
+  const stops = radarScaleStops();
+  if (t <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const [t0, c0] = stops[i - 1];
+      const [t1, c1] = stops[i];
+      const u = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+      return [0, 1, 2].map((k) => Math.round(c0[k] + (c1[k] - c0[k]) * u));
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+// Moves a palette color into another level's band, keeping its relative
+// position inside the band so cell texture survives a level change.
+const recolorCache = new Map();
+function recolorToLevel(r, g, b, fromLevel, toLevel) {
+  const key = ((r << 16) | (g << 8) | b) * 4 + toLevel;
+  let rgb = recolorCache.get(key);
+  if (!rgb) {
+    const [lo, hi] = LEVEL_BANDS[fromLevel];
+    const [nlo, nhi] = LEVEL_BANDS[toLevel];
+    const frac = clamp((rainPositionForColor(r, g, b) - lo) / (hi - lo), 0, 1);
+    // Stay off the band edges so the new color classifies as toLevel.
+    rgb = colorAtPosition(nlo + (0.1 + 0.8 * frac) * (nhi - nlo));
+    if (rainLevelForColor(rgb[0], rgb[1], rgb[2]) !== toLevel)
+      rgb = colorAtPosition((nlo + nhi) / 2);
+    recolorCache.set(key, rgb);
+  }
+  return rgb;
+}
+
+// State for incremental tracing: pos arrays hold, per output pixel, where it
+// came from after `step` back-steps. Call once per step, in order 1, 2, 3.
+// decay=false: same motion, no level decay / small-cell drop (scored as
+// `lookbackNoDecay` to separate motion error from decay error).
+function createLookback(canvas, cells, tracks, field, { decay = true } = {}) {
+  const size = NOWCAST_SIZE * NOWCAST_SIZE;
+  const src = canvas.getContext('2d').getImageData(0, 0, NOWCAST_SIZE, NOWCAST_SIZE).data;
+  const srcLevel = new Uint8Array(size);
+  const srcCell = new Int32Array(size).fill(-1);
+  for (let ci = 0; ci < cells.length; ci++) {
+    const cell = cells[ci];
+    for (let m = 0; m < cell.pixels.length; m++) {
+      srcLevel[cell.pixels[m]] = cell.levels[m];
+      srcCell[cell.pixels[m]] = ci;
+    }
+  }
+  const posX = new Float32Array(size);
+  const posY = new Float32Array(size);
+  for (let p = 0; p < size; p++) {
+    posX[p] = p % NOWCAST_SIZE;
+    posY[p] = (p / NOWCAST_SIZE) | 0;
+  }
+  let step = 0;
+  return () => {
+    step++;
+    const output = new Uint8ClampedArray(size * 4);
+    const outputLevel = new Uint8Array(size);
+    const shifts = new Map();
+    const minCell = LOOKBACK_MIN_CELL_PIXELS[Math.min(step, LOOKBACK_MIN_CELL_PIXELS.length - 1)];
+    for (let p = 0; p < size; p++) {
+      if (Number.isNaN(posX[p])) continue;
+      const [vx, vy] = sampleLookbackField(field, posX[p], posY[p]);
+      const nx = posX[p] - vx;
+      const ny = posY[p] - vy;
+      const sxp = Math.round(nx);
+      const syp = Math.round(ny);
+      // Traced outside the radar: whatever arrives from there is unknown.
+      if (sxp < 0 || syp < 0 || sxp >= NOWCAST_SIZE || syp >= NOWCAST_SIZE) {
+        posX[p] = NaN;
+        continue;
+      }
+      posX[p] = nx;
+      posY[p] = ny;
+      const s = syp * NOWCAST_SIZE + sxp;
+      const baseLevel = srcLevel[s];
+      if (!baseLevel) continue;
+      // Decay in the forecast itself, not just alpha: cumulative log mass
+      // change (neutral decay + lineage growth) × lead, one level per halving
+      // / doubling. A dying cell loses levels and its light fringe drops out,
+      // so summaries at +15 stop reporting it as heavy. Tiny cells (short
+      // lifetimes, mostly noise) are dropped at longer leads.
+      const ci = srcCell[s];
+      let shift = shifts.get(ci);
+      if (shift === undefined) {
+        if (!decay) shift = 0;
+        else if (cells[ci].pixels.length < minCell) shift = -9;
+        else {
+          const growth = tracks.get(ci)?.growth || 0;
+          const logMass = step * (Math.log(NOWCAST_DECAY) + growth);
+          // Never upgrade: lineage growth is inflated by merges (a squall
+          // absorbing neighbours "doubles" in mass), which turned whole sheets
+          // one level heavier. Growth only cancels decay.
+          shift = clamp(Math.round(logMass / Math.LN2), -3, 0);
+        }
+        shifts.set(ci, shift);
+      }
+      const level = baseLevel + shift;
+      if (level <= 0) continue;
+      const so = s * 4;
+      const o = p * 4;
+      const outLevel = Math.min(3, level);
+      if (outLevel === baseLevel) {
+        output[o] = src[so];
+        output[o + 1] = src[so + 1];
+        output[o + 2] = src[so + 2];
+      } else {
+        const [r, g, b] = recolorToLevel(src[so], src[so + 1], src[so + 2], baseLevel, outLevel);
+        output[o] = r;
+        output[o + 1] = g;
+        output[o + 2] = b;
+      }
+      output[o + 3] = src[so + 3];
+      outputLevel[p] = outLevel;
+    }
+    const out = document.createElement('canvas');
+    out.width = NOWCAST_SIZE;
+    out.height = NOWCAST_SIZE;
+    out.getContext('2d').putImageData(new ImageData(output, NOWCAST_SIZE, NOWCAST_SIZE), 0, 0);
+    return { canvas: out, levels: outputLevel };
+  };
+}
+
 function staticMember(canvas, cells) {
   const levels = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
   for (const cell of cells) {
@@ -4281,62 +4557,209 @@ function forecastAreaHits(entry) {
   }));
   for (const packed of SG_RAIN_PIXEL_DATA) {
     const pixel = packed & RAIN_PIXEL_KEY_MASK;
-    const level = entry.maxBlendLevels[pixel];
+    const level = entry.summaryLevels[pixel];
     if (level) areas[packed >>> 18].counts[level]++;
   }
   return areas
-    .map((area, index) => ({
+    .map((area) => ({
       ...area,
       area: area.counts[1] + area.counts[2] + area.counts[3],
-      votes: entry.votes[index],
     }))
-    .filter((area) => area.area && area.votes >= 2);
+    .filter((area) => area.area);
 }
 
 function hasForecastRain(entry) {
   for (const packed of SG_RAIN_PIXEL_DATA) {
-    if (entry.maxBlendLevels[packed & RAIN_PIXEL_KEY_MASK]) return true;
+    if (entry.summaryLevels[packed & RAIN_PIXEL_KEY_MASK]) return true;
   }
   return false;
 }
 
-// Scores each ensemble member's +5 min forecast for a slot against the live
-// frame that just arrived for that slot; logs per-member pooled Jaccard.
-function scoreMembers(actualSlot, entry) {
-  const frame = framesMap[70]?.get(actualSlot);
-  if (!entry?.members || entry.scored || !frame || frame.nowcast) return;
-  entry.scored = true;
-  prepareFrameImage(70, frame)
-    .then((canvas) => {
-      const actualLevels = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
-      for (const cell of analyzeRainCells(canvas, true))
-        for (let i = 0; i < cell.pixels.length; i++) actualLevels[cell.pixels[i]] = cell.levels[i];
-      const actualPool = neighborhoodMax(actualLevels, NOWCAST_FIT_POOL);
-      const names = ['median', 'd1', 'd2', 'wind', 'dense'];
-      const parts = entry.members.map((levels, i) => {
-        const s = pooledScore(neighborhoodMax(levels, NOWCAST_FIT_POOL), actualPool);
-        return `${names[i]}=${s == null ? 'n/a' : `${Math.round(s * 100)}%`}`;
-      });
-      console.log(`nowcast members @+5min: ${parts.join(' ')}`);
-    })
-    .catch(() => {});
+function loadNowcastScores() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(NOWCAST_SCORES_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveNowcastScore(record) {
+  try {
+    const scores = loadNowcastScores().filter(
+      (r) => !(r.slot === record.slot && r.lead === record.lead),
+    );
+    scores.push(record);
+    while (scores.length > NOWCAST_SCORES_MAX) scores.shift();
+    localStorage.setItem(NOWCAST_SCORES_KEY, JSON.stringify(scores));
+  } catch {}
+}
+
+// Pending forecasts and fit samples survive reloads (dev HMR, tab restore),
+// otherwise +10/+15 scores need 15 unbroken minutes. Levels are run-length
+// encoded (value, count ≤ 65535) as base64 Uint16 pairs: a 230 KB field with a
+// few rain areas shrinks to a few KB.
+const NOWCAST_PENDING_KEY = 'sgwr-nowcast-pending';
+const NOWCAST_FIT_KEY = 'sgwr-nowcast-fit';
+
+function encodeLevels(levels) {
+  const runs = [];
+  let i = 0;
+  while (i < levels.length) {
+    const v = levels[i];
+    let j = i + 1;
+    while (j < levels.length && levels[j] === v && j - i < 65535) j++;
+    runs.push(v, j - i);
+    i = j;
+  }
+  const bytes = new Uint8Array(new Uint16Array(runs).buffer);
+  let bin = '';
+  for (let k = 0; k < bytes.length; k += 0x8000)
+    bin += String.fromCharCode.apply(null, bytes.subarray(k, k + 0x8000));
+  return btoa(bin);
+}
+
+function decodeLevels(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+  const runs = new Uint16Array(bytes.buffer);
+  const levels = new Uint8Array(NOWCAST_SIZE * NOWCAST_SIZE);
+  let p = 0;
+  for (let k = 0; k < runs.length; k += 2) {
+    levels.fill(runs[k], p, p + runs[k + 1]);
+    p += runs[k + 1];
+  }
+  return levels;
+}
+
+function savePendingNowcasts() {
+  try {
+    if (!nowcastPending.size) {
+      localStorage.removeItem(NOWCAST_PENDING_KEY);
+      return;
+    }
+    const out = {};
+    const shared = new Map(); // same array (persistence) encoded once
+    for (const [key, pending] of nowcastPending) {
+      const members = {};
+      for (const [name, levels] of Object.entries(pending.members)) {
+        if (!shared.has(levels)) shared.set(levels, encodeLevels(levels));
+        members[name] = shared.get(levels);
+      }
+      out[key] = { slot: pending.slot, lead: pending.lead, v: pending.v, members };
+    }
+    localStorage.setItem(NOWCAST_PENDING_KEY, JSON.stringify(out));
+  } catch {
+    // Quota: scoring still works in-memory for this page lifetime.
+  }
+}
+
+function loadPersistedNowcastState() {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  try {
+    const raw = JSON.parse(localStorage.getItem(NOWCAST_PENDING_KEY) || '{}');
+    for (const [key, pending] of Object.entries(raw)) {
+      if (!(pending?.slot > cutoff)) continue;
+      const members = {};
+      for (const [name, b64] of Object.entries(pending.members)) members[name] = decodeLevels(b64);
+      nowcastPending.set(key, { slot: pending.slot, lead: pending.lead, v: pending.v, members });
+    }
+  } catch {}
+  try {
+    const fit = JSON.parse(localStorage.getItem(NOWCAST_FIT_KEY) || '[]');
+    const fitCutoff = Date.now() - NOWCAST_FIT_MAX_AGE;
+    for (const s of fit)
+      if (s?.slot > fitCutoff && s.pool === NOWCAST_FIT_POOL) nowcastFitSamples.push(s);
+  } catch {}
+}
+if (showNowcast) loadPersistedNowcastState();
+
+// Scores every stored forecast whose target slot just went live (+5/+10/+15
+// from earlier runs) against the actual frame, persists the result, and drops
+// anything that targeted this slot or earlier. `persistence` (no motion) is
+// the baseline: a member is only useful if it beats it.
+function verifyPendingNowcasts(liveSlot, actual) {
+  let actualPool = null;
+  let changed = false;
+  for (const [key, pending] of nowcastPending) {
+    if (pending.slot > liveSlot) continue;
+    nowcastPending.delete(key);
+    changed = true;
+    if (pending.slot !== liveSlot) continue;
+    actualPool ||= neighborhoodMax(actual.levels, NOWCAST_FIT_POOL);
+    const s = {};
+    for (const [name, levels] of Object.entries(pending.members)) {
+      const j = jaccardRain({ levels }, actual, actualPool);
+      if (j != null) s[name] = Math.round(j * 1000) / 1000;
+    }
+    if (!Object.keys(s).length) continue;
+    saveNowcastScore({
+      slot: pending.slot,
+      lead: pending.lead,
+      pool: NOWCAST_FIT_POOL,
+      v: pending.v || 1,
+      s,
+    });
+    const parts = Object.entries(s).map(([name, j]) => `${name}=${Math.round(j * 100)}%`);
+    console.log(`nowcast members @+${pending.lead}min: ${parts.join(' ')}`);
+  }
+  if (changed) savePendingNowcasts();
+}
+
+// Console helper: mean pooled score per member and lead over the persisted
+// history, plus skill vs the no-motion baseline. Usage: nowcastScores()
+window.nowcastScores = ({ pool = NOWCAST_FIT_POOL, v = NOWCAST_SCORE_VERSION } = {}) => {
+  const byLead = {};
+  for (const r of loadNowcastScores()) {
+    if (r.pool !== pool || (r.v || 1) !== v) continue;
+    const lead = (byLead[r.lead] ||= {});
+    for (const [name, j] of Object.entries(r.s)) {
+      const agg = (lead[name] ||= { sum: 0, skill: 0, n: 0 });
+      agg.sum += j;
+      agg.n++;
+      if (r.s.persistence != null) agg.skill += j - r.s.persistence;
+    }
+  }
+  const rows = {};
+  for (const lead of Object.keys(byLead).sort((a, b) => a - b)) {
+    for (const [name, agg] of Object.entries(byLead[lead])) {
+      rows[`+${lead} ${name}`] = {
+        mean: `${Math.round((agg.sum / agg.n) * 100)}%`,
+        vsPersistence: `${agg.skill >= 0 ? '+' : ''}${Math.round((agg.skill / agg.n) * 100)} pts`,
+        n: agg.n,
+      };
+    }
+  }
+  console.table(rows);
+  return rows;
+};
+
+function recordFitSample(sample) {
+  const existing = nowcastFitSamples.findIndex((s) => s.slot === sample.slot);
+  sample.pool = NOWCAST_FIT_POOL;
+  if (existing >= 0) nowcastFitSamples[existing] = sample;
+  else nowcastFitSamples.push(sample);
+  while (nowcastFitSamples.length > NOWCAST_FIT_MAX_SAMPLES) nowcastFitSamples.shift();
+  try {
+    localStorage.setItem(NOWCAST_FIT_KEY, JSON.stringify(nowcastFitSamples));
+  } catch {}
 }
 
 function modelFitPercent() {
   const cutoff = Date.now() - NOWCAST_FIT_MAX_AGE;
-  while (nowcastFitSamples.length && nowcastFitSamples[0].t < cutoff) nowcastFitSamples.shift();
+  while (nowcastFitSamples.length && nowcastFitSamples[0].slot < cutoff) nowcastFitSamples.shift();
   if (!nowcastFitSamples.length) return null;
-  return Math.round(
-    (nowcastFitSamples.reduce((sum, sample) => sum + sample.j, 0) / nowcastFitSamples.length) * 100,
-  );
+  const mean = (key) =>
+    Math.round(
+      (nowcastFitSamples.reduce((sum, sample) => sum + sample[key], 0) / nowcastFitSamples.length) *
+        100,
+    );
+  return { model: mean('model'), persistence: mean('persistence'), n: nowcastFitSamples.length };
 }
 
 function recomputeNowcast() {
   const generation = ++nowcastGeneration;
-  // The +5 min forecast made one slot ago targets the current live slot; keep
-  // its entry alive for member scoring before clear() wipes the maps.
-  const previousSlot = newestLiveSlot(70);
-  const previousEntry = nowcastCanvases.get(previousSlot);
   const clear = () => {
     nowcastCanvases.clear();
     if (framesMap[70]) {
@@ -4353,6 +4776,10 @@ function recomputeNowcast() {
   clear();
   const latest70 = newestLiveSlot(70);
   const latestGlobal = Math.max(...RANGES.map((range) => newestLiveSlot(range)));
+  if (!showNowcast && nowcastPending.size) {
+    nowcastPending.clear();
+    savePendingNowcasts();
+  }
   if (
     !showNowcast ||
     !Number.isFinite(latest70) ||
@@ -4362,11 +4789,17 @@ function recomputeNowcast() {
     redraw();
     return Promise.resolve();
   }
-  const liveFrames = [...(framesMap[70] || [])]
+  // Only the newest run of consecutive 5-min slots. Every per-pair delta,
+  // growth rate and dense-flow offset is treated as "per 5 min", so a missing
+  // frame would silently double the velocity for that pair.
+  const liveEntries = [...(framesMap[70] || [])]
     .filter(([, frame]) => !frame.nowcast)
-    .sort((a, b) => a[0] - b[0])
-    .slice(-NOWCAST_FRAMES)
-    .map(([, frame]) => frame);
+    .sort((a, b) => a[0] - b[0]);
+  const liveFrames = [];
+  for (let i = liveEntries.length - 1; i >= 0 && liveFrames.length < NOWCAST_FRAMES; i--) {
+    if (liveFrames.length && liveEntries[i + 1][0] - liveEntries[i][0] !== SLOT_MS) break;
+    liveFrames.unshift(liveEntries[i][1]);
+  }
   if (liveFrames.length < 3) {
     redraw();
     return Promise.resolve();
@@ -4382,21 +4815,23 @@ function recomputeNowcast() {
       const lineageCells = canvases.map((canvas) => analyzeRainCells(canvas, true));
       const cellsC = lineageCells[lineageCells.length - 1];
       const { tracks, pairs } = trackCells(lineageCells);
-      const dense = await estimateDenseFlow(canvasB, canvasC, generation);
+      const dense = await estimateDenseFlow(canvases, generation);
       if (!dense || generation !== nowcastGeneration) return;
       const hashValues = [];
       for (const track of tracks.values()) {
         if (track.median) hashValues.push(track.median.dx, track.median.dy);
       }
       const seed = shortHash(hashValues);
-      scoreMembers(latest70, previousEntry);
+      const actualC = staticMember(canvasC, cellsC);
+      verifyPendingNowcasts(latest70, actualC);
       // One-step validation: advect the second-to-last frame by the velocity
       // that brought its cells in, then pooled-score against the actual frame.
+      // Frame B unmoved is the no-motion baseline the fit is compared against.
       const cellsB = lineageCells[lineageCells.length - 2];
       const velocityPair = pairs[pairs.length - 2] || pairs[pairs.length - 1];
       const validationTracks = new Map();
       for (const pair of velocityPair)
-        validationTracks.set(pair.ti, { d1: { dx: pair.dx, dy: pair.dy } });
+        if (!pair.edge) validationTracks.set(pair.ti, { d1: { dx: pair.dx, dy: pair.dy } });
       const validation = advectForward(
         canvasB,
         cellsB,
@@ -4404,11 +4839,19 @@ function recomputeNowcast() {
         1,
         null,
       );
-      const j = jaccardRain(validation, staticMember(canvasC, cellsC));
-      if (j != null) {
-        nowcastFitSamples.push({ t: Date.now(), j });
-        while (nowcastFitSamples.length > NOWCAST_FIT_MAX_SAMPLES) nowcastFitSamples.shift();
-      }
+      const fitPool = neighborhoodMax(actualC.levels, NOWCAST_FIT_POOL);
+      const j = jaccardRain(validation, actualC, fitPool);
+      const jPersist = jaccardRain(staticMember(canvasB, cellsB), actualC, fitPool);
+      // Keyed by slot: recompute also runs on repeat polls / wind loads /
+      // toggles for the same frame, which must not add duplicate samples.
+      if (j != null && jPersist != null)
+        recordFitSample({ slot: latest70, model: j, persistence: jPersist });
+      const persistence = actualC.levels;
+      const lookbackField = buildLookbackField(cellsC, tracks, dense);
+      const lookbackStep = createLookback(canvasC, cellsC, tracks, lookbackField);
+      const lookbackNoDecayStep = createLookback(canvasC, cellsC, tracks, lookbackField, {
+        decay: false,
+      });
       for (let step = 1; step <= 3; step++) {
         if (step > 1) {
           await yieldToUI();
@@ -4428,20 +4871,6 @@ function recomputeNowcast() {
           step,
           tracks,
         );
-        const m1 = advectForward(
-          canvasC,
-          cellsC,
-          createField(cellsC, tracks, 'd1', step),
-          step,
-          tracks,
-        );
-        const m2 = advectForward(
-          canvasC,
-          cellsC,
-          createField(cellsC, tracks, 'd2', step),
-          step,
-          tracks,
-        );
         const m3 = advectForward(canvasC, cellsC, fieldForWind(cellsC, step), step, tracks);
         const m4 = advectForward(
           canvasC,
@@ -4450,33 +4879,57 @@ function recomputeNowcast() {
           step,
           tracks,
         );
-        const blend = maxBlend([m0, m1, m2, m3, m4]);
-        const group = [m0, m1, m2, m3, m4];
         const coherent = spatialCoherence(displaySource.canvas, displaySource.levels);
         // Seal tiny gaps first so large voids count as enclosed, then fill them.
         const smallGaps = fillHoles(coherent.canvas, coherent.levels);
+        const display = fillEnclosedHoles(smallGaps.canvas, smallGaps.levels);
+        const lookback = lookbackStep();
+        const lookbackNoDecay = lookbackNoDecayStep();
+        // Map + summary use the no-decay field: decay dropped every light
+        // pixel of a weakening cell at once and removed small cells outright,
+        // so rain visibly vanished at +10/+15 — with no score evidence that
+        // decay helps. `lookback` (with decay) stays scored as an experiment.
         const entry = {
-          display: fillEnclosedHoles(smallGaps.canvas, smallGaps.levels).canvas,
-          maxBlend: blend.canvas,
-          maxBlendLevels: blend.levels,
-          votes: areaVotes(group),
-          members: group.map((m) => m.levels),
+          display: lookbackNoDecay.canvas,
+          // Ticks + text summary follow what the map shows.
+          summaryLevels: lookbackNoDecay.levels,
         };
         const slot = latest70 + step * SLOT_MS;
         nowcastCanvases.set(slot, entry);
+        // Scored when `slot` goes live. lookbackNoDecay = what the map and
+        // summary show; lookback = same motion + decay (experiment);
+        // display = old forward-splat output; persistence = no motion.
+        nowcastPending.set(`${slot}:${step * 5}`, {
+          slot,
+          lead: step * 5,
+          v: NOWCAST_SCORE_VERSION,
+          members: {
+            median: m0.levels,
+            wind: m3.levels,
+            dense: m4.levels,
+            display: display.levels,
+            lookback: lookback.levels,
+            lookbackNoDecay: lookbackNoDecay.levels,
+            persistence,
+          },
+        });
         framesMap[70].set(slot, {
           url: `nowcast:${slot}:${seed}`,
           timestamp: new Date(slot).toISOString(),
           nowcast: true,
         });
       }
+      savePendingNowcasts();
       framesByRange[70] = [...framesMap[70].values()].sort(
         (a, b) => new Date(a.timestamp) - new Date(b.timestamp),
       );
       redraw();
       if (nowcastControlButton) {
         const fit = modelFitPercent();
-        const fitText = fit == null ? 'model fit pending' : `model fit ${fit}% (rolling 1 h)`;
+        const fitText =
+          fit == null
+            ? 'model fit pending'
+            : `model fit ${fit.model}% vs ${fit.persistence}% no-motion (${fit.n} frame${fit.n === 1 ? '' : 's'}, rolling 1 h)`;
         nowcastControlButton.title = `${fitText} · short-range rain estimate`;
       }
     })
