@@ -762,7 +762,8 @@ function pruneApiCache(now = Date.now()) {
       let expired = true;
       try {
         const entry = JSON.parse(apiCacheStore.getItem(key));
-        expired = !entry || now - entry.cachedAt >= API_CACHE_TTL;
+        expired =
+          !entry || !Number.isFinite(entry.cachedAt) || now - entry.cachedAt >= API_CACHE_TTL;
       } catch (e) {}
       if (expired) doomed.push(key);
     }
@@ -771,12 +772,17 @@ function pruneApiCache(now = Date.now()) {
   } catch (e) {}
 }
 
-function readApiCache(url) {
+// maxAgeMs defaults to the TTL: beyond it the signed image URLs in the envelope are
+// already dead, so a cache hit would paint ticks that immediately fail to load.
+function readApiCache(url, maxAgeMs = API_CACHE_TTL) {
   try {
     const raw = apiCacheStore.getItem(apiCacheKey(url));
     if (!raw) return null;
     const entry = JSON.parse(raw);
-    if (entry && typeof entry.data === 'object') return entry;
+    if (entry && typeof entry.data === 'object') {
+      if (!Number.isFinite(entry.cachedAt) || Date.now() - entry.cachedAt >= maxAgeMs) return null;
+      return entry;
+    }
   } catch (e) {}
   return null;
 }
@@ -853,7 +859,8 @@ function isCacheable(json) {
 
 // Single fetch reader for all API consumers. maxAgeMs is an age budget: within it, cached
 // data short-circuits without touching the network; beyond it the network answers, falling
-// back to stale cache only on failure (which must never be re-stamped as fresh).
+// back to a still-valid cache entry on failure (never re-stamped as fresh). Entries past
+// the cache TTL are invisible to readApiCache — their signed image URLs are dead.
 async function apiFetch(url, { maxAgeMs = 0 } = {}) {
   if (inflightFetches.has(url)) return inflightFetches.get(url);
   const promise = (async () => {
@@ -1270,6 +1277,7 @@ async function doFetchRadar() {
   let rendered = false;
   // Best-effort pass from the session cache so the map paints before the network answers.
   // Cache miss reads as empty records, so the pass itself never errors out on a cold start.
+  // readApiCache enforces the TTL — a wake after sleep must not paint expired S3 URLs.
   const cacheMiss = { code: 0, data: { records: [] } };
   const cacheReader = (url) => readApiCache(url)?.data ?? cacheMiss;
 
@@ -1437,7 +1445,9 @@ function renderTicks(newSlots) {
       const future = range === 70 && slotMs > liveSlot70;
       shape.innerHTML = rangeShapeSVG(range, future);
       const frame = framesMap[range]?.get(slotMs);
-      if (frame && !failedImages.has(frame.url)) {
+      // Tick = a scan exists at this slot. Image failures hide the map layer only;
+      // otherwise a burst of dead signed URLs blanks the whole timeline one by one.
+      if (frame) {
         shape.classList.add('on');
         if (future) {
           shape.classList.add('nowcast');
@@ -4970,10 +4980,24 @@ pruneApiCache();
 initMap();
 fetchAtSlot();
 restartCountdown();
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return;
+function refreshAfterWake() {
+  pruneApiCache();
+  // A fetch that hung across sleep must not block every later attempt.
+  inflightFetches.clear();
+  if (Date.now() - lastFetchStart > 60 * 1000) fetchRadarBusy = false;
   if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
   if (pollRanges.length) pollOnce();
   else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  refreshAfterWake();
+});
+// bfcache restore skips module init; treat it like a wake so we don't sit on dead URLs.
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) refreshAfterWake();
+});
+window.addEventListener('online', () => {
+  if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
 });
 setInterval(tickCountdown, 1000);
