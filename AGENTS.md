@@ -7,7 +7,7 @@
 - `npm run build` — production build to `dist/`
 - `npm run preview` — run the build in the local Workers runtime
 - `npm run format` — format `index.html`, `main.js`, and `styles.css` with oxfmt
-- `npx wrangler deploy` — deploy site + API proxy as one Worker (run `npm run build` first)
+- `npx wrangler deploy` — manual deploy of site + API proxy as one Worker (run `npm run build` first). Production normally deploys via Cloudflare dashboard Git integration on push to `main`
 - `node scripts/generate-icons.mjs` — regenerate `public/` icons from `design/icon.svg`
 - `node scripts/build-rail-data.mjs` — rebuild `rail.json` (bundled MRT/LRT data) from `data/sg-rail.geojson` (cheeaun/sgraildata)
 - `node scripts/build-rain-data.mjs` — rebuild `rain-pixels.json` (pre-computed 70 km radar pixel→planning-area map) and `areas-idx.json` (slim `[[name, region], ...]`) directly from `data/sg-planning-area.geojson`. Run this single command after changing the source dataset or fixed radar-grid mapping
@@ -23,7 +23,7 @@ DATA_GOV_SG_API_KEY=<data.gov.sg API key>
 WAQI_TOKEN=<aqicn.org token; required for the AQI overlay>
 ```
 
-Production uses the encrypted Cloudflare secrets of the same names (`npx wrangler secret put DATA_GOV_SG_API_KEY` / `WAQI_TOKEN`). Never commit the keys or put them in client-visible code — the whole point of the proxy.
+Production uses Cloudflare **runtime** secrets of the same names (dashboard Settings → Variables & Secrets, or `npx wrangler secret put`). AQI UI is a **build-time** gate: `aqiUiEnabled()` in `vite.config.js` checks `VITE_AQI_UI`, then `process.env.WAQI_TOKEN`, then `.dev.vars`. Dashboard runtime secrets are not visible during `npm run build` — set `VITE_AQI_UI=1` (or `WAQI_TOKEN`) under Settings → Build → Build variables and secrets. Never commit the keys or put them in client-visible code — the whole point of the proxy.
 
 Never commit `.env`, `.dev.vars`, or the API key. Never deploy without being asked.
 

@@ -55,29 +55,18 @@ Data from data.gov.sg is covered by the [Singapore Open Data Licence](https://da
 
 ## Deploy to production
 
-One-time (per machine): `npx wrangler login`.
+The Worker (`wrangler.jsonc`: `sg-weather-radar`) is connected to this repo via Cloudflare dashboard Git integration (Workers Builds). Pushing to `main` runs `npm run build` then `npx wrangler deploy`. The site and the API proxy ship together; the app calls same-origin `/api/*` paths (`worker/index.js` allowlists the routes and injects the data.gov.sg key via the `x-api-key` header).
 
-One-time (per Worker): set the production API key as an encrypted secret — never in any file:
-```sh
-npx wrangler secret put DATA_GOV_SG_API_KEY
-```
+### Secrets and build variables
 
-Then build and deploy:
-```sh
-npm run build
-npx wrangler deploy
-```
+Cloudflare separates these — build settings are invisible at runtime and vice versa:
 
-The site and the API proxy deploy together as one Worker (`wrangler.jsonc`: `sg-weather-radar`). The app calls same-origin `/api/*` paths (`worker/index.js` allowlists the routes and injects the key via the `x-api-key` header).
+| Where | What | Why |
+| --- | --- | --- |
+| Settings → Variables & Secrets (runtime) | `DATA_GOV_SG_API_KEY`, `WAQI_TOKEN` | Worker `/api/*` proxy |
+| Settings → Build → Build variables and secrets | `VITE_AQI_UI=1` (or `WAQI_TOKEN`) | AQI map control is baked at build time; runtime secrets are not visible to `npm run build` |
 
-### Deploy via GitHub Actions
-
-Pushing to `main` (or running the [Deploy](.github/workflows/deploy.yml) workflow manually) builds and deploys the Worker in CI. Add these repository secrets once (Settings → Secrets and variables → Actions):
-
-- `CLOUDFLARE_API_TOKEN` — create one with the "Edit Cloudflare Workers" template
-- `CLOUDFLARE_ACCOUNT_ID`
-
-`DATA_GOV_SG_API_KEY` needs no CI counterpart; it lives as an encrypted Cloudflare secret on the Worker and persists across deploys.
+To change a build-time flag, push a new commit so Workers Builds rebuilds. Manual deploy is still available: `npx wrangler login`, set secrets with `npx wrangler secret put …`, then `npm run build && npx wrangler deploy`.
 
 ## Build
 
@@ -108,7 +97,7 @@ This rebuilds `rain-pixels.json` and `areas-idx.json`. Rerun it when updating th
 
 ## AQI data
 
-Live station readings from the [World Air Quality Index project](https://waqi.info) ([aqicn.org](https://aqicn.org/api/)), proxied through the Worker with `WAQI_TOKEN`. Free token: [aqicn.org/data-platform/token/](https://aqicn.org/data-platform/token/). The map control is included at build time when a token is present in `.dev.vars` (or `VITE_AQI_UI=1`).
+Live station readings from the [World Air Quality Index project](https://waqi.info) ([aqicn.org](https://aqicn.org/api/)), proxied through the Worker with `WAQI_TOKEN`. Free token: [aqicn.org/data-platform/token/](https://aqicn.org/data-platform/token/). The map control is included at build time when `WAQI_TOKEN` is present in `.dev.vars` or the build environment, or when `VITE_AQI_UI=1` is set — see [Deploy to production](#deploy-to-production).
 
 One chip per station (US EPA AQI, WAQI palette) inside the 480 km radar square. Hover a chip, or zoom in, to see how old the reading is. Live only — not scrubbed with the radar timeline.
 
