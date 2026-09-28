@@ -62,8 +62,9 @@
   :root:not([data-theme]) .maplibregl-ctrl-group button + button {
     border-top-color: var(--line);
   }
-  :root:not([data-theme]) .maplibregl-ctrl button:not(:disabled):hover,
-  :root:not([data-theme]) .maplibregl-ctrl button:not(:disabled):active {
+  /* :not(.toggle-active) — hover must not wipe the inverted active plate. */
+  :root:not([data-theme]) .maplibregl-ctrl button:not(:disabled):not(.toggle-active):hover,
+  :root:not([data-theme]) .maplibregl-ctrl button:not(:disabled):not(.toggle-active):active {
     background-color: rgba(255, 255, 255, 0.05);
   }
   :root:not([data-theme]) .maplibregl-ctrl-icon {
@@ -150,8 +151,9 @@
 :root[data-theme='dark'] .maplibregl-ctrl-group button + button {
   border-top-color: var(--line);
 }
-:root[data-theme='dark'] .maplibregl-ctrl button:not(:disabled):hover,
-:root[data-theme='dark'] .maplibregl-ctrl button:not(:disabled):active {
+/* :not(.toggle-active) — hover must not wipe the inverted active plate. */
+:root[data-theme='dark'] .maplibregl-ctrl button:not(:disabled):not(.toggle-active):hover,
+:root[data-theme='dark'] .maplibregl-ctrl button:not(:disabled):not(.toggle-active):active {
   background-color: rgba(255, 255, 255, 0.05);
 }
 :root[data-theme='dark'] .maplibregl-ctrl-icon {
@@ -232,6 +234,9 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
+  /* Contain marker z-index so chips cannot paint over page chrome (toast, sheets). */
+  z-index: 0;
+  isolation: isolate;
 }
 
 .maplibregl-ctrl-top-left,
@@ -276,9 +281,84 @@ body {
   color: var(--ink-strong);
   border-radius: 4px;
 }
+/* Beats maplibre's default button:hover so the active plate stays solid on hover. */
+.maplibregl-ctrl button.toggle-btn.toggle-active:hover,
+.maplibregl-ctrl button.toggle-btn.toggle-active:active {
+  background: var(--paper-solid);
+  color: var(--ink-strong);
+}
+:root:not([data-theme]) .maplibregl-ctrl button.toggle-btn.toggle-active:hover,
+:root:not([data-theme]) .maplibregl-ctrl button.toggle-btn.toggle-active:active,
+:root[data-theme='dark'] .maplibregl-ctrl button.toggle-btn.toggle-active:hover,
+:root[data-theme='dark'] .maplibregl-ctrl button.toggle-btn.toggle-active:active {
+  background: var(--ink-strong);
+  color: var(--bg);
+}
 .maplibregl-ctrl-group svg.toggle-icon {
   width: 18px;
   height: 18px;
+  display: block;
+}
+/* MapLibre control buttons are 29×29 with a 2px border → 25px content. Stay under that. */
+.maplibregl-ctrl-group svg.toggle-icon.aqi-text-icon {
+  width: 24px;
+  height: 18px;
+}
+
+/* !important: maplibre-gl.css loads after this file and would keep z-index: 2. */
+.maplibregl-map .maplibregl-ctrl-top-left,
+.maplibregl-map .maplibregl-ctrl-top-right,
+.maplibregl-map .maplibregl-ctrl-bottom-left,
+.maplibregl-map .maplibregl-ctrl-bottom-right {
+  z-index: 1000 !important;
+}
+
+/* WAQI station chips: DOM markers, number on a rounded rect (US EPA palette inline). */
+.aqi-marker {
+  display: inline-flex;
+  pointer-events: auto;
+  z-index: var(--aqi-z, 1);
+}
+.aqi-marker:hover {
+  z-index: 501;
+}
+.aqi-chip {
+  font:
+    600 11px/1 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  padding: 3px 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.85);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  white-space: nowrap;
+  user-select: none;
+  letter-spacing: 0.01em;
+}
+/* Age sits under the chip, outside the plate — hover or zoom ≥ 11. */
+.aqi-age {
+  display: none;
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 50%;
+  transform: translateX(-50%);
+  font:
+    700 12px/1.2 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  /* Single 1px outline; text/halo colors are AAA-contrasted inline. */
+  text-shadow:
+    -1px -1px 0 var(--aqi-age-halo),
+    1px -1px 0 var(--aqi-age-halo),
+    -1px 1px 0 var(--aqi-age-halo),
+    1px 1px 0 var(--aqi-age-halo);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.aqi-marker:hover .aqi-age,
+.maplibregl-map.aqi-ages-on .aqi-age {
   display: block;
 }
 

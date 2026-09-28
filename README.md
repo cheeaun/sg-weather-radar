@@ -19,6 +19,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Optional PUB flood-alert overlay (broadcast-radius circles + icons)
 - Optional (off by default) wind particle animation driven by station wind readings
 - Optional (off by default) 15-minute rain nowcast: adds +5/+10/+15 min forecast slots to the timeline, computed client-side from the latest radar frames and station winds — rain approaching from outside Singapore (up to the 70 km radar edge) is included; implementation notes in [NOWCAST.md](NOWCAST.md)
+- Optional (off by default) AQI station chips from [WAQI / aqicn.org](https://waqi.info) inside the 480 km radar square (number on a rounded rect in the US EPA palette; relative reading age on hover or when zoomed in)
 - System / light / dark themes with matching map styles
 - Adjustable radar opacity and boundary clipping
 - Geolocate and navigation controls
@@ -30,6 +31,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Lightning: [NEA Lightning API](https://data.gov.sg/datasets/d_08238953fe0f6dd13f10714ebfbcb9f9/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Wind speed & direction: [NEA Wind Speed API](https://data.gov.sg/datasets/d_7677738484067741bf3b56ab5d69c7e9/view) / [NEA Wind Direction API](https://data.gov.sg/datasets/d_534cf203023b51f51f879145ccc56ff9/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Rail lines & stations: [cheeaun/sgraildata](https://github.com/cheeaun/sgraildata), compiled to `rail.json` by `scripts/build-rail-data.mjs` and bundled with the app
+- AQI stations: [WAQI map-bounds API](https://aqicn.org/api/) (aqicn.org) via `api.waqi.info` (proxied through the Worker with `WAQI_TOKEN`) — see [AQI data](#aqi-data)
 - Singapore landmass boundary (for the rain summary): [URA Master Plan 2025 Planning Area Boundary (No Sea)](https://data.gov.sg/datasets/d_2cc750190544007400b2cfd5d7f53209/view), compiled into the bundled rain-pixel index by `scripts/build-rain-data.mjs`
 - Map tiles: [OpenFreeMap](https://openfreemap.org)
 
@@ -103,6 +105,12 @@ node scripts/build-rain-data.mjs
 ```
 
 This rebuilds `rain-pixels.json` and `areas-idx.json`. Rerun it when updating the underlying planning-area dataset or the fixed radar-grid mapping.
+
+## AQI data
+
+Live station readings from the [World Air Quality Index project](https://waqi.info) ([aqicn.org](https://aqicn.org/api/)), proxied through the Worker with `WAQI_TOKEN`. Free token: [aqicn.org/data-platform/token/](https://aqicn.org/data-platform/token/). The map control is included at build time when a token is present in `.dev.vars` (or `VITE_AQI_UI=1`).
+
+One chip per station (US EPA AQI, WAQI palette) inside the 480 km radar square. Hover a chip, or zoom in, to see how old the reading is. Live only — not scrubbed with the radar timeline.
 
 ## Icons
 

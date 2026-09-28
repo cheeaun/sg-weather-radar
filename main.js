@@ -45,6 +45,7 @@ const LIGHTNING_STORAGE_KEY = 'sgwr-lightning';
 const FLOOD_STORAGE_KEY = 'sgwr-floods';
 const WIND_STORAGE_KEY = 'sgwr-wind';
 const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
+const AQI_STORAGE_KEY = 'sgwr-aqi';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -92,10 +93,17 @@ let showLightning = localStorage.getItem(LIGHTNING_STORAGE_KEY) === 'on';
 let showFloods = localStorage.getItem(FLOOD_STORAGE_KEY) === 'on';
 let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
+let showAqi = import.meta.env.VITE_AQI_UI === '1' && localStorage.getItem(AQI_STORAGE_KEY) === 'on';
+const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
+const BASE_ATTRIBUTION =
+  'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
+let attributionControl = null;
 let lightningStrikes = [];
 let lightningLoading = null;
 let floodAlerts = [];
 let floodLoading = null;
+let aqiStations = [];
+let aqiLoading = null;
 const failedImages = new Set();
 const nowcastCanvases = new Map();
 let nowcastGeneration = 0;
@@ -564,6 +572,39 @@ class FloodToggleControl {
   }
 }
 
+class AqiToggleControl {
+  onAdd(map) {
+    this._map = map;
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toggle-btn';
+    button.title = 'Show air quality (AQI)';
+    button.setAttribute('aria-label', 'Show air quality');
+    button.setAttribute('aria-pressed', String(showAqi));
+    button.classList.toggle('toggle-active', showAqi);
+    button.innerHTML =
+      '<svg class="toggle-icon aqi-text-icon" viewBox="0 0 32 24" aria-hidden="true"><text x="50%" y="50%" dy="0.36em" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="currentColor">AQI</text></svg>';
+    button.addEventListener('click', () => {
+      showAqi = !showAqi;
+      localStorage.setItem(AQI_STORAGE_KEY, showAqi ? 'on' : 'off');
+      button.classList.toggle('toggle-active', showAqi);
+      button.setAttribute('aria-pressed', String(showAqi));
+      setAqiOverlay(showAqi);
+      showToast(showAqi ? 'Showing air quality' : 'Hiding air quality');
+    });
+    container.appendChild(button);
+    this._container = container;
+    return container;
+  }
+  onRemove() {
+    if (this._container) this._container.remove();
+    this._container = undefined;
+    this._map = undefined;
+  }
+}
+
 function resolvedTheme() {
   if (themePreference === 'system') return darkModeQuery.matches ? 'dark' : 'light';
   return themePreference;
@@ -593,6 +634,7 @@ function applyTheme() {
   }
   updateThemeButtons();
   if (showWind && windMotionQuery.matches) renderWindStatic();
+  if (showAqi) renderAqi();
 }
 
 function setThemePreference(pref) {
@@ -671,18 +713,23 @@ function initMap() {
     style: appliedStyle,
     center: SG_CENTER,
     zoom: 8,
-    attributionControl: {
-      compact: true,
-      customAttribution:
-        'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>',
-    },
+    attributionControl: false,
   });
+  attributionControl = new maplibregl.AttributionControl({
+    compact: true,
+    customAttribution: BASE_ATTRIBUTION,
+  });
+  map.addControl(attributionControl);
+  updateAqiAttribution(showAqi);
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
   map.addControl(new RangeToggleControl(), 'bottom-right');
   map.addControl(new ClipToggleControl(), 'bottom-right');
   map.addControl(new WindToggleControl(), 'bottom-right');
   map.addControl(new LightningToggleControl(), 'bottom-right');
   map.addControl(new FloodToggleControl(), 'bottom-right');
+  if (import.meta.env.VITE_AQI_UI === '1') {
+    map.addControl(new AqiToggleControl(), 'bottom-right');
+  }
   map.addControl(new NowcastToggleControl(), 'bottom-right');
   const geolocateControl = new maplibregl.GeolocateControl({
     positionOptions: { enableHighAccuracy: true },
@@ -723,6 +770,7 @@ function initMap() {
   // Radar data fetch starts immediately at module init; only wind needs the loaded map.
   map.once('load', () => {
     if (showWind) setWindOverlay(true);
+    if (showAqi) refreshAqi();
   });
   map.on('move', windInvalidateScreen);
   map.on('moveend', () => {
@@ -734,6 +782,7 @@ function initMap() {
     styleReady = true;
     addRadarLayers();
     addLandOutline();
+    addAqiLayers();
     addRailLayers();
     addWindLayer();
     addBoundaryLayers();
@@ -744,6 +793,7 @@ function initMap() {
     raisePlaceLabels();
   });
   map.on('moveend', updateRainNearLinkLabelVisibility);
+  map.on('zoomend', updateAqiAgeVisibility);
   applyTheme();
 }
 
@@ -1050,6 +1100,30 @@ async function refreshFloods() {
   return floodLoading;
 }
 
+async function loadAqiStations(fetchFn) {
+  const json = await fetchFn(apiURL('/aqi-stations'));
+  assertApiOk(json, apiURL('/aqi-stations'));
+  return json.data.stations || [];
+}
+
+async function refreshAqi() {
+  if (!showAqi) return null;
+  if (aqiLoading) return aqiLoading;
+  aqiLoading = loadAqiStations((url) => apiFetch(url, { maxAgeMs: 15 * 60 * 1000 }))
+    .then((stations) => {
+      aqiStations = stations;
+      renderAqi();
+    })
+    .catch((e) => {
+      console.error('AQI fetch error:', e);
+      if (showAqi) showToast('AQI data unavailable — set WAQI_TOKEN');
+    })
+    .finally(() => {
+      aqiLoading = null;
+    });
+  return aqiLoading;
+}
+
 async function loadRadarData(fetchFn, ranges = RANGES) {
   const now = sgtNow();
   const cutoff = new Date(now.getTime() - WINDOW_MS);
@@ -1335,6 +1409,7 @@ async function fetchAtSlot() {
   pollRanges = missingRangesFor(pollSlotMs);
   if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
   if (showFloods) refreshFloods();
+  if (showAqi) refreshAqi();
   scheduleNextRefresh();
 }
 
@@ -1611,6 +1686,143 @@ function addLandOutline() {
       },
     });
   }
+}
+
+// WAQI US EPA palette (aqicn.org scale) — number on a rounded rect, same colors as their markers.
+function aqiStyle(aqi) {
+  const n = Number(aqi);
+  // Match WAQI map tiles: green only below 50 (50 paints yellow), not the scale table's "0-50".
+  if (n < 50) return { fill: '#009966', text: '#ffffff' };
+  if (n <= 100) return { fill: '#ffde33', text: '#000000' };
+  if (n <= 150) return { fill: '#ff9933', text: '#000000' };
+  if (n <= 200) return { fill: '#cc0033', text: '#ffffff' };
+  if (n <= 300) return { fill: '#660099', text: '#ffffff' };
+  return { fill: '#7e0023', text: '#ffffff' };
+}
+
+function inRadar480(lng, lat) {
+  const bb = RADAR_BOUNDS[480];
+  return (
+    lng >= bb.upperLeft.longitude &&
+    lng <= bb.lowerRight.longitude &&
+    lat <= bb.upperLeft.latitude &&
+    lat >= bb.lowerRight.latitude
+  );
+}
+
+function mixHex(base, tint, tintAmt) {
+  const parse = (h) => {
+    const n = h.replace('#', '');
+    return [0, 2, 4].map((i) => parseInt(n.slice(i, i + 2), 16));
+  };
+  const a = parse(base);
+  const b = parse(tint);
+  const out = a.map((c, i) => Math.round(c + (b[i] - c) * tintAmt));
+  return `#${out.map((c) => c.toString(16).padStart(2, '0')).join('')}`;
+}
+
+// Near-black/white for max legibility; a little band hue keeps it tied to AQI.
+function ageTextStyle(fill) {
+  const darkMap = resolvedTheme() === 'dark';
+  return {
+    text: darkMap ? mixHex('#0c0c0c', fill, 0.32) : mixHex('#ffffff', fill, 0.32),
+    halo: darkMap ? 'rgba(255,255,255,0.98)' : 'rgba(0,0,0,0.98)',
+  };
+}
+
+// DOM chips (not canvas sprites): crisp type, easy styling, fine at a few dozen stations.
+const aqiMarkers = [];
+const aqiAgeEls = [];
+const AQI_AGE_ZOOM = 11;
+let aqiAgeTimer = null;
+
+function clearAqiMarkers() {
+  for (const m of aqiMarkers) m.remove();
+  aqiMarkers.length = 0;
+  aqiAgeEls.length = 0;
+}
+
+function formatAqiAge(timeIso) {
+  const t = Date.parse(timeIso);
+  if (!Number.isFinite(t)) return '';
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (mins < 1) return 'now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function updateAqiAges() {
+  for (const { el, time } of aqiAgeEls) el.textContent = formatAqiAge(time);
+}
+
+function updateAqiAgeVisibility() {
+  if (!map) return;
+  map.getContainer().classList.toggle('aqi-ages-on', showAqi && map.getZoom() >= AQI_AGE_ZOOM);
+}
+
+function aqiChipEl(aqi, name, time) {
+  const { fill, text: textColor } = aqiStyle(aqi);
+  const wrap = document.createElement('div');
+  wrap.className = 'aqi-marker';
+  wrap.title = name ? `${name} · AQI ${aqi}` : `AQI ${aqi}`;
+  // Unhealthy chips stack above healthier ones; hover temporarily wins (CSS).
+  wrap.style.setProperty('--aqi-z', String(clamp(Math.round(Number(aqi) || 0), 1, 500)));
+  const chip = document.createElement('div');
+  chip.className = 'aqi-chip';
+  chip.textContent = String(aqi);
+  // Slight transparency on the plate only — text stays fully opaque.
+  chip.style.backgroundColor = `color-mix(in srgb, ${fill} 88%, transparent)`;
+  chip.style.color = textColor;
+  wrap.appendChild(chip);
+  if (time) {
+    const age = document.createElement('div');
+    age.className = 'aqi-age';
+    age.textContent = formatAqiAge(time);
+    const { text: ageColor, halo } = ageTextStyle(fill);
+    age.style.color = ageColor;
+    age.style.setProperty('--aqi-age-halo', halo);
+    wrap.appendChild(age);
+    aqiAgeEls.push({ el: age, time });
+  }
+  return wrap;
+}
+
+// Station markers only inside the 480 km radar square — never outside.
+function addAqiLayers() {
+  renderAqi();
+  updateAqiAgeVisibility();
+}
+
+function updateAqiAttribution(on) {
+  if (!attributionControl) return;
+  attributionControl.options.customAttribution = on
+    ? `${BASE_ATTRIBUTION} · ${AQI_ATTRIBUTION}`
+    : BASE_ATTRIBUTION;
+  attributionControl._updateAttributions();
+}
+
+function setAqiOverlay(on) {
+  if (on) refreshAqi();
+  else renderAqi();
+  updateAqiAgeVisibility();
+  updateAqiAttribution(on);
+}
+
+function renderAqi() {
+  clearAqiMarkers();
+  clearInterval(aqiAgeTimer);
+  aqiAgeTimer = null;
+  if (!map || !showAqi) return;
+  for (const s of aqiStations) {
+    if (!inRadar480(s.lng, s.lat)) continue;
+    const el = aqiChipEl(s.aqi, s.name, s.time);
+    aqiMarkers.push(
+      new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat([s.lng, s.lat]).addTo(map),
+    );
+  }
+  if (aqiAgeEls.length) aqiAgeTimer = setInterval(updateAqiAges, 60 * 1000);
 }
 
 // Base-style place labels sit under the overlays; raise them so names stay readable over rain.
