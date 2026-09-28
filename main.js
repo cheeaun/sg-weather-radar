@@ -2818,6 +2818,7 @@ const windBucketXY = Array.from(
 );
 const windBucketN = new Int32Array(WIND_COLOR_BUCKETS);
 let windField = null;
+let windStations = [];
 let windSpawn = null;
 let windLastT = 0;
 let windClearNext = false;
@@ -3084,11 +3085,133 @@ function stepWind(now) {
   windCtx.globalAlpha = 1;
 }
 
+// Stationary km/h readouts: outline-only text, rotated to the local flow direction.
+// Positions stay put; only the number/angle refresh when the wind field updates.
+const WIND_MS_TO_KMH = 3.6;
+const windLabels = [];
+let windLabelRaf = 0;
+
+function clearWindLabels() {
+  if (windLabelRaf) {
+    cancelAnimationFrame(windLabelRaf);
+    windLabelRaf = 0;
+  }
+  for (const L of windLabels) L.marker.remove();
+  windLabels.length = 0;
+}
+
+function windLabelEl() {
+  const wrap = document.createElement('div');
+  wrap.className = 'wind-label';
+  return { wrap, text: wrap };
+}
+
+function tickWindLabelRots() {
+  windLabelRaf = 0;
+  let moving = false;
+  for (const L of windLabels) {
+    const d = L.rotTarget - L.rot;
+    if (Math.abs(d) < 0.15) {
+      L.rot = L.rotTarget;
+    } else {
+      L.rot += d * 0.12;
+      moving = true;
+    }
+    L.marker.setRotation(L.rot);
+  }
+  if (moving) windLabelRaf = requestAnimationFrame(tickWindLabelRots);
+}
+
+function updateWindLabelReadout(L) {
+  sampleWind(L.lng, L.lat);
+  const u = windSample.u;
+  const v = windSample.v;
+  const kmh = Math.round(Math.hypot(u, v) * WIND_MS_TO_KMH);
+  const label = `${kmh}km/h`;
+  L.text.textContent = label;
+  L.text.dataset.text = label;
+  L.marker.getElement().title = `${kmh} km/h`;
+  // 10 km/h → 3s sweep; pace scales with strength (floor 1.5s, ceiling 8s).
+  // Only touch duration when speed changes — otherwise the animation restarts.
+  if (kmh !== L.speedKmh) {
+    L.speedKmh = kmh;
+    const shimmerSec = clamp(30 / Math.max(kmh, 1), 1.5, 8);
+    L.text.style.setProperty('--wind-shimmer-sec', `${shimmerSec.toFixed(2)}s`);
+  }
+  // Align to travel direction, then flip 180° if that would leave the text upside-down.
+  // When flipped, reverse the shimmer so the glint still travels with the wind.
+  let rot = (-Math.atan2(v, u) * 180) / Math.PI;
+  let flip = false;
+  while (rot > 90) {
+    rot -= 180;
+    flip = !flip;
+  }
+  while (rot < -90) {
+    rot += 180;
+    flip = !flip;
+  }
+  L.text.classList.toggle('wind-label-rev', flip);
+  // Ease along the shortest arc so a field refresh does not snap the angle.
+  if (L.rot == null) {
+    L.rot = rot;
+    L.rotTarget = rot;
+    L.marker.setRotation(rot);
+    return;
+  }
+  let d = rot - L.rot;
+  while (d > 180) d -= 360;
+  while (d < -180) d += 360;
+  L.rotTarget = L.rot + d;
+  if (!windLabelRaf && !windMotionQuery.matches) {
+    windLabelRaf = requestAnimationFrame(tickWindLabelRots);
+  } else if (windMotionQuery.matches) {
+    L.rot = L.rotTarget;
+    L.marker.setRotation(L.rot);
+  }
+}
+
+function addWindLabelAt(lng, lat) {
+  sampleWind(lng, lat);
+  if (windSample.m < 0.03) return;
+  const { wrap, text } = windLabelEl();
+  // setLngLat before addTo — Marker._update reads _lngLat on insert.
+  const marker = new maplibregl.Marker({
+    element: wrap,
+    anchor: 'center',
+    rotationAlignment: 'map',
+    pitchAlignment: 'map',
+  })
+    .setLngLat([lng, lat])
+    .addTo(map);
+  const L = { marker, text, lng, lat, speedKmh: -1, rot: null, rotTarget: null };
+  updateWindLabelReadout(L);
+  windLabels.push(L);
+}
+
+function ensureWindLabels() {
+  if (!showWind || !map || !windField || !windStations.length) {
+    clearWindLabels();
+    return;
+  }
+  // One label per NEA station so coverage is the island itself, not the padded field.
+  if (windLabels.length === windStations.length) {
+    for (const L of windLabels) updateWindLabelReadout(L);
+    return;
+  }
+  clearWindLabels();
+  for (const s of windStations) addWindLabelAt(s.lng, s.lat);
+}
+
+function renderWindLabelsStatic() {
+  ensureWindLabels();
+}
+
 function renderWindStatic() {
   sizeWindCanvas();
   const w = windViewW;
   const h = windViewH;
   windCtx.clearRect(0, 0, w, h);
+  renderWindLabelsStatic();
   if (!windField || !map) return;
   const palette = windBucketStyles();
   windCtx.globalAlpha = 0.5;
@@ -3249,6 +3372,7 @@ function startWindLoop() {
     renderWindStatic();
     return;
   }
+  ensureWindLabels();
   windLastT = performance.now();
   map.triggerRepaint();
 }
@@ -3263,10 +3387,12 @@ function setWindOverlay(on) {
       startWindLoop();
     }
     loadWind();
+    if (windField) ensureWindLabels();
   } else {
     if (hasLayer) map.setLayoutProperty(WIND_LAYER_ID, 'visibility', 'none');
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
     windNeedsUpload = false;
+    clearWindLabels();
   }
 }
 
@@ -3319,11 +3445,15 @@ async function loadWind({ forNowcast = false } = {}) {
         });
       }
       if (stations.length < 3) throw new Error('Insufficient wind stations');
+      windStations = stations;
       windField = buildWindField(stations);
       updateWindSpawn();
       windDataAt = Date.now();
       if (windMotionQuery.matches) renderWindStatic();
-      else if (map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
+      else {
+        ensureWindLabels();
+        if (map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
+      }
     } finally {
       setBusy(false);
     }
@@ -3346,7 +3476,11 @@ window.addEventListener('resize', () => {
   if (!showWind) return;
   sizeWindCanvas();
   if (windMotionQuery.matches) renderWindStatic();
-  else windClearNext = true;
+  else {
+    windClearNext = true;
+    clearWindLabels();
+    ensureWindLabels();
+  }
 });
 windMotionQuery.addEventListener('change', () => {
   if (showWind) startWindLoop();

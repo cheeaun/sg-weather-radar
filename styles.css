@@ -362,6 +362,64 @@ body {
   display: block;
 }
 
+/* Stationary wind km/h readouts. Shimmer = a see-through band masked into the
+   text itself (map shows through), not a second painted color. */
+.wind-label {
+  position: relative;
+  z-index: 2;
+  font:
+    700 11px/1 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  white-space: nowrap;
+  user-select: none;
+  letter-spacing: 0.01em;
+  pointer-events: none;
+  color: var(--shape-halo);
+  text-shadow:
+    -1px -1px 0 var(--ink-strong),
+    1px -1px 0 var(--ink-strong),
+    -1px 1px 0 var(--ink-strong),
+    1px 1px 0 var(--ink-strong),
+    -1px 0 0 var(--ink-strong),
+    1px 0 0 var(--ink-strong),
+    0 -1px 0 var(--ink-strong),
+    0 1px 0 var(--ink-strong),
+    0 0 3px var(--ink-strong);
+  /* 300% mask + 0→100% keeps the text fully covered; the dip leaves both edges. */
+  -webkit-mask-image: linear-gradient(100deg, #000 35%, rgba(0, 0, 0, 0.12) 50%, #000 65%);
+  mask-image: linear-gradient(100deg, #000 35%, rgba(0, 0, 0, 0.12) 50%, #000 65%);
+  -webkit-mask-size: 300% 100%;
+  mask-size: 300% 100%;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: 0% 0;
+  mask-position: 0% 0;
+  animation: wind-label-shimmer var(--wind-shimmer-sec, 5.5s) linear infinite;
+}
+/* Flipped (readable) labels run the band the other way so it still follows the wind. */
+.wind-label-rev {
+  animation-direction: reverse;
+}
+@keyframes wind-label-shimmer {
+  from {
+    -webkit-mask-position: 100% 0;
+    mask-position: 100% 0;
+  }
+  to {
+    -webkit-mask-position: 0% 0;
+    mask-position: 0% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wind-label {
+    animation: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
 .panel {
   pointer-events: auto;
   background: var(--paper);
