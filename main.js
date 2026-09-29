@@ -1293,8 +1293,10 @@ async function loadTempStations(fetchFn) {
     });
   }
   for (const s of stations) feelsForStation(s, stations, wbgtStations);
-  // WBGT-only sites fill gaps; one-line chips so they don't look like T+deltas.
+  // WBGT-only gap chips only when heat stress is actually elevated (Moderate/High).
+  // Low days would just paint lower numbers than air temp and confuse the map.
   for (const w of wbgtStations) {
+    if (!w.stress || w.stress.toLowerCase() === 'low') continue;
     const near = stations.some(
       (s) => Math.hypot((s.lng - w.lng) * Math.cos((w.lat * Math.PI) / 180), s.lat - w.lat) < 0.02,
     );
@@ -2100,7 +2102,8 @@ function tempChipEl(station) {
     }
     wrap.title = title;
   }
-  if (station.heatStress && station.heatStress !== 'Low') wrap.classList.add('temp-stress');
+  if (station.heatStress && station.heatStress.toLowerCase() !== 'low')
+    wrap.classList.add('temp-stress');
   wrap.style.setProperty('--temp-z', String(clamp(Math.round(station.tC * 2), 1, 500)));
   const chip = document.createElement('div');
   chip.className = 'temp-chip';
