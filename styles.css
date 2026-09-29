@@ -362,6 +362,66 @@ body {
   display: block;
 }
 
+/* Temperature chips: white type, dark thermal-color outline (no plate). */
+.temp-marker {
+  display: inline-flex;
+  pointer-events: auto;
+  z-index: var(--temp-z, 1);
+}
+.temp-marker:hover {
+  z-index: 501;
+}
+.temp-marker.temp-stress .temp-main {
+  font-weight: 800;
+}
+.temp-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 4px;
+  border: none;
+  background: none;
+  white-space: nowrap;
+  user-select: none;
+}
+.temp-main {
+  font:
+    700 13px/1.05 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  letter-spacing: 0.01em;
+}
+.temp-feels {
+  font:
+    600 10px/1 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  opacity: 0.72;
+}
+.deg-int {
+  font-weight: inherit;
+}
+.deg-soft {
+  font-weight: 500;
+}
+/* White fill + near-black thermal outline (thick, slightly soft). */
+.temp-main,
+.temp-feels {
+  color: #ffffff;
+  text-shadow:
+    -1.5px -1.5px 0 color-mix(in srgb, var(--temp-outline) 95%, transparent),
+    1.5px -1.5px 0 color-mix(in srgb, var(--temp-outline) 95%, transparent),
+    -1.5px 1.5px 0 color-mix(in srgb, var(--temp-outline) 95%, transparent),
+    1.5px 1.5px 0 color-mix(in srgb, var(--temp-outline) 95%, transparent),
+    -1.5px 0 0 color-mix(in srgb, var(--temp-outline) 85%, transparent),
+    1.5px 0 0 color-mix(in srgb, var(--temp-outline) 85%, transparent),
+    0 -1.5px 0 color-mix(in srgb, var(--temp-outline) 85%, transparent),
+    0 1.5px 0 color-mix(in srgb, var(--temp-outline) 85%, transparent);
+}
+
 /* Stationary wind km/h readouts. Shimmer = a see-through band masked into the
    text itself (map shows through), not a second painted color. */
 .wind-label {

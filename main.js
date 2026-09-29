@@ -46,6 +46,7 @@ const FLOOD_STORAGE_KEY = 'sgwr-floods';
 const WIND_STORAGE_KEY = 'sgwr-wind';
 const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
 const AQI_STORAGE_KEY = 'sgwr-aqi';
+const TEMP_STORAGE_KEY = 'sgwr-temp';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -94,6 +95,7 @@ let showFloods = localStorage.getItem(FLOOD_STORAGE_KEY) === 'on';
 let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
 let showAqi = import.meta.env.VITE_AQI_UI === '1' && localStorage.getItem(AQI_STORAGE_KEY) === 'on';
+let showTemp = localStorage.getItem(TEMP_STORAGE_KEY) === 'on';
 const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
 const BASE_ATTRIBUTION =
   'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
@@ -104,6 +106,9 @@ let floodAlerts = [];
 let floodLoading = null;
 let aqiStations = [];
 let aqiLoading = null;
+let tempStations = [];
+let tempLoading = null;
+let tempWbgtStations = [];
 const failedImages = new Set();
 const nowcastCanvases = new Map();
 let nowcastGeneration = 0;
@@ -455,6 +460,39 @@ class WindToggleControl {
   }
 }
 
+class TempToggleControl {
+  onAdd(map) {
+    this._map = map;
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toggle-btn';
+    button.title = 'Show temperature and feels-like';
+    button.setAttribute('aria-label', 'Show temperature and feels-like');
+    button.setAttribute('aria-pressed', String(showTemp));
+    button.classList.toggle('toggle-active', showTemp);
+    button.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg>';
+    button.addEventListener('click', () => {
+      showTemp = !showTemp;
+      localStorage.setItem(TEMP_STORAGE_KEY, showTemp ? 'on' : 'off');
+      button.classList.toggle('toggle-active', showTemp);
+      button.setAttribute('aria-pressed', String(showTemp));
+      setTempOverlay(showTemp);
+      showToast(showTemp ? 'Showing temperature' : 'Hiding temperature');
+    });
+    container.appendChild(button);
+    this._container = container;
+    return container;
+  }
+  onRemove() {
+    if (this._container) this._container.remove();
+    this._container = undefined;
+    this._map = undefined;
+  }
+}
+
 class NowcastToggleControl {
   onAdd(map) {
     this._map = map;
@@ -725,6 +763,7 @@ function initMap() {
   map.addControl(new RangeToggleControl(), 'bottom-right');
   map.addControl(new ClipToggleControl(), 'bottom-right');
   map.addControl(new WindToggleControl(), 'bottom-right');
+  map.addControl(new TempToggleControl(), 'bottom-right');
   map.addControl(new LightningToggleControl(), 'bottom-right');
   map.addControl(new FloodToggleControl(), 'bottom-right');
   if (import.meta.env.VITE_AQI_UI === '1') {
@@ -771,6 +810,7 @@ function initMap() {
   map.once('load', () => {
     if (showWind) setWindOverlay(true);
     if (showAqi) refreshAqi();
+    if (showTemp) refreshTemp();
   });
   map.on('move', windInvalidateScreen);
   map.on('moveend', () => {
@@ -783,6 +823,7 @@ function initMap() {
     addRadarLayers();
     addLandOutline();
     addAqiLayers();
+    renderTemp();
     addRailLayers();
     addWindLayer();
     addBoundaryLayers();
@@ -1124,6 +1165,175 @@ async function refreshAqi() {
   return aqiLoading;
 }
 
+// Feels-like (°C). Steadman/BOM AT (10 m wind) blended with NWS heat index, then
+// the excess over T is scaled down: raw HI/AT both overshoot in deep tropical
+// humidity (32°C/78% → +11°). Solar isn't in data.gov.sg; WBGT floors this later.
+function feelsLikeC(tC, rh, windMs = 0) {
+  if (!Number.isFinite(tC) || !Number.isFinite(rh)) return tC;
+  const e = (rh / 100) * 6.105 * Math.exp((17.27 * tC) / (237.7 + tC));
+  // Light-air floor: anemometer-calm / missing 10 m wind understates AT cooling.
+  const v = Number.isFinite(windMs) ? Math.max(1.5, windMs) : 1.5;
+  const at = tC + 0.33 * e - 0.7 * v - 4;
+  let raw = at;
+  if (tC >= 27 && rh >= 40) {
+    const hi =
+      -8.78469475556 +
+      1.61139411 * tC +
+      2.33854883889 * rh -
+      0.14611605 * tC * rh -
+      0.012308094 * tC * tC -
+      0.0164248277778 * rh * rh +
+      0.002211732 * tC * tC * rh +
+      0.00072546 * tC * rh * rh -
+      0.000003582 * tC * tC * rh * rh;
+    raw = 0.55 * hi + 0.45 * at;
+  }
+  // ~half the raw excess ≈ what consumer apps show for SG muggy afternoons.
+  return tC + 0.5 * (raw - tC);
+}
+
+function windMsAt(lng, lat) {
+  sampleWind(lng, lat);
+  return Math.hypot(windSample.u, windSample.v);
+}
+
+// IDW from stations that have a numeric field so chips without a co-located sensor still get one.
+function idwFrom(lng, lat, stations, pick) {
+  let wSum = 0;
+  let vSum = 0;
+  for (const s of stations) {
+    const v = pick(s);
+    if (v == null || !Number.isFinite(v)) continue;
+    const d = Math.hypot((s.lng - lng) * Math.cos((lat * Math.PI) / 180), s.lat - lat) + 0.02;
+    const w = 1 / (d * d);
+    wSum += w;
+    vSum += w * v;
+  }
+  return wSum ? vSum / wSum : null;
+}
+
+function rhFromNeighbors(lng, lat, stations) {
+  return idwFrom(lng, lat, stations, (s) => s.rh);
+}
+
+function nearestWbgt(lng, lat, wbgtStations) {
+  let best = null;
+  for (const w of wbgtStations) {
+    const d = Math.hypot((w.lng - lng) * Math.cos((lat * Math.PI) / 180), w.lat - lat);
+    if (!best || d < best.d) best = { d, wbgt: w.wbgt, stress: w.stress };
+  }
+  // ~3 km; farther and the urban/sun reading is not the same microclimate.
+  return best && best.d < 0.03 ? best : null;
+}
+
+function feelsForStation(s, stations, wbgtStations) {
+  const rh = s.rh ?? rhFromNeighbors(s.lng, s.lat, stations);
+  const base = rh != null ? feelsLikeC(s.tC, rh, windMsAt(s.lng, s.lat)) : s.tC;
+  // WBGT folds in sun + wind + humidity (NEA). Use it as a floor so we never
+  // undersell heat load on sunny spots the shade-only formula would miss.
+  const w = nearestWbgt(s.lng, s.lat, wbgtStations);
+  s.wbgt = w?.wbgt ?? null;
+  s.heatStress = w?.stress ?? null;
+  s.feels = w ? Math.max(base, w.wbgt) : base;
+}
+
+function recomputeTempFeels() {
+  for (const s of tempStations) feelsForStation(s, tempStations, tempWbgtStations);
+  if (showTemp) renderTemp();
+}
+
+async function loadTempStations(fetchFn) {
+  const tempUrl = apiURL('/air-temperature');
+  const rhUrl = apiURL('/relative-humidity');
+  const wbgtUrl = apiURL('/weather', { api: 'wbgt' });
+  const [tempJson, rhJson, wbgtJson] = await Promise.all([
+    fetchFn(tempUrl),
+    fetchFn(rhUrl),
+    fetchFn(wbgtUrl).catch(() => null),
+  ]);
+  assertApiOk(tempJson, tempUrl);
+  assertApiOk(rhJson, rhUrl);
+  const tByStation = new Map();
+  for (const r of tempJson.data.readings?.[0]?.data || []) tByStation.set(r.stationId, r.value);
+  const rhByStation = new Map();
+  for (const r of rhJson.data.readings?.[0]?.data || []) rhByStation.set(r.stationId, r.value);
+  const wbgtStations = [];
+  if (wbgtJson?.code === 0) {
+    for (const r of wbgtJson.data.records?.[0]?.item?.readings || []) {
+      const lat = Number(r.location?.latitude);
+      const lng = Number(r.location?.longitude);
+      const wbgt = Number(r.wbgt);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(wbgt)) continue;
+      wbgtStations.push({
+        id: r.station?.id,
+        name: r.station?.name || '',
+        lng,
+        lat,
+        wbgt,
+        stress: r.heatStress || '',
+      });
+    }
+  }
+  tempWbgtStations = wbgtStations;
+  // Only the air-temp network draws markers. WBGT is a feels-like input (sun/wind/humidity),
+  // not a second chip type — overlapping lookalikes confuse the map.
+  const stations = [];
+  for (const s of tempJson.data.stations || []) {
+    const tC = tByStation.get(s.id);
+    if (!s.location || tC == null || !Number.isFinite(tC)) continue;
+    const rh = rhByStation.get(s.id);
+    const hasRh = rh != null && Number.isFinite(rh);
+    stations.push({
+      id: s.id,
+      name: s.name || '',
+      lng: s.location.longitude,
+      lat: s.location.latitude,
+      tC,
+      rh: hasRh ? rh : null,
+    });
+  }
+  for (const s of stations) feelsForStation(s, stations, wbgtStations);
+  // WBGT-only sites fill gaps; one-line chips so they don't look like T+deltas.
+  for (const w of wbgtStations) {
+    const near = stations.some(
+      (s) => Math.hypot((s.lng - w.lng) * Math.cos((w.lat * Math.PI) / 180), s.lat - w.lat) < 0.02,
+    );
+    if (near) continue;
+    stations.push({
+      id: w.id,
+      name: w.name,
+      lng: w.lng,
+      lat: w.lat,
+      tC: w.wbgt,
+      rh: null,
+      feels: w.wbgt,
+      wbgt: w.wbgt,
+      heatStress: w.stress,
+      wbgtOnly: true,
+    });
+  }
+  return stations;
+}
+
+async function refreshTemp() {
+  if (!showTemp) return null;
+  if (tempLoading) return tempLoading;
+  tempLoading = (async () => {
+    // Wind first so the AT wind term is already in the field when chips are built.
+    await loadWind({ forTemp: true }).catch(() => {});
+    tempStations = await loadTempStations((url) => apiFetch(url, { maxAgeMs: 4 * 60 * 1000 }));
+    renderTemp();
+  })()
+    .catch((e) => {
+      console.error('Temperature fetch error:', e);
+      if (showTemp) showToast('Temperature data unavailable');
+    })
+    .finally(() => {
+      tempLoading = null;
+    });
+  return tempLoading;
+}
+
 async function loadRadarData(fetchFn, ranges = RANGES) {
   const now = sgtNow();
   const cutoff = new Date(now.getTime() - WINDOW_MS);
@@ -1407,9 +1617,10 @@ async function fetchAtSlot() {
   pollRanges = [];
   await fetchRadar();
   pollRanges = missingRangesFor(pollSlotMs);
-  if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
+  if (showWind || showNowcast || showTemp) loadWind({ forNowcast: showNowcast });
   if (showFloods) refreshFloods();
   if (showAqi) refreshAqi();
+  if (showTemp) refreshTemp();
   scheduleNextRefresh();
 }
 
@@ -1823,6 +2034,108 @@ function renderAqi() {
     );
   }
   if (aqiAgeEls.length) aqiAgeTimer = setInterval(updateAqiAges, 60 * 1000);
+}
+
+// SG thermal outline: ≤25° is "air-con" teal; 25→30 ramps teal→green→gold→red.
+// 30–32° red; ≥32° scary deep red.
+function tempStyle(tC) {
+  const n = Number(tC);
+  if (n <= 25) return { outline: '#0f4c5c' };
+  if (n >= 32) return { outline: '#7f1106' };
+  if (n >= 30) return { outline: '#a61b1b' };
+  const t = clamp((n - 25) / 5, 0, 1);
+  // Hue 195° (teal) → 0° (red) passes through green and gold.
+  const h = 195 * (1 - t);
+  return {
+    outline: `hsl(${h.toFixed(0)} ${(65 + t * 12).toFixed(0)}% ${(30 + t * 6).toFixed(0)}%)`,
+  };
+}
+
+// 30.0 → "30", 30.1 → "30.1"
+function fmtDeg(v) {
+  const x = Math.round(v * 10) / 10;
+  return x === 0 ? '0' : String(x);
+}
+
+function feelsDeltaLabel(delta) {
+  const x = Math.round(delta * 10) / 10;
+  if (x === 0) return '+0';
+  return (x > 0 ? '+' : '-') + fmtDeg(Math.abs(x));
+}
+
+// Integer bold; decimal + degree stay regular so the reading feels lighter.
+function degHTML(text) {
+  const i = text.indexOf('.');
+  const intPart = i === -1 ? text : text.slice(0, i);
+  const fracPart = i === -1 ? '' : text.slice(i);
+  return (
+    `<span class="deg-int">${intPart}</span>` +
+    (fracPart ? `<span class="deg-soft">${fracPart}</span>` : '') +
+    `<span class="deg-soft">°</span>`
+  );
+}
+
+const tempMarkers = [];
+
+function clearTempMarkers() {
+  for (const m of tempMarkers) m.remove();
+  tempMarkers.length = 0;
+}
+
+function tempChipEl(station) {
+  const shown = fmtDeg(station.tC);
+  const { outline } = tempStyle(station.tC);
+  const wrap = document.createElement('div');
+  wrap.className = 'temp-marker';
+  if (station.wbgtOnly) {
+    wrap.title = station.name
+      ? `${station.name} · WBGT ${fmtDeg(station.wbgt)}°C${station.heatStress ? ` (${station.heatStress})` : ''}`
+      : `WBGT ${fmtDeg(station.wbgt)}°C`;
+  } else {
+    let title = station.name
+      ? `${station.name} · ${fmtDeg(station.tC)}°C · feels like ${fmtDeg(station.feels)}°C`
+      : `feels like ${fmtDeg(station.feels)}°C`;
+    if (station.wbgt != null) {
+      title += ` · WBGT ${fmtDeg(station.wbgt)}°C${station.heatStress ? ` (${station.heatStress})` : ''}`;
+    }
+    wrap.title = title;
+  }
+  if (station.heatStress && station.heatStress !== 'Low') wrap.classList.add('temp-stress');
+  wrap.style.setProperty('--temp-z', String(clamp(Math.round(station.tC * 2), 1, 500)));
+  const chip = document.createElement('div');
+  chip.className = 'temp-chip';
+  chip.style.setProperty('--temp-outline', outline);
+  const main = document.createElement('div');
+  main.className = 'temp-main';
+  main.innerHTML = degHTML(shown);
+  chip.appendChild(main);
+  // Two-line = air temp + feels delta. One-line = WBGT reading (already a feel index).
+  if (!station.wbgtOnly) {
+    const feels = document.createElement('div');
+    feels.className = 'temp-feels';
+    feels.innerHTML = degHTML(feelsDeltaLabel(station.feels - station.tC));
+    chip.appendChild(feels);
+  }
+  wrap.appendChild(chip);
+  return wrap;
+}
+
+function setTempOverlay(on) {
+  if (on) refreshTemp();
+  else renderTemp();
+}
+
+function renderTemp() {
+  clearTempMarkers();
+  if (!map || !showTemp) return;
+  for (const s of tempStations) {
+    if (!inRadar480(s.lng, s.lat)) continue;
+    tempMarkers.push(
+      new maplibregl.Marker({ element: tempChipEl(s), anchor: 'center' })
+        .setLngLat([s.lng, s.lat])
+        .addTo(map),
+    );
+  }
 }
 
 // Base-style place labels sit under the overlays; raise them so names stay readable over rain.
@@ -3407,8 +3720,12 @@ function windInvalidateScreen() {
   for (let i = 0; i < windParticleCount; i++) windSx[i] = NaN;
 }
 
-async function loadWind({ forNowcast = false } = {}) {
-  if ((!showWind && !forNowcast) || (windField && Date.now() - windDataAt < 4 * 60 * 1000)) {
+async function loadWind({ forNowcast = false, forTemp = false } = {}) {
+  // Display, nowcast, and feels-like each need the field; only the overlay renders.
+  if (
+    (!showWind && !forNowcast && !forTemp && !showTemp) ||
+    (windField && Date.now() - windDataAt < 4 * 60 * 1000)
+  ) {
     // Fresh cache or hidden tab: the map's animation chain may have stalled, so nudge a frame.
     if (showWind && !windMotionQuery.matches && map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
     return;
@@ -3447,12 +3764,15 @@ async function loadWind({ forNowcast = false } = {}) {
       if (stations.length < 3) throw new Error('Insufficient wind stations');
       windStations = stations;
       windField = buildWindField(stations);
-      updateWindSpawn();
       windDataAt = Date.now();
-      if (windMotionQuery.matches) renderWindStatic();
-      else {
-        ensureWindLabels();
-        if (map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
+      if (showTemp) recomputeTempFeels();
+      if (showWind) {
+        updateWindSpawn();
+        if (windMotionQuery.matches) renderWindStatic();
+        else {
+          ensureWindLabels();
+          if (map?.getLayer(WIND_LAYER_ID)) map.triggerRepaint();
+        }
       }
     } finally {
       setBusy(false);
@@ -5784,7 +6104,8 @@ function refreshAfterWake() {
   // A fetch that hung across sleep must not block every later attempt.
   inflightFetches.clear();
   if (Date.now() - lastFetchStart > 60 * 1000) fetchRadarBusy = false;
-  if (showWind || showNowcast) loadWind({ forNowcast: showNowcast });
+  if (showWind || showNowcast || showTemp) loadWind({ forNowcast: showNowcast });
+  if (showTemp) refreshTemp();
   if (pollRanges.length) pollOnce();
   else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
 }

@@ -12,6 +12,8 @@ const ALLOWED_PREFIXES = [
   '/weather',
   '/wind-speed',
   '/wind-direction',
+  '/air-temperature',
+  '/relative-humidity',
 ];
 
 function aqiError(status, message) {

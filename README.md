@@ -19,6 +19,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Optional PUB flood-alert overlay (broadcast-radius circles + icons)
 - Optional (off by default) wind particle animation driven by station wind readings
 - Optional (off by default) 15-minute rain nowcast: adds +5/+10/+15 min forecast slots to the timeline, computed client-side from the latest radar frames and station winds — rain approaching from outside Singapore (up to the 70 km radar edge) is included; implementation notes in [NOWCAST.md](NOWCAST.md)
+- Optional (off by default) temperature chips: air temp + feels-like delta (damped heat index / apparent temperature with wind, floored by NEA WBGT) at NEA stations, plus one-line WBGT chips where they fill gaps; white type with a dark thermal outline (teal ≤25° → red ≥30° → deep red ≥32°)
 - Optional (off by default) AQI station chips from [WAQI / aqicn.org](https://waqi.info) inside the 480 km radar square (number on a rounded rect in the US EPA palette; relative reading age on hover or when zoomed in)
 - System / light / dark themes with matching map styles
 - Adjustable radar opacity and boundary clipping
@@ -30,6 +31,8 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Radar images: [NEA Weather Radar Images API](https://data.gov.sg/datasets/d_418e9ac3414fd927b7405631e0a7bc82/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Lightning: [NEA Lightning API](https://data.gov.sg/datasets/d_08238953fe0f6dd13f10714ebfbcb9f9/view) via `api-open.data.gov.sg` (proxied through the Worker)
 - Wind speed & direction: [NEA Wind Speed API](https://data.gov.sg/datasets/d_7677738484067741bf3b56ab5d69c7e9/view) / [NEA Wind Direction API](https://data.gov.sg/datasets/d_534cf203023b51f51f879145ccc56ff9/view) via `api-open.data.gov.sg` (proxied through the Worker)
+- Air temperature & relative humidity: NEA real-time `/air-temperature` and `/relative-humidity` via `api-open.data.gov.sg` (proxied through the Worker)
+- Wet Bulb Globe Temperature: [NEA WBGT Observations API](https://data.gov.sg/datasets/d_87884af1f85d702d4f74c6af13b4853d/view) (`/weather?api=wbgt`) via `api-open.data.gov.sg` (proxied through the Worker) — heat-stress floor for feels-like
 - Rail lines & stations: [cheeaun/sgraildata](https://github.com/cheeaun/sgraildata), compiled to `rail.json` by `scripts/build-rail-data.mjs` and bundled with the app
 - AQI stations: [WAQI map-bounds API](https://aqicn.org/api/) (aqicn.org) via `api.waqi.info` (proxied through the Worker with `WAQI_TOKEN`) — see [AQI data](#aqi-data)
 - Singapore landmass boundary (for the rain summary): [URA Master Plan 2025 Planning Area Boundary (No Sea)](https://data.gov.sg/datasets/d_2cc750190544007400b2cfd5d7f53209/view), compiled into the bundled rain-pixel index by `scripts/build-rain-data.mjs`
