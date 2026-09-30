@@ -759,6 +759,7 @@ function initMap() {
   });
   map.addControl(attributionControl);
   updateAqiAttribution(showAqi);
+  updateAqiLegend(showAqi);
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
   map.addControl(new RangeToggleControl(), 'bottom-right');
   map.addControl(new ClipToggleControl(), 'bottom-right');
@@ -2016,11 +2017,17 @@ function updateAqiAttribution(on) {
   attributionControl._updateAttributions();
 }
 
+function updateAqiLegend(on) {
+  const el = document.getElementById('aqi-legend');
+  if (el) el.hidden = !on;
+}
+
 function setAqiOverlay(on) {
   if (on) refreshAqi();
   else renderAqi();
   updateAqiAgeVisibility();
   updateAqiAttribution(on);
+  updateAqiLegend(on);
 }
 
 function renderAqi() {
