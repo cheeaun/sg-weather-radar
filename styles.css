@@ -1289,10 +1289,11 @@ scritto-text {
 /* WAQI US EPA bands — same fills as the station chips (aqiStyle). */
 .aqi-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: max-content max-content;
   grid-template-rows: repeat(3, auto);
   grid-auto-flow: column;
-  column-gap: 6px;
+  justify-content: start;
+  column-gap: 2px;
   row-gap: 0;
 }
 .aqi-row {
