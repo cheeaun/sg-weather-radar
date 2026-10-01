@@ -825,6 +825,8 @@ function initMap() {
     addLandOutline();
     addAqiLayers();
     renderTemp();
+    updateTempFeelsVisibility();
+    updateTempLegend(showTemp);
     addRailLayers();
     addWindLayer();
     addBoundaryLayers();
@@ -835,7 +837,10 @@ function initMap() {
     raisePlaceLabels();
   });
   map.on('moveend', updateRainNearLinkLabelVisibility);
-  map.on('zoomend', updateAqiAgeVisibility);
+  map.on('zoomend', () => {
+    updateAqiAgeVisibility();
+    updateTempFeelsVisibility();
+  });
   applyTheme();
 }
 
@@ -1914,6 +1919,20 @@ function aqiStyle(aqi) {
   return { fill: '#7e0023', text: '#ffffff' };
 }
 
+// Shared stack for AQI + temp chips: good AQI < cool temp < moderate AQI < warm temp < unhealthy+.
+function aqiZIndex(aqi) {
+  const n = Number(aqi) || 0;
+  if (n < 50) return 10 + clamp(n / 50, 0, 1) * 9;
+  if (n <= 100) return 50 + clamp((n - 50) / 50, 0, 1) * 9;
+  return 90 + clamp((n - 100) / 200, 0, 1) * 30;
+}
+
+function tempZIndex(tC) {
+  const n = Number(tC) || 0;
+  if (n < 29) return 30 + clamp((n - 22) / 8, 0, 1) * 9;
+  return 70 + clamp((n - 29) / 5, 0, 1) * 9;
+}
+
 function inRadar480(lng, lat) {
   const bb = RADAR_BOUNDS[480];
   return (
@@ -1948,6 +1967,7 @@ function ageTextStyle(fill) {
 const aqiMarkers = [];
 const aqiAgeEls = [];
 const AQI_AGE_ZOOM = 11;
+const TEMP_FEELS_ZOOM = 10;
 let aqiAgeTimer = null;
 
 function clearAqiMarkers() {
@@ -1976,13 +1996,25 @@ function updateAqiAgeVisibility() {
   map.getContainer().classList.toggle('aqi-ages-on', showAqi && map.getZoom() >= AQI_AGE_ZOOM);
 }
 
+function updateTempFeelsVisibility() {
+  if (!map) return;
+  map
+    .getContainer()
+    .classList.toggle('temp-feels-on', showTemp && map.getZoom() >= TEMP_FEELS_ZOOM);
+}
+
+function updateTempLegend(on) {
+  const el = document.getElementById('temp-legend');
+  if (el) el.hidden = !on;
+}
+
 function aqiChipEl(aqi, name, time) {
   const { fill, text: textColor } = aqiStyle(aqi);
   const wrap = document.createElement('div');
   wrap.className = 'aqi-marker';
   wrap.title = name ? `${name} · AQI ${aqi}` : `AQI ${aqi}`;
   // Unhealthy chips stack above healthier ones; hover temporarily wins (CSS).
-  wrap.style.setProperty('--aqi-z', String(clamp(Math.round(Number(aqi) || 0), 1, 500)));
+  wrap.style.setProperty('--aqi-z', String(Math.round(aqiZIndex(aqi))));
   const chip = document.createElement('div');
   chip.className = 'aqi-chip';
   chip.textContent = String(aqi);
@@ -2045,18 +2077,15 @@ function renderAqi() {
   if (aqiAgeEls.length) aqiAgeTimer = setInterval(updateAqiAges, 60 * 1000);
 }
 
-// SG thermal outline: ≤25° is "air-con" teal; 25→30 ramps teal→green→gold→red.
-// 30–32° red; ≥32° scary deep red.
+// OKLCH cool → warm red; L/C/H free-run on the short hue arc (220→25 via purple).
+// Clamped outside 25–32.
 function tempStyle(tC) {
-  const n = Number(tC);
-  if (n <= 25) return { outline: '#0f4c5c' };
-  if (n >= 32) return { outline: '#7f1106' };
-  if (n >= 30) return { outline: '#a61b1b' };
-  const t = clamp((n - 25) / 5, 0, 1);
-  // Hue 195° (teal) → 0° (red) passes through green and gold.
-  const h = 195 * (1 - t);
+  const t = clamp((Number(tC) - 25) / 7, 0, 1);
+  const L = 0.58 - 0.04 * t;
+  const c = 0.16 + 0.1 * t;
+  const h = 220 + 165 * t;
   return {
-    outline: `hsl(${h.toFixed(0)} ${(65 + t * 12).toFixed(0)}% ${(30 + t * 6).toFixed(0)}%)`,
+    outline: `oklch(${L.toFixed(3)} ${c.toFixed(3)} ${h.toFixed(1)})`,
   };
 }
 
@@ -2111,7 +2140,7 @@ function tempChipEl(station) {
   }
   if (station.heatStress && station.heatStress.toLowerCase() !== 'low')
     wrap.classList.add('temp-stress');
-  wrap.style.setProperty('--temp-z', String(clamp(Math.round(station.tC * 2), 1, 500)));
+  wrap.style.setProperty('--temp-z', String(Math.round(tempZIndex(station.tC))));
   const chip = document.createElement('div');
   chip.className = 'temp-chip';
   chip.style.setProperty('--temp-outline', outline);
@@ -2133,6 +2162,8 @@ function tempChipEl(station) {
 function setTempOverlay(on) {
   if (on) refreshTemp();
   else renderTemp();
+  updateTempFeelsVisibility();
+  updateTempLegend(on);
 }
 
 function renderTemp() {

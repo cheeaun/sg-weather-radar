@@ -19,7 +19,7 @@ Runs as a single Cloudflare Worker: the site is served as static assets and `/ap
 - Optional PUB flood-alert overlay (broadcast-radius circles + icons)
 - Optional (off by default) wind particle animation driven by station wind readings
 - Optional (off by default) 15-minute rain nowcast: adds +5/+10/+15 min forecast slots to the timeline, computed client-side from the latest radar frames and station winds — rain approaching from outside Singapore (up to the 70 km radar edge) is included; implementation notes in [NOWCAST.md](NOWCAST.md)
-- Optional (off by default) temperature chips: air temp + feels-like delta (damped heat index / apparent temperature with wind, floored by NEA WBGT) at NEA stations, plus one-line WBGT chips where they fill gaps; white type with a dark thermal outline (teal ≤25° → red ≥30° → deep red ≥32°)
+- Optional (off by default) temperature chips: air temp + feels-like delta (damped heat index / apparent temperature with wind, floored by NEA WBGT) at NEA stations, plus one-line WBGT chips where they fill gaps; white type with a thermal OKLCH outline (muted teal ≤25° → vivid red ≥32°; chroma tracks heat)
 - Optional (off by default) AQI station chips from [WAQI / aqicn.org](https://waqi.info) inside the 480 km radar square (number on a rounded rect in the US EPA palette; relative reading age on hover or when zoomed in)
 - System / light / dark themes with matching map styles
 - Adjustable radar opacity and boundary clipping

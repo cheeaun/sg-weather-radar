@@ -400,6 +400,11 @@ body {
     'Segoe UI',
     sans-serif;
   opacity: 0.72;
+  display: none;
+}
+.temp-marker:hover .temp-feels,
+.maplibregl-map.temp-feels-on .temp-feels {
+  display: block;
 }
 .deg-int {
   font-weight: inherit;
@@ -407,7 +412,7 @@ body {
 .deg-soft {
   font-weight: 500;
 }
-/* White fill + near-black thermal outline (thick, slightly soft). */
+/* White fill + thermal outline (thick, slightly soft). --temp-outline is OKLCH. */
 .temp-main,
 .temp-feels {
   color: #ffffff;
@@ -1275,8 +1280,25 @@ scritto-text {
 .masthead .scale {
   margin-top: 6px;
 }
-.masthead .aqi-scale {
+.masthead .aqi-scale,
+.masthead .temp-scale {
   margin-top: 4px;
+}
+/* Extra air between stacked legends when both overlays are on. */
+.aqi-scale:not([hidden]) + .temp-scale {
+  margin-top: 10px;
+}
+/* Smooth thermal bar (not the precip hard-stop ramp) — matches tempStyle endpoints. */
+.temp-gradient {
+  height: 7px;
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 1px var(--scale-line);
+  /* in oklch so the bar walks the same short hue arc as the chips (via purple). */
+  background: linear-gradient(in oklch to right, oklch(0.58 0.16 220), oklch(0.54 0.26 25));
+}
+.temp-scale .scale-labels {
+  margin-top: 0;
+  line-height: 1.15;
 }
 .aqi-title {
   font-size: 10.5px;
