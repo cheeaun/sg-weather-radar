@@ -2153,6 +2153,10 @@ function tempChipEl(station) {
     const feels = document.createElement('div');
     feels.className = 'temp-feels';
     feels.innerHTML = degHTML(feelsDeltaLabel(station.feels - station.tC));
+    feels.style.setProperty(
+      '--temp-outline',
+      tempStyle(Number.isFinite(station.feels) ? station.feels : station.tC).outline,
+    );
     chip.appendChild(feels);
   }
   wrap.appendChild(chip);
