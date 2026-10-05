@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
     <title>SG Weather Radar</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -301,11 +301,122 @@
           <a href="https://www.pub.gov.sg/" target="_blank" rel="noopener noreferrer">PUB</a>
           via
           <a href="https://data.gov.sg/" target="_blank" rel="noopener noreferrer">data.gov.sg</a>.
+          Traffic camera images by
+          <a href="https://www.lta.gov.sg/" target="_blank" rel="noopener noreferrer">LTA</a>
+          via
+          <a href="https://data.gov.sg/" target="_blank" rel="noopener noreferrer">data.gov.sg</a>.
           For official forecasts and warnings, refer to
           <a href="https://www.weather.gov.sg" target="_blank" rel="noopener noreferrer"
             >weather.gov.sg</a
           >.
         </p>
+      </div>
+    </div>
+
+    <div
+      class="sheet camera-sheet"
+      id="camera-sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Traffic camera images"
+      aria-hidden="true"
+    >
+      <div class="sheet-head">
+        <button
+          type="button"
+          class="sheet-close"
+          id="camera-close"
+          aria-label="Close camera"
+          title="Close"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+      <div class="camera-body">
+        <div class="camera-img-wrap">
+          <img class="camera-img" id="camera-img" alt="Traffic camera frame" />
+          <button
+            type="button"
+            class="camera-nav camera-previous"
+            id="camera-previous"
+            aria-label="Previous image"
+            title="Previous image"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              aria-hidden="true"
+            >
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="camera-nav camera-next"
+            id="camera-next"
+            aria-label="Next image"
+            title="Next image"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              aria-hidden="true"
+            >
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+          </button>
+        </div>
+        <div class="camera-filmstrip" id="camera-filmstrip" aria-label="Past frames"></div>
+      </div>
+    </div>
+
+    <div
+      class="sheet incident-sheet"
+      id="incident-sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="incident-title"
+      aria-hidden="true"
+    >
+      <div class="sheet-head">
+        <h2 id="incident-title">Traffic incident</h2>
+        <button
+          type="button"
+          class="sheet-close"
+          id="incident-close"
+          aria-label="Close incident"
+          title="Close"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+      <div class="incident-body">
+        <p class="incident-message" id="incident-message"></p>
+        <div class="incident-meta">LTA via DataMall · live traffic incidents</div>
       </div>
     </div>
 

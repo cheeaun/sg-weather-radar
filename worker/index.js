@@ -16,6 +16,65 @@ const ALLOWED_PREFIXES = [
   '/relative-humidity',
 ];
 
+// LTA traffic cameras via data.gov.sg v1 (keyless; LTA's own DataMall API now
+// exposes the same reduced set). Normalized to the app's { code: 0, data }
+// envelope so the client cache accepts it. An optional date_time (SGT,
+// YYYY-MM-DDTHH:mm:ss) returns the archive snapshot nearest that time — frame
+// URLs are immutable, so old queries edge-cache for a day.
+async function trafficImages(searchParams) {
+  const dt = searchParams?.get('date_time');
+  const valid = !!dt && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(dt);
+  const stale = valid && Date.now() - Date.parse(`${dt}+08:00`) > 15 * 60 * 1000;
+  const url =
+    'https://api.data.gov.sg/v1/transport/traffic-images' + (valid ? `?date_time=${dt}` : '');
+  let raw;
+  try {
+    const upstreamRes = await fetch(url, { cf: { cacheTtl: stale ? 86400 : 60 } });
+    if (!upstreamRes.ok) throw new Error(`data.gov.sg ${upstreamRes.status}`);
+    raw = await upstreamRes.json();
+  } catch (e) {
+    return Response.json({ code: 502, errorMsg: `Traffic upstream error: ${e.message}` }, { status: 502 });
+  }
+  const cameras = (raw?.items?.[0]?.cameras || [])
+    .map((cam) => ({
+      id: cam.camera_id ?? null,
+      lat: Number(cam?.location?.latitude),
+      lng: Number(cam?.location?.longitude),
+      image: cam?.image,
+      time: cam?.timestamp || null,
+    }))
+    .filter((c) => Number.isFinite(c.lat) && Number.isFinite(c.lng) && c.image);
+  return Response.json({ code: 0, data: { cameras } });
+}
+
+// LTA traffic incidents via DataMall (keyless on data.gov.sg). Secret:
+// LTA_DATAMALL_KEY; without it the toggle degrades like AQI without WAQI_TOKEN.
+async function trafficIncidents(env) {
+  const key = env.LTA_DATAMALL_KEY;
+  if (!key) {
+    return Response.json({ code: 503, errorMsg: 'LTA_DATAMALL_KEY not configured' }, { status: 503 });
+  }
+  try {
+    const upstreamRes = await fetch('https://datamall2.mytransport.sg/ltaodataservice/TrafficIncidents', {
+      headers: { AccountKey: key, accept: 'application/json' },
+      cf: { cacheTtl: 60 },
+    });
+    if (!upstreamRes.ok) throw new Error(`DataMall ${upstreamRes.status}`);
+    const raw = await upstreamRes.json();
+    const incidents = (Array.isArray(raw) ? raw : raw?.value || [])
+      .map((inc) => ({
+        type: inc.Type || '',
+        lat: Number(inc.Latitude),
+        lng: Number(inc.Longitude),
+        message: String(inc.Message || '').replace(/\s+/g, ' ').trim(),
+      }))
+      .filter((i) => Number.isFinite(i.lat) && Number.isFinite(i.lng) && i.message);
+    return Response.json({ code: 0, data: { incidents } });
+  } catch (e) {
+    return Response.json({ code: 502, errorMsg: `Traffic upstream error: ${e.message}` }, { status: 502 });
+  }
+}
+
 function aqiError(status, message) {
   return Response.json({ code: status, errorMsg: message }, { status });
 }
@@ -53,6 +112,31 @@ export default {
 
     const incoming = new URL(request.url);
     const path = incoming.pathname.replace(/^\/api/, '');
+
+    if (path === '/traffic-images') {
+      return trafficImages(incoming.searchParams);
+    }
+
+    if (path === '/traffic-image') {
+      // Same-origin proxy for camera JPEGs (they lack CORS headers, so canvas
+      // reads need this). Allowlisted to the images host only — no open proxy.
+      // Frame URLs are immutable: edge-cache a day.
+      const u = incoming.searchParams.get('url');
+      if (!u || !u.startsWith('https://images.data.gov.sg/')) {
+        return Response.json({ error: 'Not found' }, { status: 404 });
+      }
+      const upstreamRes = await fetch(u, { cf: { cacheTtl: 86400, cacheEverything: true } });
+      return new Response(upstreamRes.body, {
+        headers: {
+          'content-type': 'image/jpeg',
+          'cache-control': 'public, max-age=86400',
+        },
+      });
+    }
+
+    if (path === '/traffic-incidents') {
+      return trafficIncidents(env);
+    }
 
     if (path === '/aqi-stations') {
       const token = env.WAQI_TOKEN;

@@ -313,6 +313,243 @@ body {
   z-index: 1000 !important;
 }
 
+/* Traffic camera markers: live thumbnails whose size scales with map zoom. */
+.cam-marker {
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  display: grid;
+  place-items: center;
+}
+.cam-marker:focus-visible {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 2px;
+}
+/* Overlapping markers: hovered one wins over its neighbours (and incidents). */
+.cam-marker:hover {
+  z-index: 501;
+}
+/* Inner wrapper carries the spread offset; keeps hover scale on the img.
+   No transition here: offsets recompute every 'move' frame, so a transition
+   would chase a moving target and read as wobble (MapLibre does the same). */
+.cam-offset {
+  position: relative;
+  display: block;
+  will-change: transform;
+}
+.cam-thumb {
+  display: block;
+  width: calc(24px * var(--cam-zoom-scale, 1));
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: calc(3px * min(var(--cam-zoom-scale, 1), 1.5));
+  border: 1px solid rgba(0, 0, 0, 0.85);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  background: var(--hairline);
+  transition: transform 0.12s ease;
+}
+.cam-marker:hover .cam-thumb {
+  transform: scale(1.08);
+}
+/* Frame age sits under the thumbnail — hover or zoom ≥ 14. */
+.cam-age {
+  display: none;
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 50%;
+  transform: translateX(-50%);
+  font:
+    700 12px/1.2 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  color: var(--ink-strong);
+  text-shadow:
+    -1px -1px 0 var(--shape-halo),
+    1px -1px 0 var(--shape-halo),
+    -1px 1px 0 var(--shape-halo),
+    1px 1px 0 var(--shape-halo);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.cam-marker {
+  position: relative;
+}
+.cam-marker:hover .cam-age,
+.maplibregl-map.cam-ages-on .cam-age {
+  display: block;
+}
+
+.camera-body {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+.camera-img-wrap {
+  position: relative;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: transparent;
+}
+.camera-img {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.camera-nav {
+  position: absolute;
+  top: 50%;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 50%;
+  background: rgba(14, 21, 25, 0.82);
+  color: #f5f8f9;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+.camera-previous {
+  left: 12px;
+}
+.camera-next {
+  right: 12px;
+}
+.camera-nav svg {
+  display: block;
+  width: 22px;
+  height: 22px;
+}
+.camera-nav:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+@media (hover: hover) and (pointer: fine) {
+  .camera-nav,
+  .camera-nav:disabled {
+    opacity: 0;
+    transition: opacity 0.14s ease;
+  }
+  .camera-img-wrap:hover .camera-nav,
+  .camera-nav:focus-visible {
+    opacity: 1;
+  }
+  .camera-img-wrap:hover .camera-nav:disabled {
+    opacity: 0.3;
+  }
+}
+.camera-nav:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+.camera-filmstrip {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  min-width: 0;
+  max-width: 100%;
+  width: min(100%, 720px);
+  margin: 0 auto;
+  padding: 3px 0 5px;
+  touch-action: pan-y;
+}
+.camera-tile {
+  width: 100%;
+  min-width: 0;
+  position: relative;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: #1b252a;
+  color: #fff;
+  cursor: pointer;
+  opacity: 0.66;
+  outline: none;
+}
+.camera-tile.active {
+  z-index: 1;
+  outline: 2px solid var(--forecast);
+  outline-offset: -2px;
+  opacity: 1;
+}
+.camera-tile:focus-visible:not(.active) {
+  z-index: 2;
+  outline: 2px solid #fff;
+  outline-offset: -2px;
+}
+.camera-tile:active {
+  opacity: 1;
+}
+.camera-tile img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+.camera-tile span {
+  display: block;
+  padding: 2px 3px;
+  font:
+    600 10px/1.3 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  color: rgba(255, 255, 255, 0.82);
+  text-align: center;
+}
+/* Traffic incident markers: bare yellow warning triangle, no plate. */
+.incident-marker {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: transform 0.12s ease;
+}
+.incident-marker svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+  /* ⚠️-style: yellow fill inside a dark outline. */
+  fill: #f5c11e;
+  stroke: rgba(0, 0, 0, 0.85);
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.35));
+}
+.incident-marker:hover {
+  transform: scale(1.2);
+  z-index: 501;
+}
+.incident-marker:focus-visible {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 2px;
+}
+.incident-body {
+  padding-top: 10px;
+}
+.incident-message {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink-strong);
+}
+.incident-meta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* WAQI station chips: DOM markers, number on a rounded rect (US EPA palette inline). */
 .aqi-marker {
   display: inline-flex;
@@ -626,6 +863,53 @@ body {
 }
 .sheet.open {
   transform: translateY(0);
+}
+.sheet.camera-sheet,
+.sheet.camera-sheet.open {
+  inset: 0;
+  z-index: 1001;
+  display: grid;
+  grid-template-rows: 40px minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  margin: 0;
+  padding: calc(8px + env(safe-area-inset-top, 0px)) 16px
+    calc(8px + env(safe-area-inset-bottom, 0px));
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: color-mix(in srgb, var(--paper-solid) 90%, transparent);
+  color: var(--ink-strong);
+  box-shadow: none;
+  transform: none;
+  transition: none;
+  visibility: hidden;
+  pointer-events: none;
+}
+.sheet.camera-sheet.open {
+  visibility: visible;
+  pointer-events: auto;
+}
+.sheet.camera-sheet .sheet-head {
+  justify-content: flex-end;
+}
+.sheet.camera-sheet .sheet-close {
+  width: 40px;
+  height: 40px;
+  margin: 0;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--paper-solid) 82%, transparent);
+  color: var(--ink-strong);
+}
+.sheet.camera-sheet .sheet-close:hover {
+  background: color-mix(in srgb, var(--ink-strong) 10%, var(--paper-solid));
+}
+.sheet.camera-sheet .sheet-close:focus-visible {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 3px;
 }
 .sheet-head {
   display: flex;

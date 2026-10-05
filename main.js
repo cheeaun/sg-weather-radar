@@ -48,6 +48,7 @@ const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
 const AQI_STORAGE_KEY = 'sgwr-aqi';
 const TEMP_STORAGE_KEY = 'sgwr-temp';
 const SMOOTH_STORAGE_KEY = 'sgwr-smooth';
+const TRAFFIC_STORAGE_KEY = 'sgwr-traffic';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -98,6 +99,15 @@ let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
 let showAqi = import.meta.env.VITE_AQI_UI === '1' && localStorage.getItem(AQI_STORAGE_KEY) === 'on';
 let showTemp = localStorage.getItem(TEMP_STORAGE_KEY) === 'on';
 let smoothRadar = localStorage.getItem(SMOOTH_STORAGE_KEY) === 'on';
+// One toggle drives both traffic layers; legacy per-layer keys migrate once,
+// then are removed so only sgwr-traffic remains in localStorage.
+let showTraffic =
+  localStorage.getItem(TRAFFIC_STORAGE_KEY) === 'on' ||
+  (localStorage.getItem(TRAFFIC_STORAGE_KEY) == null &&
+    (localStorage.getItem('sgwr-cams') === 'on' ||
+      localStorage.getItem('sgwr-incidents') === 'on'));
+localStorage.removeItem('sgwr-cams');
+localStorage.removeItem('sgwr-incidents');
 const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
 const BASE_ATTRIBUTION =
   'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
@@ -645,6 +655,39 @@ class AqiToggleControl {
   }
 }
 
+class TrafficToggleControl {
+  onAdd(map) {
+    this._map = map;
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toggle-btn';
+    button.title = 'Show live traffic (cameras + incidents)';
+    button.setAttribute('aria-label', 'Show live traffic');
+    button.setAttribute('aria-pressed', String(showTraffic));
+    button.classList.toggle('toggle-active', showTraffic);
+    button.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="1.5" width="13" height="21" rx="3"/><circle cx="12" cy="6" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="18" r="1.7"/></svg>';
+    button.addEventListener('click', () => {
+      showTraffic = !showTraffic;
+      localStorage.setItem(TRAFFIC_STORAGE_KEY, showTraffic ? 'on' : 'off');
+      button.classList.toggle('toggle-active', showTraffic);
+      button.setAttribute('aria-pressed', String(showTraffic));
+      setTrafficOverlay(showTraffic);
+      showToast(showTraffic ? 'Showing live traffic' : 'Hiding live traffic');
+    });
+    container.appendChild(button);
+    this._container = container;
+    return container;
+  }
+  onRemove() {
+    if (this._container) this._container.remove();
+    this._container = undefined;
+    this._map = undefined;
+  }
+}
+
 function resolvedTheme() {
   if (themePreference === 'system') return darkModeQuery.matches ? 'dark' : 'light';
   return themePreference;
@@ -800,6 +843,7 @@ function initMap() {
   map.addControl(new TempToggleControl(), 'bottom-right');
   map.addControl(new LightningToggleControl(), 'bottom-right');
   map.addControl(new FloodToggleControl(), 'bottom-right');
+  map.addControl(new TrafficToggleControl(), 'bottom-right');
   if (import.meta.env.VITE_AQI_UI === '1') {
     map.addControl(new AqiToggleControl(), 'bottom-right');
   }
@@ -845,6 +889,10 @@ function initMap() {
     if (showWind) setWindOverlay(true);
     if (showAqi) refreshAqi();
     if (showTemp) refreshTemp();
+    if (showTraffic) {
+      refreshCameras();
+      refreshIncidents();
+    }
   });
   map.on('move', windInvalidateScreen);
   map.on('moveend', () => {
@@ -870,6 +918,11 @@ function initMap() {
     raisePlaceLabels();
   });
   map.on('moveend', updateRainNearLinkLabelVisibility);
+  map.on('zoom', () => {
+    updateCamThumbScale();
+    updateCamAgeVisibility();
+  });
+  map.on('move', layoutCamMarkers);
   map.on('zoomend', () => {
     updateAqiAgeVisibility();
     updateTempFeelsVisibility();
@@ -1662,6 +1715,10 @@ async function fetchAtSlot() {
   if (showFloods) refreshFloods();
   if (showAqi) refreshAqi();
   if (showTemp) refreshTemp();
+  if (showTraffic) {
+    refreshCameras();
+    refreshIncidents();
+  }
   scheduleNextRefresh();
 }
 
@@ -2242,6 +2299,642 @@ function renderTemp() {
     );
   }
 }
+
+// LTA traffic cameras (data.gov.sg, proxied + normalized by the Worker): dot
+// markers everywhere once toggled on; clicking one opens a bottom sheet with
+// the live snapshot, auto-refreshed while open.
+const camMarkers = [];
+let camData = [];
+let camLoading = null;
+let openCamId = null;
+let camSheetTimer = null;
+const CAM_SHEET_REFRESH_MS = 60 * 1000;
+// Thumbnails are always shown and scale with zoom: 24px at the default SG fit
+// (zoom 10), doubling by zoom 12, capped at 320px. The scale is a CSS var on the
+// map container so one write on 'zoom' resizes every marker.
+const CAM_THUMB_BASE_PX = 24;
+const CAM_THUMB_MAX_PX = 320;
+// Frame age ("3m ago") sits under each thumbnail when zoomed in past this.
+const CAM_AGE_ZOOM = 14;
+let camAgeEls = [];
+let camAgeTimer = null;
+
+function updateCamThumbScale() {
+  if (!map) return;
+  const scale = Math.min(
+    CAM_THUMB_MAX_PX / CAM_THUMB_BASE_PX,
+    Math.max(1, 2 ** ((map.getZoom() - 10) / 2)),
+  );
+  map.getContainer().style.setProperty('--cam-zoom-scale', scale.toFixed(3));
+}
+
+function updateCamAgeVisibility() {
+  if (!map) return;
+  map.getContainer().classList.toggle('cam-ages-on', showTraffic && map.getZoom() >= CAM_AGE_ZOOM);
+}
+
+async function loadCameras(fetchFn) {
+  const json = await fetchFn(apiURL('/traffic-images'));
+  assertApiOk(json, apiURL('/traffic-images'));
+  return json.data.cameras || [];
+}
+
+function refreshCameras() {
+  if (!showTraffic) return null;
+  if (camLoading) return camLoading;
+  camLoading = loadCameras((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
+    .then((cams) => {
+      camData = cams;
+      renderCameras();
+      updateOpenCamSheet();
+    })
+    .catch((e) => {
+      console.error('Camera fetch error:', e);
+    })
+    .finally(() => {
+      camLoading = null;
+    });
+  return camLoading;
+}
+
+function clearCamMarkers() {
+  for (const m of camMarkers) m.remove();
+  camMarkers.length = 0;
+}
+
+function camDotEl(cam) {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'cam-marker';
+  el.title = `Traffic camera ${cam.id ?? ''}`.trim();
+  el.setAttribute('aria-label', `Open traffic camera ${cam.id ?? ''}`.trim());
+  // Inner wrapper carries the spread offset so MapLibre's own transform on the
+  // button (its marker positioning) is never touched.
+  const offset = document.createElement('span');
+  offset.className = 'cam-offset';
+  // loading=lazy keeps offscreen/idle thumbnails off the network.
+  const thumb = document.createElement('img');
+  thumb.className = 'cam-thumb';
+  thumb.loading = 'lazy';
+  thumb.alt = '';
+  offset.appendChild(thumb);
+  if (cam.time) {
+    const age = document.createElement('div');
+    age.className = 'cam-age';
+    age.textContent = formatAqiAge(cam.time);
+    offset.appendChild(age);
+    camAgeEls.push({ el: age, time: cam.time });
+  }
+  el.appendChild(offset);
+  el.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openCamId = cam.id;
+    openCameraSheet(cam);
+  });
+  el._thumb = thumb;
+  el._ageEl = offset.querySelector('.cam-age');
+  return el;
+}
+
+// Diff-based render: existing markers are reused (thumbnail src only swapped
+// after the new frame has decoded) so feed refreshes never blank the map.
+function renderCameras() {
+  clearInterval(camAgeTimer);
+  camAgeTimer = null;
+  camAgeEls = [];
+  if (!map || !showTraffic) {
+    clearCamMarkers();
+    return;
+  }
+  const byId = new Map(camMarkers.map((m) => [String(m._cam?.id), m]));
+  const kept = [];
+  for (const cam of camData) {
+    if (!inRadar480(cam.lng, cam.lat)) continue;
+    let marker = byId.get(String(cam.id));
+    if (marker) {
+      byId.delete(String(cam.id));
+      const el = marker.getElement();
+      if (el._camImage !== cam.image) {
+        // Predecode off-DOM, then swap — no disappear/reappear flash.
+        const fresh = new Image();
+        fresh.onload = () => {
+          el._thumb.src = cam.image;
+          el._camImage = cam.image;
+        };
+        fresh.src = cam.image;
+      }
+      if (el._ageEl) {
+        el._ageEl.textContent = formatAqiAge(cam.time);
+        camAgeEls.push({ el: el._ageEl, time: cam.time });
+      }
+      marker.setLngLat([cam.lng, cam.lat]);
+      marker._cam = cam;
+    } else {
+      const el = camDotEl(cam);
+      el._camImage = cam.image;
+      el._thumb.src = cam.image;
+      marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+        .setLngLat([cam.lng, cam.lat])
+        .addTo(map);
+      marker._cam = cam;
+    }
+    kept.push(marker);
+  }
+  for (const stale of byId.values()) stale.remove();
+  camMarkers.length = 0;
+  camMarkers.push(...kept);
+  updateCamThumbScale();
+  updateCamAgeVisibility();
+  if (camAgeEls.length) {
+    camAgeTimer = setInterval(
+      () => camAgeEls.forEach(({ el, time }) => (el.textContent = formatAqiAge(time))),
+      60 * 1000,
+    );
+  }
+  layoutCamMarkers();
+}
+
+// Overlapping thumbnails must never touch: every 'move', colliding pairs are
+// pushed apart along their least-overlapped axis by exactly the overlap amount,
+// relaxed until settled. Because the displacement is continuous in the input
+// geometry, markers glide smoothly as zoom converges their true positions —
+// no discrete slots to hop between. Side-by-side emerges naturally: same-row
+// markers overlap more on Y, so they separate on X.
+const CAM_SPREAD_GAP = 4;
+
+function layoutCamMarkers() {
+  if (!map || !showTraffic || !camMarkers.length) return;
+  const zoom = map.getZoom();
+  const scale = Math.min(CAM_THUMB_MAX_PX / CAM_THUMB_BASE_PX, Math.max(1, 2 ** ((zoom - 10) / 2)));
+  const w = CAM_THUMB_BASE_PX * scale;
+  const h = (w * 9) / 16;
+  const els = camMarkers.map((m) => m.getElement().querySelector('.cam-offset'));
+  const pts = camMarkers.map((m, i) => {
+    const p = map.project(m.getLngLat());
+    return { el: els[i], x: p.x, y: p.y, dx: 0, dy: 0 };
+  });
+  for (let iter = 0; iter < 60; iter++) {
+    let moved = 0;
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        const a = pts[i];
+        const b = pts[j];
+        const dx = b.x + b.dx - (a.x + a.dx);
+        const dy = b.y + b.dy - (a.y + a.dy);
+        const overlapX = w + CAM_SPREAD_GAP - Math.abs(dx);
+        const overlapY = h + CAM_SPREAD_GAP - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+        if (overlapX <= overlapY) {
+          const push = (overlapX / 2) * Math.sign(dx || 1);
+          a.dx -= push;
+          b.dx += push;
+        } else {
+          const push = (overlapY / 2) * Math.sign(dy || 1);
+          a.dy -= push;
+          b.dy += push;
+        }
+        moved += overlapX + overlapY;
+      }
+    }
+    if (!moved) break;
+  }
+  for (const b of pts) {
+    const el = b.el;
+    const now = performance.now();
+    const delta = Math.hypot(b.dx - (el._tx ?? 0), b.dy - (el._ty ?? 0));
+    if (delta > 14) {
+      // Discrete snap (slot reassignment / big geometry change): animate it,
+      // then go quiet briefly so per-frame updates don't restart the easing.
+      el.style.transition = 'transform 0.25s cubic-bezier(0.32, 0.72, 0, 1)';
+      el.style.transform = `translate(${b.dx.toFixed(1)}px, ${b.dy.toFixed(1)}px)`;
+      el._tx = b.dx;
+      el._ty = b.dy;
+      el._snapUntil = now + 280;
+    } else if (now >= (el._snapUntil ?? 0)) {
+      // Continuous tracking: apply instantly (a transition here would chase
+      // a target that moves every frame and read as wobble).
+      el.style.transition = 'none';
+      el.style.transform = `translate(${b.dx.toFixed(1)}px, ${b.dy.toFixed(1)}px)`;
+      el._tx = b.dx;
+      el._ty = b.dy;
+    }
+  }
+}
+
+function setTrafficOverlay(on) {
+  if (on) {
+    refreshCameras();
+    refreshIncidents();
+  } else {
+    renderCameras();
+    renderIncidents();
+    if (openCamId != null) closeCameraSheet();
+    if (openIncident) closeIncidentSheet();
+  }
+}
+
+const cameraSheet = document.getElementById('camera-sheet');
+const cameraImg = document.getElementById('camera-img');
+const cameraFilmstrip = document.getElementById('camera-filmstrip');
+const cameraPrevious = document.getElementById('camera-previous');
+const cameraNext = document.getElementById('camera-next');
+let camSheetReq = 0; // token: stale history responses are dropped
+let camSheetView = 'live'; // 'live' or index into camSheetHistory
+let camSheetHistory = []; // [{ url, time, label }]
+let camSheetEntries = [];
+let camSheetReturnFocus = null;
+let cameraScrubPointerId = null;
+const CAM_HISTORY_COUNT = 5;
+
+// No transition: the new frame is fully predecoded off-DOM first, then painted
+// in one shot — a fade here only ever reads as flicker.
+let camSheetShownUrl = null;
+function showCameraFrame(url) {
+  if (!url || url === camSheetShownUrl) return;
+  const paint = () => {
+    camSheetShownUrl = url;
+    cameraImg.src = url;
+  };
+  if (cameraImg.src.endsWith(url.split('/').pop())) {
+    camSheetShownUrl = url;
+    return;
+  }
+  const fresh = new Image();
+  fresh.onload = paint;
+  fresh.onerror = () => {};
+  fresh.src = url;
+}
+
+function formatCamClock(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '';
+  return new Date(t).toLocaleTimeString('en-SG', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Singapore',
+  });
+}
+
+// Filmstrip tiles use tiny canvas thumbs (240px) instead of the full 1920px
+// frame — no large-image decode/paint pop when the sheet opens, tiny memory.
+const camThumbCache = new Map();
+function cameraThumb(url) {
+  const cached = camThumbCache.get(url);
+  if (cached) return Promise.resolve(cached);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const cv = document.createElement('canvas');
+      cv.width = 240;
+      cv.height = 135;
+      cv.getContext('2d').drawImage(img, 0, 0, 240, 135);
+      let durl;
+      try {
+        durl = cv.toDataURL('image/jpeg', 0.7);
+      } catch {
+        durl = url; // tainted canvas (e.g. HMR edge) — fall back to full frame
+      }
+      if (camThumbCache.size > 40) camThumbCache.delete(camThumbCache.keys().next().value);
+      camThumbCache.set(url, durl);
+      resolve(durl);
+    };
+    img.onerror = () => resolve(url);
+    img.src = apiURL('/traffic-image', { url });
+  });
+}
+
+function renderCameraFilmstrip() {
+  cameraFilmstrip.textContent = '';
+  const liveCam = camData.find((c) => c.id === openCamId);
+  // Chronological, latest on the right: past frames first, live last.
+  const entries = [
+    ...camSheetHistory.map((f, i) => ({ ...f, key: i })),
+    {
+      key: 'live',
+      url: liveCam?.image ?? '',
+      time: liveCam?.time,
+      label: formatCamClock(liveCam?.time) || 'now',
+    },
+  ];
+  camSheetEntries = entries;
+  let selectedIndex = entries.findIndex((entry) => entry.key === camSheetView);
+  if (selectedIndex < 0) {
+    selectedIndex = entries.length - 1;
+    camSheetView = entries[selectedIndex].key;
+  }
+  cameraPrevious.disabled = selectedIndex === 0;
+  cameraNext.disabled = selectedIndex === entries.length - 1;
+  for (const entry of entries) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.dataset.frameKey = String(entry.key);
+    const isSelected = entry.key === camSheetView;
+    btn.className = `camera-tile${isSelected ? ' active' : ''}`;
+    btn.setAttribute(
+      'aria-label',
+      `Show frame ${entry.label}${entry.key === 'live' ? ', live' : ''}`,
+    );
+    btn.setAttribute('aria-pressed', String(isSelected));
+    if (entry.url) {
+      const img = document.createElement('img');
+      img.alt = '';
+      cameraThumb(entry.url).then((durl) => {
+        img.src = durl;
+      });
+      btn.appendChild(img);
+    }
+    const cap = document.createElement('span');
+    cap.textContent = entry.label;
+    btn.appendChild(cap);
+    btn.addEventListener('click', () => selectCameraFrame(entry.key));
+    btn.addEventListener('pointerenter', (event) => {
+      if (event.pointerType !== 'touch') selectCameraFrame(entry.key);
+    });
+    cameraFilmstrip.appendChild(btn);
+  }
+}
+
+function selectCameraFrame(key) {
+  const entry = camSheetEntries.find((item) => String(item.key) === String(key));
+  if (!entry) return;
+  camSheetView = entry.key;
+  showCameraFrame(entry.url);
+  const selectedKey = String(entry.key);
+  for (const button of cameraFilmstrip.querySelectorAll('.camera-tile')) {
+    const isSelected = button.dataset.frameKey === selectedKey;
+    button.classList.toggle('active', isSelected);
+    button.setAttribute('aria-pressed', String(isSelected));
+  }
+  const selectedIndex = camSheetEntries.indexOf(entry);
+  cameraPrevious.disabled = selectedIndex === 0;
+  cameraNext.disabled = selectedIndex === camSheetEntries.length - 1;
+}
+
+cameraFilmstrip.addEventListener('pointerdown', (event) => {
+  if (event.pointerType !== 'touch') return;
+  const tile = event.target.closest('.camera-tile');
+  if (!tile) return;
+  cameraScrubPointerId = event.pointerId;
+  cameraFilmstrip.setPointerCapture(event.pointerId);
+  selectCameraFrame(tile.dataset.frameKey);
+});
+cameraFilmstrip.addEventListener('pointermove', (event) => {
+  if (event.pointerId !== cameraScrubPointerId) return;
+  const tile = document.elementFromPoint(event.clientX, event.clientY)?.closest('.camera-tile');
+  if (tile && cameraFilmstrip.contains(tile)) selectCameraFrame(tile.dataset.frameKey);
+});
+function endCameraScrub(event) {
+  if (event.pointerId === cameraScrubPointerId) cameraScrubPointerId = null;
+}
+cameraFilmstrip.addEventListener('pointerup', endCameraScrub);
+cameraFilmstrip.addEventListener('pointercancel', endCameraScrub);
+cameraFilmstrip.addEventListener('lostpointercapture', endCameraScrub);
+
+function moveCameraFrame(direction) {
+  const selectedIndex = camSheetEntries.findIndex((entry) => entry.key === camSheetView);
+  const nextEntry = camSheetEntries[selectedIndex + direction];
+  if (nextEntry) selectCameraFrame(nextEntry.key);
+}
+
+cameraPrevious.addEventListener('click', () => moveCameraFrame(-1));
+cameraNext.addEventListener('click', () => moveCameraFrame(1));
+
+// Fetch the past 5 slot-aligned frames (5 min apart) for the open camera.
+async function loadCameraHistory(cam) {
+  const req = ++camSheetReq;
+  const jobs = [];
+  for (let k = 1; k <= CAM_HISTORY_COUNT; k++) {
+    const t = new Date(Math.floor((Date.now() - k * SLOT_MS) / 60000) * 60000);
+    // date_time is SGT: shift by +8h and trim the ISO string
+    const dt = new Date(t.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19);
+    jobs.push(
+      apiFetch(apiURL('/traffic-images', { date_time: dt }), { maxAgeMs: 10 * 60 * 1000 })
+        .then((json) => {
+          assertApiOk(json, apiURL('/traffic-images'));
+          const frame = (json.data.cameras || []).find((c) => c.id === cam.id);
+          if (frame) {
+            return {
+              url: frame.image,
+              time: frame.time,
+              label: formatCamClock(frame.time) || dt.slice(11, 16),
+            };
+          }
+          return null;
+        })
+        .catch(() => null),
+    );
+  }
+  const frames = (await Promise.all(jobs))
+    .filter(Boolean)
+    .sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+  if (req !== camSheetReq || openCamId == null || frames.length === 0) return;
+  camSheetHistory = frames;
+  renderCameraFilmstrip();
+}
+
+function openCameraSheet(cam) {
+  camSheetReturnFocus = document.activeElement;
+  cameraSheet.classList.add('open');
+  sheetBackdrop.classList.add('open');
+  cameraSheet.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('sheet-open');
+  camSheetReq++;
+  camSheetView = 'live';
+  camSheetHistory = [];
+  showCameraFrame(cam.image);
+  renderCameraFilmstrip();
+  document.getElementById('camera-close').focus({ preventScroll: true });
+  loadCameraHistory(cam);
+  clearInterval(camSheetTimer);
+  camSheetTimer = setInterval(() => refreshCameras(), CAM_SHEET_REFRESH_MS);
+  refreshCameras();
+}
+
+// Called after every feed refresh while the sheet is open; swaps the live
+// snapshot only when the feed carries a newer frame and the user is on Live.
+function updateOpenCamSheet() {
+  if (openCamId == null || !cameraSheet.classList.contains('open')) return;
+  const cam = camData.find((c) => c.id === openCamId);
+  if (!cam) return;
+  renderCameraFilmstrip();
+  if (camSheetView !== 'live') return;
+  showCameraFrame(cam.image);
+}
+
+function closeCameraSheet() {
+  cameraSheet.classList.remove('open');
+  sheetBackdrop.classList.remove('open');
+  cameraSheet.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('sheet-open');
+  openCamId = null;
+  camSheetReq++;
+  camSheetView = 'live';
+  camSheetHistory = [];
+  camSheetShownUrl = null;
+  cameraImg.src = '';
+  cameraFilmstrip.textContent = '';
+  camSheetEntries = [];
+  clearInterval(camSheetTimer);
+  camSheetTimer = null;
+  if (camSheetReturnFocus?.isConnected) camSheetReturnFocus.focus({ preventScroll: true });
+  camSheetReturnFocus = null;
+}
+
+function cameraImageContainsPoint(x, y) {
+  const { naturalWidth, naturalHeight } = cameraImg;
+  const rect = cameraImg.getBoundingClientRect();
+  if (!naturalWidth || !naturalHeight || !rect.width || !rect.height) return false;
+  const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight);
+  const width = naturalWidth * scale;
+  const height = naturalHeight * scale;
+  const left = rect.left + (rect.width - width) / 2;
+  const top = rect.top + (rect.height - height) / 2;
+  return x >= left && x <= left + width && y >= top && y <= top + height;
+}
+
+cameraSheet.addEventListener('click', (event) => {
+  if (event.target.closest('button')) return;
+  if (event.target === cameraImg && cameraImageContainsPoint(event.clientX, event.clientY)) return;
+  closeCameraSheet();
+});
+document.getElementById('camera-close').addEventListener('click', closeCameraSheet);
+sheetBackdrop.addEventListener('click', closeCameraSheet);
+document.addEventListener('keydown', (e) => {
+  if (!cameraSheet.classList.contains('open')) return;
+  if (e.key === 'Escape') {
+    closeCameraSheet();
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    moveCameraFrame(-1);
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    moveCameraFrame(1);
+  } else if (e.key === 'Tab') {
+    const focusable = [...cameraSheet.querySelectorAll('button:not(:disabled)')];
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+});
+
+// LTA traffic incidents (DataMall via the Worker; needs LTA_DATAMALL_KEY):
+// bare yellow warning triangles; clicking one opens a sheet with the message.
+const incidentMarkers = [];
+let incidentData = [];
+let incidentLoading = null;
+let openIncident = null;
+
+async function loadIncidents(fetchFn) {
+  const json = await fetchFn(apiURL('/traffic-incidents'));
+  assertApiOk(json, apiURL('/traffic-incidents'));
+  return json.data.incidents || [];
+}
+
+function refreshIncidents() {
+  if (!showTraffic) return null;
+  if (incidentLoading) return incidentLoading;
+  incidentLoading = loadIncidents((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
+    .then((incidents) => {
+      incidentData = incidents;
+      renderIncidents();
+      updateOpenIncidentSheet();
+    })
+    .catch((e) => {
+      console.error('Incident fetch error:', e);
+      if (String(e.message).includes('LTA_DATAMALL_KEY')) {
+        showToast('Traffic incidents unavailable — set LTA_DATAMALL_KEY');
+      }
+    })
+    .finally(() => {
+      incidentLoading = null;
+    });
+  return incidentLoading;
+}
+
+function clearIncidentMarkers() {
+  for (const m of incidentMarkers) m.remove();
+  incidentMarkers.length = 0;
+}
+
+function incidentChipEl(incident) {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'incident-marker';
+  el.title = incident.message;
+  el.setAttribute('aria-label', `Traffic incident: ${incident.type}`);
+  el.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>';
+  el.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openIncident = incident;
+    openIncidentSheet(incident);
+  });
+  return el;
+}
+
+function renderIncidents() {
+  clearIncidentMarkers();
+  if (!map || !showTraffic) return;
+  for (const incident of incidentData) {
+    if (!inRadar480(incident.lng, incident.lat)) continue;
+    incidentMarkers.push(
+      new maplibregl.Marker({ element: incidentChipEl(incident), anchor: 'center' })
+        .setLngLat([incident.lng, incident.lat])
+        .addTo(map),
+    );
+  }
+}
+
+const incidentSheet = document.getElementById('incident-sheet');
+const incidentTitle = document.getElementById('incident-title');
+const incidentMessage = document.getElementById('incident-message');
+
+function openIncidentSheet(incident) {
+  incidentSheet.classList.add('open');
+  sheetBackdrop.classList.add('open');
+  incidentSheet.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('sheet-open');
+  incidentTitle.textContent = incident.type || 'Traffic incident';
+  incidentMessage.textContent = incident.message;
+  cameraSheet.classList.remove('open');
+}
+
+function updateOpenIncidentSheet() {
+  if (!openIncident || !incidentSheet.classList.contains('open')) return;
+  const fresh = incidentData.find(
+    (i) =>
+      i.lat === openIncident.lat &&
+      i.lng === openIncident.lng &&
+      i.message === openIncident.message,
+  );
+  if (!fresh) {
+    closeIncidentSheet();
+    return;
+  }
+  incidentTitle.textContent = fresh.type || 'Traffic incident';
+  incidentMessage.textContent = fresh.message;
+}
+
+function closeIncidentSheet() {
+  incidentSheet.classList.remove('open');
+  sheetBackdrop.classList.remove('open');
+  incidentSheet.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('sheet-open');
+  openIncident = null;
+}
+
+document.getElementById('incident-close').addEventListener('click', closeIncidentSheet);
+sheetBackdrop.addEventListener('click', closeIncidentSheet);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && incidentSheet.classList.contains('open')) closeIncidentSheet();
+});
 
 // Base-style place labels sit under the overlays; raise them so names stay readable over rain.
 function raisePlaceLabels() {
