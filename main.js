@@ -922,6 +922,10 @@ function initMap() {
     updateCamThumbScale();
     updateCamAgeVisibility();
   });
+  window.addEventListener('resize', () => {
+    updateCamThumbScale();
+    updateCamAgeVisibility();
+  });
   map.on('move', layoutCamMarkers);
   map.on('zoomend', () => {
     updateAqiAgeVisibility();
@@ -2309,28 +2313,35 @@ let camLoading = null;
 let openCamId = null;
 let camSheetTimer = null;
 const CAM_SHEET_REFRESH_MS = 60 * 1000;
-// Thumbnails are always shown and scale with zoom: 24px at the default SG fit
-// (zoom 10), doubling by zoom 12, capped at 320px. The scale is a CSS var on the
+// Thumbnails are always shown and scale with zoom: 48px at the default SG fit
+// (zoom 10), doubling by zoom 12, capped at 640px. The scale is a CSS var on the
 // map container so one write on 'zoom' resizes every marker.
-const CAM_THUMB_BASE_PX = 24;
-const CAM_THUMB_MAX_PX = 320;
+const CAM_THUMB_BASE_PX = 48;
+const CAM_THUMB_MAX_PX = 640;
 // Frame age ("3m ago") sits under each thumbnail when zoomed in past this.
-const CAM_AGE_ZOOM = 14;
+const CAM_AGE_ZOOM = 12;
+const INCIDENT_TYPE_ZOOM = 12;
 let camAgeEls = [];
 let camAgeTimer = null;
 
 function updateCamThumbScale() {
   if (!map) return;
-  const scale = Math.min(
+  const viewportLimitPx = Math.max(CAM_THUMB_BASE_PX, window.innerWidth * 0.9);
+  const maxScale = Math.min(
     CAM_THUMB_MAX_PX / CAM_THUMB_BASE_PX,
-    Math.max(1, 2 ** ((map.getZoom() - 10) / 2)),
+    viewportLimitPx / CAM_THUMB_BASE_PX,
   );
+  const scale = Math.min(maxScale, Math.max(1, 2 ** ((map.getZoom() - 10) / 2)));
+  map.getContainer().style.setProperty('--cam-thumb-base', `${CAM_THUMB_BASE_PX}px`);
   map.getContainer().style.setProperty('--cam-zoom-scale', scale.toFixed(3));
 }
 
 function updateCamAgeVisibility() {
   if (!map) return;
-  map.getContainer().classList.toggle('cam-ages-on', showTraffic && map.getZoom() >= CAM_AGE_ZOOM);
+  const zoom = map.getZoom();
+  const container = map.getContainer();
+  container.classList.toggle('cam-ages-on', showTraffic && zoom >= CAM_AGE_ZOOM);
+  container.classList.toggle('incident-types-on', showTraffic && zoom >= INCIDENT_TYPE_ZOOM);
 }
 
 async function loadCameras(fetchFn) {
@@ -2366,7 +2377,6 @@ function camDotEl(cam) {
   const el = document.createElement('button');
   el.type = 'button';
   el.className = 'cam-marker';
-  el.title = `Traffic camera ${cam.id ?? ''}`.trim();
   el.setAttribute('aria-label', `Open traffic camera ${cam.id ?? ''}`.trim());
   // Inner wrapper carries the spread offset so MapLibre's own transform on the
   // button (its marker positioning) is never touched.
@@ -2861,6 +2871,10 @@ function incidentChipEl(incident) {
   el.setAttribute('aria-label', `Traffic incident: ${incident.type}`);
   el.innerHTML =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>';
+  const typeLabel = document.createElement('span');
+  typeLabel.className = 'incident-type';
+  typeLabel.textContent = incident.type || 'Traffic incident';
+  el.append(typeLabel);
   el.addEventListener('click', (e) => {
     e.stopPropagation();
     openIncident = incident;

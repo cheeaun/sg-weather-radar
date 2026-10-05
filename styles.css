@@ -341,7 +341,7 @@ body {
 }
 .cam-thumb {
   display: block;
-  width: calc(24px * var(--cam-zoom-scale, 1));
+  width: min(calc(var(--cam-thumb-base, 48px) * var(--cam-zoom-scale, 1)), 100vw);
   aspect-ratio: 16 / 9;
   object-fit: cover;
   border-radius: calc(3px * min(var(--cam-zoom-scale, 1), 1.5));
@@ -405,8 +405,7 @@ body {
   object-fit: contain;
 }
 .camera-filmstrip {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  display: flex;
   min-width: 0;
   max-width: 100%;
   width: min(calc(100% - 32px), 720px);
@@ -415,7 +414,7 @@ body {
   touch-action: pan-y;
 }
 .camera-tile {
-  width: 100%;
+  flex: 1 1 0;
   min-width: 0;
   position: relative;
   padding: 0;
@@ -461,6 +460,7 @@ body {
 }
 /* Traffic incident markers: bare yellow warning triangle, no plate. */
 .incident-marker {
+  position: relative;
   display: grid;
   place-items: center;
   padding: 0;
@@ -469,6 +469,31 @@ body {
   cursor: pointer;
   pointer-events: auto;
   transition: transform 0.12s ease;
+}
+.incident-type {
+  display: none;
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 50%;
+  transform: translateX(-50%);
+  font:
+    700 12px/1.2 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  color: var(--ink-strong);
+  text-shadow:
+    -1px -1px 0 var(--shape-halo),
+    1px -1px 0 var(--shape-halo),
+    -1px 1px 0 var(--shape-halo),
+    1px 1px 0 var(--shape-halo);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.incident-marker:hover .incident-type,
+.incident-marker:focus-visible .incident-type,
+.maplibregl-map.incident-types-on .incident-type {
+  display: block;
 }
 .incident-marker svg {
   width: 18px;
