@@ -47,6 +47,7 @@ const WIND_STORAGE_KEY = 'sgwr-wind';
 const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
 const AQI_STORAGE_KEY = 'sgwr-aqi';
 const TEMP_STORAGE_KEY = 'sgwr-temp';
+const SMOOTH_STORAGE_KEY = 'sgwr-smooth';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -96,6 +97,7 @@ let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
 let showAqi = import.meta.env.VITE_AQI_UI === '1' && localStorage.getItem(AQI_STORAGE_KEY) === 'on';
 let showTemp = localStorage.getItem(TEMP_STORAGE_KEY) === 'on';
+let smoothRadar = localStorage.getItem(SMOOTH_STORAGE_KEY) === 'on';
 const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
 const BASE_ATTRIBUTION =
   'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
@@ -691,6 +693,8 @@ function applyOpacity(value) {
         map.setPaintProperty(`radar-${range}`, 'raster-opacity', v);
       }
     }
+    // Custom smooth layers read radarOpacity as a uniform; repaint to apply.
+    if (smoothRadar) map.triggerRepaint();
   }
   document.getElementById('opacity-value').textContent = `${Math.round(v * 100)}%`;
   document.getElementById('opacity-reset').classList.toggle('visible', v !== 0.75);
@@ -707,6 +711,35 @@ document.getElementById('opacity-reset').addEventListener('click', () => {
   localStorage.setItem(OPACITY_STORAGE_KEY, '0.75');
 });
 applyOpacity(radarOpacity);
+
+function radarResampling() {
+  return smoothRadar ? 'linear' : 'nearest';
+}
+
+function setSmoothRadar(on) {
+  smoothRadar = on;
+  localStorage.setItem(SMOOTH_STORAGE_KEY, on ? 'on' : 'off');
+  const checkbox = document.getElementById('smooth-checkbox');
+  if (checkbox) checkbox.checked = on;
+  if (map) {
+    for (const range of RANGES) {
+      if (map.getLayer(`radar-${range}`)) {
+        map.setPaintProperty(`radar-${range}`, 'resampling', radarResampling());
+        // Hide the outgoing stack now so the old frame can't flash under the new one.
+        map.setLayoutProperty(`radar-${range}`, 'visibility', on ? 'none' : 'visible');
+      }
+      setSmoothRangeVisible(range, on);
+    }
+  }
+  if (allTimestamps.length) showFrame(currentIndex);
+  showToast(on ? 'Smooth radar on' : 'Smooth radar off');
+}
+
+const smoothCheckbox = document.getElementById('smooth-checkbox');
+if (smoothCheckbox) {
+  smoothCheckbox.checked = smoothRadar;
+  smoothCheckbox.addEventListener('change', (e) => setSmoothRadar(e.target.checked));
+}
 
 darkModeQuery.addEventListener('change', () => {
   if (themePreference === 'system') applyTheme();
@@ -1818,6 +1851,9 @@ const RADAR_BLANK_PNG =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=';
 const CLIP_SOURCE = { 480: 240, 240: 70 };
 const frameImageCache = new Map();
+// Display-only contour GeoJSON derived from the sharp cache; analysis and
+// nowcast keep reading the sharp originals so the toggle never changes science.
+const smoothDataCache = new Map();
 // One canvas per range per slot across the whole visible window (+pad), so replay/scrub
 // never evicts a frame it will immediately revisit.
 const FRAME_CACHE_MAX = RANGES.length * Math.ceil((PAST_HOURS * 60 * 60 * 1000) / SLOT_MS + 2);
@@ -1868,12 +1904,36 @@ function addRadarLayers() {
       source: `radar-${range}`,
       paint: {
         'raster-opacity': radarOpacity,
-        resampling: 'nearest',
+        resampling: radarResampling(),
         'raster-fade-duration': 0,
       },
     });
   }
+  addSmoothLayers();
   if (allTimestamps.length) showFrame(currentIndex);
+}
+
+// Custom shader layers replace the raster layers when smooth is on.
+function addSmoothLayers() {
+  if (!map || !styleReady) return;
+  for (const range of RANGES) {
+    const id = `smooth-${range}`;
+    if (map.getLayer(id)) continue;
+    try {
+      map.addLayer(makeSmoothLayer(range));
+    } catch (e) {
+      console.error('Smooth layer failed:', e);
+      showError(`Smooth layer failed: ${e.message || e}`);
+      return;
+    }
+    map.setLayoutProperty(id, 'visibility', smoothRadar ? 'visible' : 'none');
+  }
+}
+
+function setSmoothRangeVisible(range, on) {
+  if (!map) return;
+  const id = `smooth-${range}`;
+  if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
 }
 
 // Coastline traced above the radar so rain stays readable against the land it falls on.
@@ -2339,6 +2399,43 @@ async function fetchRadarImage(url) {
 }
 
 // MapLibre projects the image source from its geographic corner coordinates.
+// Texel box of this range's frame covered by the inner range (for clipping
+// outer ranges where inner ones draw, so stacked translucent layers can't
+// double-darken the same storm).
+function innerCutBox(range, W, H) {
+  const innerRange = CLIP_SOURCE[range];
+  if (!innerRange) return null;
+  const bb = boundaryBoxes[range] || RADAR_BOUNDS[range];
+  const inner = boundaryBoxes[innerRange] || RADAR_BOUNDS[innerRange];
+  const lonSpan = bb.lowerRight.longitude - bb.upperLeft.longitude;
+  const west = inner.upperLeft.longitude;
+  const east = inner.lowerRight.longitude;
+  const latSpan = bb.upperLeft.latitude - bb.lowerRight.latitude;
+  const north = inner.upperLeft.latitude;
+  const south = inner.lowerRight.latitude;
+  let x0 = W,
+    x1 = -1;
+  for (let x = 0; x < W; x++) {
+    const left = bb.upperLeft.longitude + (x / W) * lonSpan;
+    const right = bb.upperLeft.longitude + ((x + 1) / W) * lonSpan;
+    if (left >= west && right <= east) {
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+    }
+  }
+  let y0 = H,
+    y1 = -1;
+  for (let y = 0; y < H; y++) {
+    const lat = bb.upperLeft.latitude - ((y + 0.5) / H) * latSpan;
+    if (lat <= north && lat >= south) {
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+  }
+  if (x1 < x0 || y1 < y0) return null;
+  return { x0, y0, x1, y1 };
+}
+
 function buildRadarCanvas(range, frame, clip) {
   if (frame.nowcast) {
     const entry = nowcastCanvases.get(new Date(frame.timestamp).getTime());
@@ -2358,36 +2455,8 @@ function buildRadarCanvas(range, frame, clip) {
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         ctx.imageSmoothingEnabled = false;
         ctx.drawImage(bitmap, 0, 0);
-        const innerRange = CLIP_SOURCE[range];
-        if (clip && innerRange) {
-          const inner = boundaryBoxes[innerRange] || RADAR_BOUNDS[innerRange];
-          const lonSpan = bb.lowerRight.longitude - bb.upperLeft.longitude;
-          const west = inner.upperLeft.longitude;
-          const east = inner.lowerRight.longitude;
-          const latSpan = bb.upperLeft.latitude - bb.lowerRight.latitude;
-          const north = inner.upperLeft.latitude;
-          const south = inner.lowerRight.latitude;
-          let x0 = W,
-            x1 = -1;
-          for (let x = 0; x < W; x++) {
-            const left = bb.upperLeft.longitude + (x / W) * lonSpan;
-            const right = bb.upperLeft.longitude + ((x + 1) / W) * lonSpan;
-            if (left >= west && right <= east) {
-              if (x < x0) x0 = x;
-              if (x > x1) x1 = x;
-            }
-          }
-          let y0 = H,
-            y1 = -1;
-          for (let y = 0; y < H; y++) {
-            const lat = bb.upperLeft.latitude - ((y + 0.5) / H) * latSpan;
-            if (lat <= north && lat >= south) {
-              if (y < y0) y0 = y;
-              if (y > y1) y1 = y;
-            }
-          }
-          if (x1 >= x0 && y1 >= y0) ctx.clearRect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-        }
+        const cut = clip ? innerCutBox(range, W, H) : null;
+        if (cut) ctx.clearRect(cut.x0, cut.y0, cut.x1 - cut.x0 + 1, cut.y1 - cut.y0 + 1);
         return canvas;
       } finally {
         bitmap.close();
@@ -2425,6 +2494,481 @@ function prepareFrameImage(range, frame) {
   return promise;
 }
 
+function displayImageKey(range, frame) {
+  return `${frameImageKey(range, frame, clipBoundaries)}${smoothRadar ? `#smoothv${SMOOTH_SHADER_VERSION}` : ''}`;
+}
+
+// Contour-style smoothing: blur the palette position, not RGB, then colorize
+// along the continuous ramp so fills shade smoothly with no band steps.
+const smoothPosCache = new Map();
+function smoothPositionForColor(r, g, b) {
+  const key = (r << 16) | (g << 8) | b;
+  let t = smoothPosCache.get(key);
+  if (t === undefined) {
+    t = rainPositionForColor(r, g, b);
+    if (smoothPosCache.size > 4096) smoothPosCache.clear();
+    smoothPosCache.set(key, t);
+  }
+  return t;
+}
+
+// Smooth radar as a custom WebGL layer: the intensity field goes up as a data
+// texture and the fragment shader smooths + colorizes it. Calibrated (color
+// tracks the palette), continuous (no points, no dots), correct at every zoom
+// (kernel lives in data space, quad is projective).
+const SMOOTH_CACHE_MAX = 24;
+const SMOOTH_RAMP_STEPS = 256;
+// Bump when SMOOTH_FRAG or the ramp changes: the GL program persists across
+// Vite hot swaps, so render() recompiles on mismatch instead of drawing stale
+// pixels.
+const SMOOTH_SHADER_VERSION = 36;
+
+// Scratch for the field pre-blur, sized once per canvas resolution.
+const smoothScratch = { n: 0, pos: null, ra: null, ta: null, tmp: null };
+function smoothScratchFor(n) {
+  if (smoothScratch.n !== n) {
+    smoothScratch.n = n;
+    smoothScratch.pos = new Uint8Array(n);
+    smoothScratch.ra = new Float32Array(n);
+    smoothScratch.ta = new Float32Array(n);
+    smoothScratch.tmp = new Float32Array(n);
+  }
+  return smoothScratch;
+}
+
+// One [1,2,1] lap per axis, edge-clamped; result lands back in src.
+function blur121(src, dst, W, H) {
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    for (let x = 0; x < W; x++) {
+      const xl = row + (x > 0 ? x - 1 : 0);
+      const xr = row + (x < W - 1 ? x + 1 : W - 1);
+      dst[row + x] = (src[xl] + 2 * src[row + x] + src[xr]) * 0.25;
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    const yu = (y > 0 ? y - 1 : 0) * W;
+    const yd = (y < H - 1 ? y + 1 : H - 1) * W;
+    for (let x = 0; x < W; x++) {
+      src[row + x] = (dst[yu + x] + 2 * dst[row + x] + dst[yd + x]) * 0.25;
+    }
+  }
+}
+
+// Intensity field packed for the GPU: R = blurred palette position (colors
+// melt, so dither hues blend), A = blurred coverage (kept for the R
+// normalization only). The shader reads alpha from a separate exact binary
+// mask instead, so shape never passes through bilinear filtering.
+function buildSmoothField(sharp, range) {
+  const W = sharp.width;
+  const H = sharp.height;
+  const n = W * H;
+  const d = sharp.getContext('2d').getImageData(0, 0, W, H).data;
+  const { pos, ra, ta, tmp } = smoothScratchFor(n);
+  const od = new Uint8ClampedArray(n * 4);
+  const mask = new Uint8Array(n);
+  let count = 0;
+  for (let k = 0; k < n; k++) {
+    const pi = k * 4;
+    let p = 0;
+    if (d[pi + 3] >= 16) {
+      const r = d[pi];
+      const g = d[pi + 1];
+      const b = d[pi + 2];
+      if (Math.max(r, g, b) - Math.min(r, g, b) >= 40) {
+        p = Math.round(smoothPositionForColor(r, g, b) * 255);
+        od[pi + 3] = 255;
+        mask[k] = 255;
+        count++;
+      }
+    }
+    pos[k] = p;
+  }
+  for (let k = 0; k < n; k++) ra[k] = pos[k];
+  blur121(ra, tmp, W, H);
+  for (let k = 0; k < n; k++) ta[k] = od[k * 4 + 3] ? 1 : 0;
+  blur121(ta, tmp, W, H);
+  for (let k = 0; k < n; k++) {
+    const cov = ta[k];
+    const pi = k * 4;
+    // R is exact on rainy texels so band steps reach the bilateral crisp;
+    // off rain it carries the blurred average as extension, or bilinear
+    // sampling of zero-R holes drags fringe hues toward band 0 (teal rings).
+    od[pi] = mask[k] ? pos[k] : ta[k] > 0.004 ? Math.round(ra[k] / ta[k]) : 0;
+    od[pi + 3] = Math.round(cov * 255);
+  }
+  // Smooth layers always draw exclusive coverage (unlike the raster, whose
+  // opaque stacking is invisible): outer ranges clear where the inner range
+  // draws, whatever the clip toggle says, or translucent fringes stack into
+  // dark bands.
+  const cut = range ? innerCutBox(range, W, H) : null;
+  if (cut) {
+    for (let y = cut.y0; y <= cut.y1; y++) {
+      for (let x = cut.x0; x <= cut.x1; x++) {
+        const k = y * W + x;
+        const pi = k * 4;
+        mask[k] = 0;
+        od[pi] = 0;
+        od[pi + 3] = 0;
+      }
+    }
+  }
+  // Raw bytes, not a canvas: canvas uploads premultiply, and the palette
+  // position in R collapses to garbage wherever coverage alpha is small —
+  // the field must reach the GPU un-premultiplied.
+  return { data: od, mask, width: W, height: H };
+}
+
+const SMOOTH_VERT = `
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  v_uv = a_uv;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+const smoothGL = {
+  program: null,
+  version: 0,
+  aPos: 0,
+  aUv: 0,
+  uData: null,
+  uMask: null,
+  uRamp: null,
+  uTexel: null,
+  uOpacity: null,
+  rampTex: null,
+};
+const smoothLayers = {};
+
+function initSmoothGL(gl) {
+  if (smoothGL.program && smoothGL.version === SMOOTH_SHADER_VERSION) return;
+  if (smoothGL.program) {
+    gl.deleteProgram(smoothGL.program);
+    smoothGL.program = null;
+  }
+  const compile = (type, src) => {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      console.error('Smooth radar shader error:', gl.getShaderInfoLog(shader));
+    }
+    return shader;
+  };
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, SMOOTH_VERT));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, SMOOTH_FRAG));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error('Smooth radar link error:', gl.getProgramInfoLog(program));
+  }
+  smoothGL.program = program;
+  smoothGL.aPos = gl.getAttribLocation(program, 'a_pos');
+  smoothGL.aUv = gl.getAttribLocation(program, 'a_uv');
+  smoothGL.uData = gl.getUniformLocation(program, 'u_data');
+  smoothGL.uMask = gl.getUniformLocation(program, 'u_mask');
+  smoothGL.uRamp = gl.getUniformLocation(program, 'u_ramp');
+  smoothGL.uTexel = gl.getUniformLocation(program, 'u_texel');
+  smoothGL.uOpacity = gl.getUniformLocation(program, 'u_opacity');
+  const ramp = document.createElement('canvas');
+  ramp.width = SMOOTH_RAMP_STEPS;
+  ramp.height = 1;
+  const rctx = ramp.getContext('2d');
+  const img = rctx.createImageData(SMOOTH_RAMP_STEPS, 1);
+  // Dedupe the hard-stop pairs first: lerping raw stops keeps 33 flat bands,
+  // lerping the unique palette gives a truly continuous dissolve.
+  const stops = radarScaleStops();
+  const pal = [];
+  for (const [, rgb] of stops) {
+    const last = pal[pal.length - 1];
+    if (!last || last[0] !== rgb[0] || last[1] !== rgb[1] || last[2] !== rgb[2]) pal.push(rgb);
+  }
+  for (let i = 0; i < SMOOTH_RAMP_STEPS; i++) {
+    // Texel centers encode stop-space: stored intensities are band-left
+    // positions k/33, so u = k/33 must land on palette color k, not drift
+    // half a band light.
+    const f = Math.min(pal.length - 1, ((i + 0.5) / SMOOTH_RAMP_STEPS) * pal.length);
+    const i0 = Math.min(pal.length - 2, Math.floor(f));
+    const u = f - i0;
+    img.data[i * 4] = Math.round(pal[i0][0] + (pal[i0 + 1][0] - pal[i0][0]) * u);
+    img.data[i * 4 + 1] = Math.round(pal[i0][1] + (pal[i0 + 1][1] - pal[i0][1]) * u);
+    img.data[i * 4 + 2] = Math.round(pal[i0][2] + (pal[i0 + 1][2] - pal[i0][2]) * u);
+    img.data[i * 4 + 3] = 255;
+  }
+  rctx.putImageData(img, 0, 0);
+  smoothGL.rampTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, smoothGL.rampTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, ramp);
+  smoothGL.version = SMOOTH_SHADER_VERSION;
+}
+
+// Alpha is an analytic rounded-box SDF over the exact binary rain mask: each
+// rainy texel stamps a squircle (half 0.5, corner radius 0.3), unions take a
+// polynomial smooth-min so joints merge cleanly. Shape never passes through
+// the sampling grid, so grid-scale dots can't pinch into diamonds, size stays
+// near a lone cell, and nothing flickers while panning. Color taps snap to
+// texel centers (exact palette positions) weighted by continuous tents and a
+// soft similarity gate (k=4) against a continuous tent-average reference:
+// interiors stay flat while band joints blend directly between the two band
+// colors in RGB space (not through the ramp's intermediate hues).
+const SMOOTH_FRAG = `
+// highp: texels are 1/480th of UV space, far below mediump precision;
+// mediump quantizes tap positions into a visible lattice.
+precision highp float;
+uniform sampler2D u_data;
+uniform sampler2D u_mask;
+uniform sampler2D u_ramp;
+uniform vec2 u_texel;
+uniform float u_opacity;
+varying vec2 v_uv;
+float sdRoundBox(vec2 p, vec2 b, float r) {
+  vec2 q = abs(p) - b + r;
+  return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+float sminPoly(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+void main() {
+  // Snap to the current texel center so the 3x3 taps below land exactly on
+  // texel centers under NEAREST filtering, whatever the sub-texel position.
+  vec2 g = v_uv / u_texel;
+  vec2 base = (floor(g) + 0.5) * u_texel;
+  vec2 p = fract(g) - 0.5;
+  // Pass 1: continuous ungated tent average of nearby palette positions —
+  // the gate reference. Tents enter and leave at zero weight across texel
+  // boundaries, so ref never prints the grid; the bilinear center tap does
+  // oscillate per texel and referencing it re-printed dither as mosaic.
+  float rsum = 0.0;
+  float rwsum = 0.0;
+  for (int j = -1; j <= 1; j++) {
+    float fj = float(j);
+    for (int i = -1; i <= 1; i++) {
+      float fi = float(i);
+      vec2 tuv = base + vec2(fi, fj) * u_texel;
+      vec2 off = (v_uv - tuv) / u_texel;
+      float cw = max(0.0, 1.0 - abs(off.x)) * max(0.0, 1.0 - abs(off.y));
+      float m = texture2D(u_mask, tuv).r;
+      rsum += cw * m * texture2D(u_data, tuv).r;
+      rwsum += cw * m;
+    }
+  }
+  float ref = rwsum > 0.0 ? rsum / rwsum : 0.0;
+  float d = 1000.0;
+  vec3 csum = vec3(0.0);
+  float wsum = 0.0;
+  vec3 bestCol = vec3(0.0);
+  float bestW = -1.0;
+  for (int j = -1; j <= 1; j++) {
+    float fj = float(j);
+    for (int i = -1; i <= 1; i++) {
+      float fi = float(i);
+      vec2 tuv = base + vec2(fi, fj) * u_texel;
+      float m = texture2D(u_mask, tuv).r;
+      vec2 off = (v_uv - tuv) / u_texel;
+      float cw = max(0.0, 1.0 - abs(off.x)) * max(0.0, 1.0 - abs(off.y));
+      float sd = sdRoundBox(p - vec2(fi, fj), vec2(0.5), 0.3);
+      // Polynomial smooth-min: rounds the union joints so combined pixels
+      // merge with no waist notches or beading; lone texels keep their exact
+      // squircle (a single tap passes through unchanged whatever k is).
+      d = sminPoly(d, mix(1000.0, sd, step(0.5, m)), 0.5);
+      // Soft similarity gate vs the continuous reference, k=4 so adjacent
+      // bands genuinely blend across the joint (~50% cross-weight at 8
+      // bands apart) while texel interiors stay flat. Referencing the
+      // oscillating bilinear center tap instead re-printed dither mosaic.
+      float snap = texture2D(u_data, tuv).r;
+      float dt = (snap - ref) * 4.0;
+      float w = cw * m * exp(-dt * dt);
+      // Blend band colors directly in RGB space: routing the position
+      // average through the ramp instead printed a full yellow band between
+      // red and green (the palette's intermediate hues) where a plain mix
+      // of the two colors belongs.
+      vec3 col = texture2D(u_ramp, vec2(snap, 0.5)).rgb;
+      csum += w * col;
+      wsum += w;
+      if (cw * m > bestW) {
+        bestW = cw * m;
+        bestCol = col;
+      }
+    }
+  }
+  // Softer outer edge on request: the silhouette gradient spans 0.4 texel.
+  float a = 1.0 - smoothstep(-0.1, 0.3, d);
+  if (a * u_opacity < 0.004) discard;
+  // Underflow fallback takes the nearest rainy tap's exact color: the
+  // blurred extension average would bleed heavy-core hues onto the dry
+  // fringe outside the silhouette. No max() floor on wsum itself — flooring
+  // only the denominator invented cyan at starved junctions.
+  vec3 col = wsum > 0.001 ? csum / wsum : bestCol;
+  gl_FragColor = vec4(col * a * u_opacity, a * u_opacity);
+}
+`;
+
+function smoothQuadOf(map, range) {
+  // Screen-space quad via map.project (same math that places every DOM
+  // marker), so no projection-matrix convention can misplace it.
+  const bb = boundaryBoxes[range] || RADAR_BOUNDS[range];
+  const canvas = map.getCanvas();
+  const w = canvas.clientWidth || 1;
+  const h = canvas.clientHeight || 1;
+  const toClip = ([lng, lat]) => {
+    const p = map.project([lng, lat]);
+    return [(p.x / w) * 2 - 1, 1 - (p.y / h) * 2];
+  };
+  const nw = toClip([bb.upperLeft.longitude, bb.upperLeft.latitude]);
+  const ne = toClip([bb.lowerRight.longitude, bb.upperLeft.latitude]);
+  const sw = toClip([bb.upperLeft.longitude, bb.lowerRight.latitude]);
+  const se = toClip([bb.lowerRight.longitude, bb.lowerRight.latitude]);
+  return {
+    pos: new Float32Array([nw[0], nw[1], ne[0], ne[1], sw[0], sw[1], se[0], se[1]]),
+    uv: new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]),
+  };
+}
+
+function makeSmoothLayer(range) {
+  return {
+    id: `smooth-${range}`,
+    type: 'custom',
+    renderingMode: '2d',
+    onAdd(map, gl) {
+      initSmoothGL(gl);
+      this._range = range;
+      this._map = map;
+      this._tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this._tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      // Exact binary rain mask: NEAREST so taps land on true texel values.
+      this._maskTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this._maskTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      this._posBuf = gl.createBuffer();
+      this._uvBuf = gl.createBuffer();
+      this._uvDone = false;
+      this.field = null;
+      this.dirty = false;
+      smoothLayers[range] = this;
+    },
+    render(gl) {
+      if (!smoothRadar || !this.field) return;
+      // Recompile on shader-version mismatch so hot-swapped code can't
+      // keep drawing the previous build's pixels.
+      initSmoothGL(gl);
+      this._draws = (this._draws || 0) + 1;
+      // Custom layers inherit a stale tile viewport; reset to full canvas like wind.
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      // Screen-space quad recomputed every frame: immune to projection-matrix
+      // conventions, and tracks pan/zoom/rotate exactly like DOM markers do.
+      const quad = smoothQuadOf(this._map, this._range);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._posBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, quad.pos, gl.STREAM_DRAW);
+      if (!this._uvDone) {
+        this._uvDone = true;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this._uvBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, quad.uv, gl.STATIC_DRAW);
+      }
+      if (this.dirty) {
+        this.dirty = false;
+        gl.bindTexture(gl.TEXTURE_2D, this._tex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        // Raw bytes: canvas uploads premultiply, which wrecks the low-coverage
+        // texels where the palette position must stay exact.
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          this.field.width,
+          this.field.height,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          this.field.data,
+        );
+        gl.bindTexture(gl.TEXTURE_2D, this._maskTex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.R8,
+          this.field.width,
+          this.field.height,
+          0,
+          gl.RED,
+          gl.UNSIGNED_BYTE,
+          this.field.mask,
+        );
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      }
+      const prevBlend = gl.isEnabled(gl.BLEND);
+      const prevDepth = gl.isEnabled(gl.DEPTH_TEST);
+      const prevCull = gl.isEnabled(gl.CULL_FACE);
+      gl.disable(gl.DEPTH_TEST);
+      gl.disable(gl.CULL_FACE);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.useProgram(smoothGL.program);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this._tex);
+      gl.uniform1i(smoothGL.uData, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, smoothGL.rampTex);
+      gl.uniform1i(smoothGL.uRamp, 1);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this._maskTex);
+      gl.uniform1i(smoothGL.uMask, 2);
+      gl.uniform2f(smoothGL.uTexel, 1 / this.field.width, 1 / this.field.height);
+      gl.uniform1f(smoothGL.uOpacity, radarOpacity);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._posBuf);
+      gl.enableVertexAttribArray(smoothGL.aPos);
+      gl.vertexAttribPointer(smoothGL.aPos, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._uvBuf);
+      gl.enableVertexAttribArray(smoothGL.aUv);
+      gl.vertexAttribPointer(smoothGL.aUv, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.disableVertexAttribArray(smoothGL.aPos);
+      gl.disableVertexAttribArray(smoothGL.aUv);
+      if (prevDepth) gl.enable(gl.DEPTH_TEST);
+      if (prevCull) gl.enable(gl.CULL_FACE);
+      if (!prevBlend) gl.disable(gl.BLEND);
+    },
+  };
+}
+
+function prepareDisplayData(range, frame) {
+  if (frame.nowcast)
+    return prepareFrameImage(range, frame).then((sharp) => buildSmoothField(sharp, range));
+  const key = displayImageKey(range, frame);
+  let promise = smoothDataCache.get(key);
+  if (!promise) {
+    promise = prepareFrameImage(range, frame).then((sharp) => buildSmoothField(sharp, range));
+    promise = promise.catch((e) => {
+      console.error('Smooth field failed:', e);
+      smoothDataCache.delete(key);
+      throw e;
+    });
+    smoothDataCache.set(key, promise);
+    while (smoothDataCache.size > SMOOTH_CACHE_MAX) {
+      smoothDataCache.delete(smoothDataCache.keys().next().value);
+    }
+  }
+  smoothDataCache.delete(key);
+  smoothDataCache.set(key, promise);
+  return promise;
+}
+
 function applyRadarFrame(range, frame) {
   const source = map && styleReady && map.getSource(`radar-${range}`);
   if (!source) return;
@@ -2439,15 +2983,59 @@ function applyRadarFrame(range, frame) {
     radarShownKey.delete(range);
     radarPendingKey.delete(range);
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
+    setSmoothRangeVisible(range, false);
     updateBoundaryAvailability();
   };
-  const key = frame && frameImageKey(range, frame, clipBoundaries);
+  const key = frame && displayImageKey(range, frame);
   // Only the exact signed URL is failed; a re-signed URL for the same timestamp is retried,
   // else stale cached API data (expired S3 URLs) poisons a whole range until the next refresh.
   if (!frame || failedImages.has(frame.url)) {
     hide();
     return;
   }
+  if (smoothRadar) {
+    if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
+    setSmoothRangeVisible(range, true);
+    if (radarShownKey.get(range) === key) {
+      clearSlow();
+      radarPendingKey.delete(range);
+      return;
+    }
+    radarPendingKey.set(range, key);
+    clearSlow();
+    radarSlowTimers.set(
+      range,
+      setTimeout(() => {
+        radarSlowTimers.delete(range);
+        if (radarPendingKey.get(range) !== key) return;
+        radarSlowPending.add(range);
+        updateBoundaryAvailability();
+      }, RADAR_STRIPE_DELAY_MS),
+    );
+    setBusy(true);
+    prepareDisplayData(range, frame)
+      .then((field) => {
+        const L = smoothLayers[range];
+        if (!L || radarPendingKey.get(range) !== key) return;
+        L.field = field;
+        L.dirty = true;
+        if (map) map.triggerRepaint();
+        radarShownKey.set(range, key);
+        radarPendingKey.delete(range);
+        clearSlow();
+        updateBoundaryAvailability();
+      })
+      .catch(() => {
+        if (!failedImages.has(frame.url)) {
+          failedImages.add(frame.url);
+          renderTicks();
+        }
+        if (radarPendingKey.get(range) === key) hide();
+      })
+      .finally(() => setBusy(false));
+    return;
+  }
+  setSmoothRangeVisible(range, false);
   map.setLayoutProperty(layerId, 'visibility', 'visible');
   source.setCoordinates(bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]));
   if (radarShownKey.get(range) === key) {
@@ -2824,7 +3412,7 @@ function computeAvailability() {
   const available = {};
   for (const range of RANGES) {
     const frame = slotMs !== null ? framesMap[range]?.get(slotMs) : null;
-    const key = frame && frameImageKey(range, frame, clipBoundaries);
+    const key = frame && displayImageKey(range, frame);
     // Available once the frame's image is rendered. While it is still loading,
     // the previous image stays up and counts as available for a short grace
     // period (RADAR_STRIPE_DELAY_MS); only slow loads, or a range with nothing
@@ -3860,7 +4448,9 @@ function prefetchFrames(index) {
     for (const range of RANGES) {
       const frame = framesMap[range]?.get(slotMs);
       if (!frame || failedImages.has(frame.url)) continue;
-      prepareFrameImage(range, frame).catch(() => {});
+      (smoothRadar ? prepareDisplayData(range, frame) : prepareFrameImage(range, frame)).catch(
+        () => {},
+      );
     }
   }
 }
