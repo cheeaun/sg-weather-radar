@@ -2536,8 +2536,6 @@ function setTrafficOverlay(on) {
 const cameraSheet = document.getElementById('camera-sheet');
 const cameraImg = document.getElementById('camera-img');
 const cameraFilmstrip = document.getElementById('camera-filmstrip');
-const cameraPrevious = document.getElementById('camera-previous');
-const cameraNext = document.getElementById('camera-next');
 let camSheetReq = 0; // token: stale history responses are dropped
 let camSheetView = 'live'; // 'live' or index into camSheetHistory
 let camSheetHistory = []; // [{ url, time, label }]
@@ -2623,8 +2621,6 @@ function renderCameraFilmstrip() {
     selectedIndex = entries.length - 1;
     camSheetView = entries[selectedIndex].key;
   }
-  cameraPrevious.disabled = selectedIndex === 0;
-  cameraNext.disabled = selectedIndex === entries.length - 1;
   for (const entry of entries) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -2666,9 +2662,6 @@ function selectCameraFrame(key) {
     button.classList.toggle('active', isSelected);
     button.setAttribute('aria-pressed', String(isSelected));
   }
-  const selectedIndex = camSheetEntries.indexOf(entry);
-  cameraPrevious.disabled = selectedIndex === 0;
-  cameraNext.disabled = selectedIndex === camSheetEntries.length - 1;
 }
 
 cameraFilmstrip.addEventListener('pointerdown', (event) => {
@@ -2696,9 +2689,6 @@ function moveCameraFrame(direction) {
   const nextEntry = camSheetEntries[selectedIndex + direction];
   if (nextEntry) selectCameraFrame(nextEntry.key);
 }
-
-cameraPrevious.addEventListener('click', () => moveCameraFrame(-1));
-cameraNext.addEventListener('click', () => moveCameraFrame(1));
 
 // Fetch the past 5 slot-aligned frames (5 min apart) for the open camera.
 async function loadCameraHistory(cam) {

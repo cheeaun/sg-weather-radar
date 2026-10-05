@@ -404,60 +404,12 @@ body {
   height: 100%;
   object-fit: contain;
 }
-.camera-nav {
-  position: absolute;
-  top: 50%;
-  display: grid;
-  place-items: center;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 50%;
-  background: rgba(14, 21, 25, 0.82);
-  color: #f5f8f9;
-  cursor: pointer;
-  transform: translateY(-50%);
-}
-.camera-previous {
-  left: 12px;
-}
-.camera-next {
-  right: 12px;
-}
-.camera-nav svg {
-  display: block;
-  width: 22px;
-  height: 22px;
-}
-.camera-nav:disabled {
-  opacity: 0.3;
-  cursor: default;
-}
-@media (hover: hover) and (pointer: fine) {
-  .camera-nav,
-  .camera-nav:disabled {
-    opacity: 0;
-    transition: opacity 0.14s ease;
-  }
-  .camera-img-wrap:hover .camera-nav,
-  .camera-nav:focus-visible {
-    opacity: 1;
-  }
-  .camera-img-wrap:hover .camera-nav:disabled {
-    opacity: 0.3;
-  }
-}
-.camera-nav:focus-visible {
-  outline: 2px solid #fff;
-  outline-offset: 3px;
-}
 .camera-filmstrip {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
   min-width: 0;
   max-width: 100%;
-  width: min(100%, 720px);
+  width: min(calc(100% - 32px), 720px);
   margin: 0 auto;
   padding: 3px 0 5px;
   touch-action: pan-y;
@@ -876,8 +828,7 @@ body {
   height: 100dvh;
   max-height: 100dvh;
   margin: 0;
-  padding: calc(8px + env(safe-area-inset-top, 0px)) 16px
-    calc(8px + env(safe-area-inset-bottom, 0px));
+  padding: calc(8px + env(safe-area-inset-top, 0px)) 0 calc(8px + env(safe-area-inset-bottom, 0px));
   overflow: hidden;
   border: 0;
   border-radius: 0;
@@ -895,6 +846,7 @@ body {
 }
 .sheet.camera-sheet .sheet-head {
   justify-content: flex-end;
+  padding-inline: 16px;
 }
 .sheet.camera-sheet .sheet-close {
   width: 40px;
