@@ -447,6 +447,15 @@ body {
   aspect-ratio: 16 / 9;
   object-fit: cover;
 }
+.camera-tile.is-loading {
+  cursor: default;
+}
+.camera-tile .tile-ph {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: rgba(255, 255, 255, 0.07);
+}
 .camera-tile span {
   display: block;
   padding: 2px 3px;

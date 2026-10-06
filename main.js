@@ -2549,6 +2549,7 @@ const cameraFilmstrip = document.getElementById('camera-filmstrip');
 let camSheetReq = 0; // token: stale history responses are dropped
 let camSheetView = 'live'; // 'live' or index into camSheetHistory
 let camSheetHistory = []; // [{ url, time, label }]
+let camSheetHistoryLoading = false;
 let camSheetEntries = [];
 let camSheetReturnFocus = null;
 let cameraScrubPointerId = null;
@@ -2615,9 +2616,16 @@ function cameraThumb(url) {
 function renderCameraFilmstrip() {
   cameraFilmstrip.textContent = '';
   const liveCam = camData.find((c) => c.id === openCamId);
+  // Skeletons hold all 6 slots while history loads, so the live tile never
+  // stretches full-width for a frame (the giant black flash).
+  const skels =
+    camSheetHistoryLoading && camSheetHistory.length === 0
+      ? Array.from({ length: CAM_HISTORY_COUNT }, (_, i) => ({ key: `skel-${i}`, skeleton: true }))
+      : [];
   // Chronological, latest on the right: past frames first, live last.
   const entries = [
     ...camSheetHistory.map((f, i) => ({ ...f, key: i })),
+    ...skels,
     {
       key: 'live',
       url: liveCam?.image ?? '',
@@ -2625,13 +2633,26 @@ function renderCameraFilmstrip() {
       label: formatCamClock(liveCam?.time) || 'now',
     },
   ];
-  camSheetEntries = entries;
+  camSheetEntries = entries.filter((entry) => !entry.skeleton);
   let selectedIndex = entries.findIndex((entry) => entry.key === camSheetView);
   if (selectedIndex < 0) {
     selectedIndex = entries.length - 1;
     camSheetView = entries[selectedIndex].key;
   }
   for (const entry of entries) {
+    if (entry.skeleton) {
+      const skel = document.createElement('div');
+      skel.className = 'camera-tile is-loading';
+      skel.setAttribute('aria-hidden', 'true');
+      const ph = document.createElement('div');
+      ph.className = 'tile-ph';
+      skel.appendChild(ph);
+      const cap = document.createElement('span');
+      cap.textContent = ' ';
+      skel.appendChild(cap);
+      cameraFilmstrip.appendChild(skel);
+      continue;
+    }
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.dataset.frameKey = String(entry.key);
@@ -2643,12 +2664,30 @@ function renderCameraFilmstrip() {
     );
     btn.setAttribute('aria-pressed', String(isSelected));
     if (entry.url) {
-      const img = document.createElement('img');
-      img.alt = '';
-      cameraThumb(entry.url).then((durl) => {
-        img.src = durl;
-      });
-      btn.appendChild(img);
+      const cached = camThumbCache.get(entry.url);
+      if (cached) {
+        const img = document.createElement('img');
+        img.alt = '';
+        img.src = cached;
+        btn.appendChild(img);
+      } else {
+        const ph = document.createElement('div');
+        ph.className = 'tile-ph';
+        ph.setAttribute('aria-hidden', 'true');
+        btn.appendChild(ph);
+        cameraThumb(entry.url).then((durl) => {
+          if (!ph.isConnected) return;
+          const img = document.createElement('img');
+          img.alt = '';
+          img.src = durl;
+          ph.replaceWith(img);
+        });
+      }
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'tile-ph';
+      ph.setAttribute('aria-hidden', 'true');
+      btn.appendChild(ph);
     }
     const cap = document.createElement('span');
     cap.textContent = entry.label;
@@ -2728,7 +2767,12 @@ async function loadCameraHistory(cam) {
   const frames = (await Promise.all(jobs))
     .filter(Boolean)
     .sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
-  if (req !== camSheetReq || openCamId == null || frames.length === 0) return;
+  if (req !== camSheetReq || openCamId == null) return;
+  camSheetHistoryLoading = false;
+  if (frames.length === 0) {
+    renderCameraFilmstrip();
+    return;
+  }
   camSheetHistory = frames;
   renderCameraFilmstrip();
 }
@@ -2742,6 +2786,7 @@ function openCameraSheet(cam) {
   camSheetReq++;
   camSheetView = 'live';
   camSheetHistory = [];
+  camSheetHistoryLoading = true;
   showCameraFrame(cam.image);
   renderCameraFilmstrip();
   document.getElementById('camera-close').focus({ preventScroll: true });
@@ -2771,6 +2816,7 @@ function closeCameraSheet() {
   camSheetReq++;
   camSheetView = 'live';
   camSheetHistory = [];
+  camSheetHistoryLoading = false;
   camSheetShownUrl = null;
   cameraImg.src = '';
   cameraFilmstrip.textContent = '';
