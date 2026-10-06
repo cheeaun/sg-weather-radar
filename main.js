@@ -2845,6 +2845,19 @@ cameraSheet.addEventListener('click', (event) => {
   closeCameraSheet();
 });
 document.getElementById('camera-close').addEventListener('click', closeCameraSheet);
+
+const camEnhanceBtn = document.getElementById('camera-enhance');
+let camEnhanceOn = localStorage.getItem('sgwr-cam-enhance') !== '0';
+function applyCamEnhance() {
+  cameraImg.classList.toggle('cam-enhance', camEnhanceOn);
+  camEnhanceBtn.setAttribute('aria-pressed', String(camEnhanceOn));
+}
+camEnhanceBtn.addEventListener('click', () => {
+  camEnhanceOn = !camEnhanceOn;
+  localStorage.setItem('sgwr-cam-enhance', camEnhanceOn ? '1' : '0');
+  applyCamEnhance();
+});
+applyCamEnhance();
 sheetBackdrop.addEventListener('click', closeCameraSheet);
 document.addEventListener('keydown', (e) => {
   if (!cameraSheet.classList.contains('open')) return;

@@ -322,25 +322,47 @@
       aria-hidden="true"
     >
       <div class="sheet-head">
-        <button
-          type="button"
-          class="sheet-close"
-          id="camera-close"
-          aria-label="Close camera"
-          title="Close"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <div class="cam-sheet-tools">
+          <button
+            type="button"
+            class="sheet-close cam-enhance-toggle"
+            id="camera-enhance"
+            aria-label="Toggle image enhancement"
+            aria-pressed="false"
+            title="Enhance"
           >
-            <path d="M18 6 6 18M6 6l12 12" />
-          </svg>
-        </button>
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="sheet-close"
+            id="camera-close"
+            aria-label="Close camera"
+            title="Close"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
       </div>
       <div class="camera-body">
         <div class="camera-img-wrap">
@@ -387,6 +409,60 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true" focusable="false">
+      <filter
+        id="cam-sharpen"
+        x="-5%"
+        y="-5%"
+        width="110%"
+        height="110%"
+        color-interpolation-filters="sRGB"
+      >
+        <feGaussianBlur in="SourceGraphic" stdDeviation="1.1" result="blur1" />
+        <feComposite
+          in="SourceGraphic"
+          in2="blur1"
+          operator="arithmetic"
+          k1="0"
+          k2="1.8"
+          k3="-0.8"
+          k4="0"
+          result="fine"
+        />
+        <feGaussianBlur in="fine" stdDeviation="4" result="blur2" />
+        <feComposite
+          in="fine"
+          in2="blur2"
+          operator="arithmetic"
+          k1="0"
+          k2="1.3"
+          k3="-0.3"
+          k4="0"
+          result="clear"
+        />
+        <feColorMatrix
+          in="clear"
+          type="matrix"
+          values="1 0 0 0 0
+                  0 1.04 0 0 0
+                  0 0 1 0 0
+                  0 0 0 1 0"
+          result="wb"
+        />
+        <feColorMatrix in="wb" type="saturate" values="1.3" result="sat" />
+        <feComponentTransfer in="sat" result="gamma">
+          <feFuncR type="gamma" amplitude="1" exponent="0.95" offset="0" />
+          <feFuncG type="gamma" amplitude="1" exponent="0.95" offset="0" />
+          <feFuncB type="gamma" amplitude="1" exponent="0.95" offset="0" />
+        </feComponentTransfer>
+        <feComponentTransfer in="gamma">
+          <feFuncR type="linear" slope="1.25" intercept="-0.125" />
+          <feFuncG type="linear" slope="1.25" intercept="-0.125" />
+          <feFuncB type="linear" slope="1.25" intercept="-0.125" />
+        </feComponentTransfer>
+      </filter>
+    </svg>
 
     <script type="module" src="/main.js"></script>
   </body>

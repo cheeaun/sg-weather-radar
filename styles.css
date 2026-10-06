@@ -404,6 +404,9 @@ body {
   height: 100%;
   object-fit: contain;
 }
+.camera-img.cam-enhance {
+  filter: url(#cam-sharpen);
+}
 .camera-filmstrip {
   display: flex;
   min-width: 0;
@@ -881,6 +884,17 @@ body {
 .sheet.camera-sheet .sheet-head {
   justify-content: flex-end;
   padding-inline: 16px;
+}
+.cam-sheet-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sheet.camera-sheet .cam-enhance-toggle[aria-pressed='true'],
+.sheet.camera-sheet .cam-enhance-toggle[aria-pressed='true']:hover {
+  background: var(--ink-strong);
+  color: var(--paper-solid);
+  border-color: var(--ink-strong);
 }
 .sheet.camera-sheet .sheet-close {
   width: 40px;
