@@ -319,7 +319,9 @@ body {
   border: none;
   background: transparent;
   cursor: pointer;
-  pointer-events: auto;
+  /* Hit target is the thumbnail only: the button's own box stays at the
+     undisplaced anchor when layoutCamMarkers shifts the visible thumb. */
+  pointer-events: none;
   display: grid;
   place-items: center;
 }
@@ -341,6 +343,7 @@ body {
 }
 .cam-thumb {
   display: block;
+  pointer-events: auto;
   width: min(calc(var(--cam-thumb-base, 48px) * var(--cam-zoom-scale, 1)), 100vw);
   aspect-ratio: 16 / 9;
   object-fit: cover;
@@ -373,9 +376,13 @@ body {
     1px 1px 0 var(--shape-halo);
   white-space: nowrap;
   pointer-events: none;
+  z-index: -1;
 }
 .cam-marker {
   position: relative;
+  /* Own stacking context so the age label (z -1) paints below every other
+     marker's thumbnail instead of occluding neighbours on hover promote. */
+  z-index: 0;
 }
 .cam-marker:hover .cam-age,
 .maplibregl-map.cam-ages-on .cam-age {
@@ -449,6 +456,10 @@ body {
   width: 100%;
   aspect-ratio: 16 / 9;
   object-fit: cover;
+}
+body.cam-enhance-on .cam-thumb,
+body.cam-enhance-on .camera-tile img {
+  filter: url(#cam-sharpen);
 }
 .camera-tile.is-loading {
   cursor: default;
@@ -889,6 +900,30 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.cam-enhance-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 14px 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--paper-solid) 82%, transparent);
+  color: var(--ink-strong);
+  font:
+    600 13px/1 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  cursor: pointer;
+}
+.cam-enhance-toggle svg {
+  width: 16px;
+  height: 16px;
+}
+.cam-enhance-toggle:hover {
+  background: color-mix(in srgb, var(--ink-strong) 10%, var(--paper-solid));
 }
 .sheet.camera-sheet .cam-enhance-toggle[aria-pressed='true'],
 .sheet.camera-sheet .cam-enhance-toggle[aria-pressed='true']:hover {

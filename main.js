@@ -2769,11 +2769,21 @@ async function loadCameraHistory(cam) {
     .sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
   if (req !== camSheetReq || openCamId == null) return;
   camSheetHistoryLoading = false;
-  if (frames.length === 0) {
+  // Opened just after a slot boundary, the newest history fetch can return the
+  // frame the live tile already shows — drop it and any republished dupes.
+  const liveTime = Date.parse(camData.find((c) => c.id === openCamId)?.time ?? cam.time);
+  const seen = new Set();
+  const unique = frames.filter((f) => {
+    const t = Date.parse(f.time);
+    if (seen.has(t) || t >= liveTime) return false;
+    seen.add(t);
+    return true;
+  });
+  if (unique.length === 0) {
     renderCameraFilmstrip();
     return;
   }
-  camSheetHistory = frames;
+  camSheetHistory = unique;
   renderCameraFilmstrip();
 }
 
@@ -2850,6 +2860,7 @@ const camEnhanceBtn = document.getElementById('camera-enhance');
 let camEnhanceOn = localStorage.getItem('sgwr-cam-enhance') !== '0';
 function applyCamEnhance() {
   cameraImg.classList.toggle('cam-enhance', camEnhanceOn);
+  document.body.classList.toggle('cam-enhance-on', camEnhanceOn);
   camEnhanceBtn.setAttribute('aria-pressed', String(camEnhanceOn));
 }
 camEnhanceBtn.addEventListener('click', () => {
