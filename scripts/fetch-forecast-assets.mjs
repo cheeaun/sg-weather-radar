@@ -1,5 +1,6 @@
 // Download MSS weather icons + rain legend from weather.gov.sg into forecast-assets/.
 // Re-run: node scripts/fetch-forecast-assets.mjs (URLs are stable theme paths).
+import { execFileSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,3 +78,22 @@ for (const [url, rel] of jobs) {
   ok++;
 }
 console.log(`forecast-assets: ${ok}/${jobs.length} files`);
+
+// Quantize the PNGs in place so regenerating doesn't undo their compression.
+// Skips gracefully when pngquant isn't on PATH.
+let quantized = 0;
+for (const [, rel] of jobs) {
+  if (!rel.endsWith('.png')) continue;
+  try {
+    execFileSync('pngquant', ['--force', '--ext', '.png', '--quality=65-90', '--speed', '1', join(ROOT, rel)]);
+    quantized++;
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      console.warn('pngquant not found; PNGs left uncompressed');
+      break;
+    }
+    if (err.status !== 99) console.warn(`pngquant failed for ${rel}: ${err.message}`);
+    else quantized++;
+  }
+}
+if (quantized) console.log(`forecast-assets: quantized ${quantized} PNGs`);
