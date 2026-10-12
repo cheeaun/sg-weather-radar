@@ -108,7 +108,7 @@
     .maplibregl-ctrl-attrib-button {
     background-color: rgba(255, 255, 255, 0.08);
   }
-  :root:not([data-theme]) .range-toggle-ctrl svg {
+  :root:not([data-theme]) .range-toggle-ctrl svg:not(.toggle-icon) {
     color: var(--ink);
   }
   :root:not([data-theme]) .maplibregl-ctrl-group button.toggle-active {
@@ -197,7 +197,7 @@
   .maplibregl-ctrl-attrib-button {
   background-color: rgba(255, 255, 255, 0.08);
 }
-:root[data-theme='dark'] .range-toggle-ctrl svg {
+:root[data-theme='dark'] .range-toggle-ctrl svg:not(.toggle-icon) {
   color: var(--ink);
 }
 :root[data-theme='dark'] .maplibregl-ctrl-group button.toggle-active {
@@ -258,7 +258,11 @@ body {
   display: grid;
   place-items: center;
 }
-.range-toggle-ctrl svg {
+/* Divider between stacked toggle buttons; skipped while the active plate is shown. */
+.maplibregl-ctrl-group button + button.toggle-btn:not(.toggle-active) {
+  border-top: 1px solid var(--line);
+}
+.range-toggle-ctrl svg:not(.toggle-icon) {
   width: 13px;
   height: 13px;
   display: block;

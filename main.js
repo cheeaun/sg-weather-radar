@@ -392,6 +392,26 @@ class RangeToggleControl {
     });
     this._button = button;
     container.appendChild(button);
+    const clipBtn = document.createElement('button');
+    clipBtn.type = 'button';
+    clipBtn.className = 'toggle-btn';
+    clipBtn.title = 'Clip intersecting radar at range boundaries';
+    clipBtn.setAttribute('aria-label', 'Clip intersecting radar at range boundaries');
+    clipBtn.setAttribute('aria-pressed', String(clipBoundaries));
+    clipBtn.classList.toggle('toggle-active', clipBoundaries);
+    clipBtn.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 22a2 2 0 0 1-2-2"/><path d="M16 22h-2"/><path d="M16 4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3a1 1 0 0 0 1-1v-5a2 2 0 0 1 2-2h5a1 1 0 0 0 1-1z"/><path d="M20 8a2 2 0 0 1 2 2"/><path d="M22 14v2"/><path d="M22 20a2 2 0 0 1-2 2"/></svg>';
+    clipBtn.addEventListener('click', () => {
+      clipBoundaries = !clipBoundaries;
+      localStorage.setItem(CLIP_STORAGE_KEY, clipBoundaries ? 'on' : 'off');
+      clipBtn.classList.toggle('toggle-active', clipBoundaries);
+      clipBtn.setAttribute('aria-pressed', String(clipBoundaries));
+      showFrame(currentIndex);
+      showToast(
+        clipBoundaries ? 'Clipping radar at range boundaries' : 'Showing intersecting radar',
+      );
+    });
+    container.appendChild(clipBtn);
     this._container = container;
     this._updateButton();
     return container;
@@ -413,97 +433,87 @@ class RangeToggleControl {
   }
 }
 
-class ClipToggleControl {
+class OverlayToggleControl {
   onAdd(map) {
     this._map = map;
     const container = document.createElement('div');
     container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.title = 'Clip intersecting radar at range boundaries';
-    button.setAttribute('aria-label', 'Clip intersecting radar at range boundaries');
-    button.setAttribute('aria-pressed', String(clipBoundaries));
-    button.classList.toggle('toggle-active', clipBoundaries);
-    button.innerHTML =
-      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 22a2 2 0 0 1-2-2"/><path d="M16 22h-2"/><path d="M16 4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3a1 1 0 0 0 1-1v-5a2 2 0 0 1 2-2h5a1 1 0 0 0 1-1z"/><path d="M20 8a2 2 0 0 1 2 2"/><path d="M22 14v2"/><path d="M22 20a2 2 0 0 1-2 2"/></svg>';
-    button.addEventListener('click', () => {
-      clipBoundaries = !clipBoundaries;
-      localStorage.setItem(CLIP_STORAGE_KEY, clipBoundaries ? 'on' : 'off');
-      button.classList.toggle('toggle-active', clipBoundaries);
-      button.setAttribute('aria-pressed', String(clipBoundaries));
-      showFrame(currentIndex);
+    const floodBtn = document.createElement('button');
+    floodBtn.type = 'button';
+    floodBtn.className = 'toggle-btn';
+    floodBtn.title = 'Show flood alerts (broadcast radius)';
+    floodBtn.setAttribute('aria-label', 'Show flood alerts');
+    floodBtn.setAttribute('aria-pressed', String(showFloods));
+    floodBtn.classList.toggle('toggle-active', showFloods);
+    floodBtn.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 7c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M2 12c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M2 17c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/></svg>';
+    floodBtn.addEventListener('click', () => {
+      showFloods = !showFloods;
+      localStorage.setItem(FLOOD_STORAGE_KEY, showFloods ? 'on' : 'off');
+      floodBtn.classList.toggle('toggle-active', showFloods);
+      floodBtn.setAttribute('aria-pressed', String(showFloods));
+      renderFloods();
+      refreshFloods();
+      showToast(showFloods ? 'Showing flood alerts' : 'Hiding flood alerts');
+    });
+    container.appendChild(floodBtn);
+    const lightningBtn = document.createElement('button');
+    lightningBtn.type = 'button';
+    lightningBtn.className = 'toggle-btn';
+    lightningBtn.title = 'Show cloud-to-ground lightning';
+    lightningBtn.setAttribute('aria-label', 'Show cloud-to-ground lightning');
+    lightningBtn.setAttribute('aria-pressed', String(showLightning));
+    lightningBtn.classList.toggle('toggle-active', showLightning);
+    lightningBtn.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
+    lightningBtn.addEventListener('click', () => {
+      showLightning = !showLightning;
+      localStorage.setItem(LIGHTNING_STORAGE_KEY, showLightning ? 'on' : 'off');
+      lightningBtn.classList.toggle('toggle-active', showLightning);
+      lightningBtn.setAttribute('aria-pressed', String(showLightning));
+      renderLightning();
+      refreshLightning();
       showToast(
-        clipBoundaries ? 'Clipping radar at range boundaries' : 'Showing intersecting radar',
+        showLightning ? 'Showing cloud-to-ground lightning' : 'Hiding cloud-to-ground lightning',
       );
     });
-    container.appendChild(button);
-    this._container = container;
-    return container;
-  }
-  onRemove() {
-    if (this._container) this._container.remove();
-    this._container = undefined;
-    this._map = undefined;
-  }
-}
-
-class WindToggleControl {
-  onAdd(map) {
-    this._map = map;
-    const container = document.createElement('div');
-    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.title = 'Show wind flow';
-    button.setAttribute('aria-label', 'Show wind flow');
-    button.setAttribute('aria-pressed', String(showWind));
-    button.classList.toggle('toggle-active', showWind);
-    button.innerHTML =
+    container.appendChild(lightningBtn);
+    const windBtn = document.createElement('button');
+    windBtn.type = 'button';
+    windBtn.className = 'toggle-btn';
+    windBtn.title = 'Show wind flow';
+    windBtn.setAttribute('aria-label', 'Show wind flow');
+    windBtn.setAttribute('aria-pressed', String(showWind));
+    windBtn.classList.toggle('toggle-active', showWind);
+    windBtn.innerHTML =
       '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.6 4.6A2 2 0 1 1 11 8H2"/><path d="M17.7 7.7a2.5 2.5 0 1 1 1.8 4.3H2"/><path d="M12.6 19.4A2 2 0 1 0 14 16H2"/></svg>';
-    button.addEventListener('click', () => {
+    windBtn.addEventListener('click', () => {
       showWind = !showWind;
       localStorage.setItem(WIND_STORAGE_KEY, showWind ? 'on' : 'off');
-      button.classList.toggle('toggle-active', showWind);
-      button.setAttribute('aria-pressed', String(showWind));
+      windBtn.classList.toggle('toggle-active', showWind);
+      windBtn.setAttribute('aria-pressed', String(showWind));
       setWindOverlay(showWind);
       showToast(showWind ? 'Showing wind flow' : 'Hiding wind flow');
     });
-    container.appendChild(button);
-    this._container = container;
-    return container;
-  }
-  onRemove() {
-    if (this._container) this._container.remove();
-    this._container = undefined;
-    this._map = undefined;
-  }
-}
-
-class TempToggleControl {
-  onAdd(map) {
-    this._map = map;
-    const container = document.createElement('div');
-    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.title = 'Show temperature and feels-like';
-    button.setAttribute('aria-label', 'Show temperature and feels-like');
-    button.setAttribute('aria-pressed', String(showTemp));
-    button.classList.toggle('toggle-active', showTemp);
-    button.innerHTML =
+    container.appendChild(windBtn);
+    const tempBtn = document.createElement('button');
+    tempBtn.type = 'button';
+    tempBtn.className = 'toggle-btn';
+    tempBtn.title = 'Show temperature and feels-like';
+    tempBtn.setAttribute('aria-label', 'Show temperature and feels-like');
+    tempBtn.setAttribute('aria-pressed', String(showTemp));
+    tempBtn.classList.toggle('toggle-active', showTemp);
+    tempBtn.innerHTML =
       '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg>';
-    button.addEventListener('click', () => {
+    tempBtn.addEventListener('click', () => {
       showTemp = !showTemp;
       localStorage.setItem(TEMP_STORAGE_KEY, showTemp ? 'on' : 'off');
-      button.classList.toggle('toggle-active', showTemp);
-      button.setAttribute('aria-pressed', String(showTemp));
+      tempBtn.classList.toggle('toggle-active', showTemp);
+      tempBtn.setAttribute('aria-pressed', String(showTemp));
       setTempOverlay(showTemp);
       showToast(showTemp ? 'Showing temperature' : 'Hiding temperature');
     });
-    container.appendChild(button);
+    container.appendChild(tempBtn);
     this._container = container;
     return container;
   }
@@ -514,20 +524,35 @@ class TempToggleControl {
   }
 }
 
-class NowcastToggleControl {
+class NowcastForecastToggleControl {
   onAdd(map) {
     this._map = map;
     const container = document.createElement('div');
     container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.innerHTML =
+    const forecastBtn = document.createElement('button');
+    forecastBtn.type = 'button';
+    forecastBtn.className = 'toggle-btn';
+    forecastBtn.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g transform="translate(-0.5 3.75) scale(0.6)"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></g><g transform="translate(10.45 3.75) scale(0.6)"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></g></svg>';
+    forecastBtn.addEventListener('click', () => {
+      showForecast = !showForecast;
+      localStorage.setItem(FORECAST_STORAGE_KEY, showForecast ? 'on' : 'off');
+      forecastBtn.classList.toggle('toggle-active', showForecast);
+      forecastBtn.setAttribute('aria-pressed', String(showForecast));
+      setForecastOverlay(showForecast);
+      showToast(showForecast ? 'Showing 2-hour + 24-hour forecast' : 'Hiding forecast');
+    });
+    forecastControlButton = forecastBtn;
+    container.appendChild(forecastBtn);
+    const nowcastBtn = document.createElement('button');
+    nowcastBtn.type = 'button';
+    nowcastBtn.className = 'toggle-btn';
+    nowcastBtn.innerHTML =
       '<svg class="toggle-icon nowcast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></svg>';
-    button.addEventListener('click', () => {
+    nowcastBtn.addEventListener('click', () => {
       showNowcast = !showNowcast;
       localStorage.setItem(NOWCAST_STORAGE_KEY, showNowcast ? 'on' : 'off');
-      this._updateButton();
+      this._updateNowcastButton();
       if (showNowcast) {
         loadWind({ forNowcast: true }).finally(() => {
           if (showNowcast) recomputeNowcast();
@@ -537,97 +562,29 @@ class NowcastToggleControl {
       }
       showToast(showNowcast ? 'Showing 15-minute nowcast' : 'Hiding 15-minute nowcast');
     });
-    this._button = button;
-    nowcastControlButton = button;
-    container.appendChild(button);
+    this._nowcastButton = nowcastBtn;
+    nowcastControlButton = nowcastBtn;
+    container.appendChild(nowcastBtn);
     this._container = container;
-    this._updateButton();
+    updateForecastButton();
+    this._updateNowcastButton();
     return container;
   }
-  _updateButton() {
+  _updateNowcastButton() {
     const fit = modelFitPercent();
     const fitText = fit == null ? 'model fit pending' : `model fit ${fit}% (rolling 1 h)`;
     const label = 'Show 15-minute nowcast (70 km)';
-    this._button.title = `${fitText} · short-range rain estimate`;
-    this._button.setAttribute('aria-label', label);
-    this._button.setAttribute('aria-pressed', String(showNowcast));
-    this._button.classList.toggle('toggle-active', showNowcast);
+    this._nowcastButton.title = `${fitText} · short-range rain estimate`;
+    this._nowcastButton.setAttribute('aria-label', label);
+    this._nowcastButton.setAttribute('aria-pressed', String(showNowcast));
+    this._nowcastButton.classList.toggle('toggle-active', showNowcast);
   }
   onRemove() {
     if (this._container) this._container.remove();
     this._container = undefined;
     this._map = undefined;
     nowcastControlButton = null;
-  }
-}
-
-class LightningToggleControl {
-  onAdd(map) {
-    this._map = map;
-    const container = document.createElement('div');
-    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.title = 'Show cloud-to-ground lightning';
-    button.setAttribute('aria-label', 'Show cloud-to-ground lightning');
-    button.setAttribute('aria-pressed', String(showLightning));
-    button.classList.toggle('toggle-active', showLightning);
-    button.innerHTML =
-      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
-    button.addEventListener('click', () => {
-      showLightning = !showLightning;
-      localStorage.setItem(LIGHTNING_STORAGE_KEY, showLightning ? 'on' : 'off');
-      button.classList.toggle('toggle-active', showLightning);
-      button.setAttribute('aria-pressed', String(showLightning));
-      renderLightning();
-      refreshLightning();
-      showToast(
-        showLightning ? 'Showing cloud-to-ground lightning' : 'Hiding cloud-to-ground lightning',
-      );
-    });
-    container.appendChild(button);
-    this._container = container;
-    return container;
-  }
-  onRemove() {
-    if (this._container) this._container.remove();
-    this._container = undefined;
-    this._map = undefined;
-  }
-}
-
-class FloodToggleControl {
-  onAdd(map) {
-    this._map = map;
-    const container = document.createElement('div');
-    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.title = 'Show flood alerts (broadcast radius)';
-    button.setAttribute('aria-label', 'Show flood alerts');
-    button.setAttribute('aria-pressed', String(showFloods));
-    button.classList.toggle('toggle-active', showFloods);
-    button.innerHTML =
-      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 7c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M2 12c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M2 17c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/></svg>';
-    button.addEventListener('click', () => {
-      showFloods = !showFloods;
-      localStorage.setItem(FLOOD_STORAGE_KEY, showFloods ? 'on' : 'off');
-      button.classList.toggle('toggle-active', showFloods);
-      button.setAttribute('aria-pressed', String(showFloods));
-      renderFloods();
-      refreshFloods();
-      showToast(showFloods ? 'Showing flood alerts' : 'Hiding flood alerts');
-    });
-    container.appendChild(button);
-    this._container = container;
-    return container;
-  }
-  onRemove() {
-    if (this._container) this._container.remove();
-    this._container = undefined;
-    this._map = undefined;
+    forecastControlButton = null;
   }
 }
 
@@ -694,39 +651,6 @@ class TrafficToggleControl {
     if (this._container) this._container.remove();
     this._container = undefined;
     this._map = undefined;
-  }
-}
-
-class ForecastToggleControl {
-  onAdd(map) {
-    this._map = map;
-    const container = document.createElement('div');
-    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.innerHTML =
-      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g transform="translate(-0.5 3.75) scale(0.6)"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></g><g transform="translate(10.45 3.75) scale(0.6)"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></g></svg>';
-    button.addEventListener('click', () => {
-      showForecast = !showForecast;
-      localStorage.setItem(FORECAST_STORAGE_KEY, showForecast ? 'on' : 'off');
-      button.classList.toggle('toggle-active', showForecast);
-      button.setAttribute('aria-pressed', String(showForecast));
-      setForecastOverlay(showForecast);
-      showToast(showForecast ? 'Showing 2-hour + 24-hour forecast' : 'Hiding forecast');
-    });
-    this._button = button;
-    forecastControlButton = button;
-    container.appendChild(button);
-    this._container = container;
-    updateForecastButton();
-    return container;
-  }
-  onRemove() {
-    if (this._container) this._container.remove();
-    this._container = undefined;
-    this._map = undefined;
-    forecastControlButton = null;
   }
 }
 
@@ -879,18 +803,6 @@ function initMap() {
   updateAqiAttribution(showAqi);
   updateAqiLegend(showAqi);
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
-  map.addControl(new RangeToggleControl(), 'bottom-right');
-  map.addControl(new ClipToggleControl(), 'bottom-right');
-  map.addControl(new WindToggleControl(), 'bottom-right');
-  map.addControl(new TempToggleControl(), 'bottom-right');
-  map.addControl(new LightningToggleControl(), 'bottom-right');
-  map.addControl(new FloodToggleControl(), 'bottom-right');
-  map.addControl(new TrafficToggleControl(), 'bottom-right');
-  if (import.meta.env.VITE_AQI_UI === '1') {
-    map.addControl(new AqiToggleControl(), 'bottom-right');
-  }
-  map.addControl(new NowcastToggleControl(), 'bottom-right');
-  map.addControl(new ForecastToggleControl(), 'bottom-right');
   const geolocateControl = new maplibregl.GeolocateControl({
     positionOptions: { enableHighAccuracy: true },
     trackUserLocation: true,
@@ -922,6 +834,13 @@ function initMap() {
     updateRainSummary({ force: true });
   });
   map.addControl(geolocateControl, 'bottom-right');
+  map.addControl(new RangeToggleControl(), 'bottom-right');
+  map.addControl(new OverlayToggleControl(), 'bottom-right');
+  map.addControl(new TrafficToggleControl(), 'bottom-right');
+  if (import.meta.env.VITE_AQI_UI === '1') {
+    map.addControl(new AqiToggleControl(), 'bottom-right');
+  }
+  map.addControl(new NowcastForecastToggleControl(), 'bottom-right');
   map.addControl(panelControl('.masthead'), 'top-left');
   map.addControl(panelControl('.console'), 'bottom-left');
   map.addControl(panelControl('.settings-btn'), 'top-right');
