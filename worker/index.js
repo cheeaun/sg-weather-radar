@@ -14,6 +14,8 @@ const ALLOWED_PREFIXES = [
   '/wind-direction',
   '/air-temperature',
   '/relative-humidity',
+  '/two-hr-forecast',
+  '/twenty-four-hr-forecast',
 ];
 
 // LTA traffic cameras via data.gov.sg v1 (keyless; LTA's own DataMall API now

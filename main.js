@@ -12,6 +12,13 @@ import SINGAPORE_AREAS from './areas-idx.json';
 // scripts/build-rain-data.mjs from the planning-area source. Flat array of
 // delta-encoded [pixelDelta, areaIdx] pairs; each areaIdx indexes SINGAPORE_AREAS.
 import SG_RAIN_PIXELS from './rain-pixels.json';
+// MSS condition art + forecast text/code mappings (see forecast-assets/).
+import FORECAST_MAP from './forecast-assets/mappings.json';
+const forecastIconFiles = import.meta.glob('./forecast-assets/icons/*.png', {
+  eager: true,
+  query: '?url',
+  import: 'default',
+});
 
 maplibregl.setWorkerUrl(workerUrl);
 const API_BASE = '/api';
@@ -49,6 +56,7 @@ const AQI_STORAGE_KEY = 'sgwr-aqi';
 const TEMP_STORAGE_KEY = 'sgwr-temp';
 const SMOOTH_STORAGE_KEY = 'sgwr-smooth';
 const TRAFFIC_STORAGE_KEY = 'sgwr-traffic';
+const FORECAST_STORAGE_KEY = 'sgwr-forecast';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -108,6 +116,7 @@ let showTraffic =
       localStorage.getItem('sgwr-incidents') === 'on'));
 localStorage.removeItem('sgwr-cams');
 localStorage.removeItem('sgwr-incidents');
+let showForecast = localStorage.getItem(FORECAST_STORAGE_KEY) === 'on';
 const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
 const BASE_ATTRIBUTION =
   'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
@@ -688,6 +697,39 @@ class TrafficToggleControl {
   }
 }
 
+class ForecastToggleControl {
+  onAdd(map) {
+    this._map = map;
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toggle-btn';
+    button.innerHTML =
+      '<svg class="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g transform="translate(-0.5 3.75) scale(0.6)"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></g><g transform="translate(10.45 3.75) scale(0.6)"><path d="M3.5 18.5 9 13l3.5 3.5L20 9"/><path d="M15.5 9H20v4.5"/></g></svg>';
+    button.addEventListener('click', () => {
+      showForecast = !showForecast;
+      localStorage.setItem(FORECAST_STORAGE_KEY, showForecast ? 'on' : 'off');
+      button.classList.toggle('toggle-active', showForecast);
+      button.setAttribute('aria-pressed', String(showForecast));
+      setForecastOverlay(showForecast);
+      showToast(showForecast ? 'Showing 2-hour + 24-hour forecast' : 'Hiding forecast');
+    });
+    this._button = button;
+    forecastControlButton = button;
+    container.appendChild(button);
+    this._container = container;
+    updateForecastButton();
+    return container;
+  }
+  onRemove() {
+    if (this._container) this._container.remove();
+    this._container = undefined;
+    this._map = undefined;
+    forecastControlButton = null;
+  }
+}
+
 function resolvedTheme() {
   if (themePreference === 'system') return darkModeQuery.matches ? 'dark' : 'light';
   return themePreference;
@@ -848,6 +890,7 @@ function initMap() {
     map.addControl(new AqiToggleControl(), 'bottom-right');
   }
   map.addControl(new NowcastToggleControl(), 'bottom-right');
+  map.addControl(new ForecastToggleControl(), 'bottom-right');
   const geolocateControl = new maplibregl.GeolocateControl({
     positionOptions: { enableHighAccuracy: true },
     trackUserLocation: true,
@@ -892,6 +935,10 @@ function initMap() {
     if (showTraffic) {
       refreshCameras();
       refreshIncidents();
+    }
+    if (showForecast) {
+      refreshForecast();
+      startForecastPoll();
     }
   });
   map.on('move', windInvalidateScreen);
@@ -2301,6 +2348,306 @@ function renderTemp() {
         .setLngLat([s.lng, s.lat])
         .addTo(map),
     );
+  }
+}
+
+// 2-hour + 24-hour forecast (data.gov.sg, one toggle): one icon per 2-hr area
+// plus one horizontal all-periods strip per 24-hr region. Display-only.
+const forecastIconByFile = {};
+for (const [path, url] of Object.entries(forecastIconFiles)) {
+  forecastIconByFile[path.split('/').pop()] = url;
+}
+function forecastIconUrl(rel) {
+  return forecastIconByFile[(rel || '').split('/').pop()] || forecastIconByFile['cloudy.png'];
+}
+function forecastIconForText(text) {
+  return forecastIconUrl(FORECAST_MAP.twoHrText[text] || FORECAST_MAP.fallback);
+}
+function forecastIconForCode(code) {
+  return forecastIconUrl(FORECAST_MAP.codes[code] || FORECAST_MAP.fallback);
+}
+// 24-hr regions are coarse; anchors are MSS's own icon positions on their
+// 24-hr page map (detected on rain-lighting_map_988.jpg, georeferenced via
+// the town-boundary overlay) — not planning-area centers.
+const FORECAST_REGION_ANCHORS = {
+  north: [103.816, 1.44],
+  south: [103.816, 1.282],
+  east: [103.965, 1.353],
+  west: [103.678, 1.352],
+  central: [103.816, 1.352],
+};
+const FORECAST_CACHE_MS = 30 * 60 * 1000;
+let twoHrData = null;
+let twentyFourHrData = null;
+let forecastLoading = null;
+let forecastControlButton = null;
+const forecastMarkers = [];
+
+function shortHour(iso) {
+  const parts = timeFormatter.formatToParts(new Date(iso));
+  const hour = parts.find((p) => p.type === 'hour').value;
+  const dp = parts.find((p) => p.type === 'dayPeriod');
+  return `${hour}${dp ? dp.value[0].toLowerCase() : ''}`;
+}
+
+// Midday reads cleaner without the p: 6a-12, 12-6p, 6p-6a.
+function shortRangeLabel(startIso, endIso) {
+  const trim = (iso) => shortHour(iso).replace('12p', '12');
+  return `${trim(startIso)}-${trim(endIso)}`;
+}
+
+function updateForecastButton() {
+  if (!forecastControlButton) return;
+  const bits = [];
+  const valid2 = twoHrData?.items?.[0]?.valid_period?.text;
+  if (valid2) bits.push(`2-hr valid ${valid2}`);
+  const valid24 = twentyFourHrData?.records?.[0]?.general?.validPeriod?.text;
+  if (valid24) bits.push(`24-hr valid ${valid24}`);
+  const label = 'Show 2-hour + 24-hour forecast';
+  forecastControlButton.title = bits.length ? bits.join(' · ') : label;
+  forecastControlButton.setAttribute('aria-label', label);
+  forecastControlButton.setAttribute('aria-pressed', String(showForecast));
+  forecastControlButton.classList.toggle('toggle-active', showForecast);
+}
+
+function clearForecastMarkers() {
+  for (const m of forecastMarkers) m.remove();
+  forecastMarkers.length = 0;
+}
+
+function forecastAreaEl(name, text, validSuffix) {
+  const wrap = document.createElement('div');
+  wrap.className = 'forecast-area';
+  wrap.title = text ? `${name}: ${text}${validSuffix}` : name;
+  const img = document.createElement('img');
+  img.src = forecastIconForText(text);
+  img.alt = text || name;
+  img.draggable = false;
+  wrap.appendChild(img);
+  return wrap;
+}
+
+function forecastStripEl(regionName, periods, regionKey) {
+  const wrap = document.createElement('div');
+  wrap.className = 'forecast-strip';
+  wrap.title = `${regionName} 24-hour outlook`;
+  const plate = document.createElement('div');
+  plate.className = 'forecast-plate';
+  const cells = document.createElement('div');
+  cells.className = 'forecast-cells';
+  const connector = () => {
+    const conn = document.createElement('i');
+    conn.className = 'forecast-connector';
+    conn.setAttribute('aria-hidden', 'true');
+    return conn;
+  };
+  const addCell = (iconUrl, label, title) => {
+    const cell = document.createElement('div');
+    cell.className = 'forecast-cell';
+    cell.title = title;
+    const img = document.createElement('img');
+    img.src = iconUrl;
+    img.alt = title;
+    img.draggable = false;
+    const row = document.createElement('div');
+    row.className = 'forecast-label-row';
+    row.appendChild(connector());
+    const lab = document.createElement('span');
+    lab.textContent = label;
+    row.appendChild(lab);
+    row.appendChild(connector());
+    cell.appendChild(img);
+    cell.appendChild(row);
+    cells.appendChild(cell);
+  };
+  const present = [];
+  for (const p of periods) {
+    const r = p.regions?.[regionKey];
+    if (r) present.push({ p, r });
+  }
+  // Connected slots share a boundary (6a-12, 12-6p), so only the last cell
+  // repeats it: earlier cells show just their start.
+  present.forEach(({ p, r }, i) => {
+    const label =
+      i < present.length - 1
+        ? shortHour(p.timePeriod.start).replace('12p', '12')
+        : shortRangeLabel(p.timePeriod.start, p.timePeriod.end);
+    addCell(forecastIconForCode(r.code), label, `${regionName} ${p.timePeriod.text}: ${r.text}`);
+  });
+  plate.appendChild(cells);
+  wrap.appendChild(plate);
+  return wrap;
+}
+
+async function loadForecastData(fetchFn) {
+  const twoHrUrl = apiURL('/two-hr-forecast');
+  const twentyFourHrUrl = apiURL('/twenty-four-hr-forecast');
+  const [twoHrJson, twentyFourHrJson] = await Promise.all([
+    fetchFn(twoHrUrl),
+    fetchFn(twentyFourHrUrl),
+  ]);
+  assertApiOk(twoHrJson, twoHrUrl);
+  assertApiOk(twentyFourHrJson, twentyFourHrUrl);
+  return { twoHr: twoHrJson.data, twentyFourHr: twentyFourHrJson.data };
+}
+
+async function refreshForecast({ force = false } = {}) {
+  if (!showForecast) return null;
+  if (forecastLoading) return forecastLoading;
+  forecastLoading = loadForecastData((url) =>
+    apiFetch(url, { maxAgeMs: force ? 0 : FORECAST_CACHE_MS }),
+  )
+    .then(({ twoHr, twentyFourHr }) => {
+      twoHrData = twoHr;
+      twentyFourHrData = twentyFourHr;
+      renderForecast();
+    })
+    .catch((e) => {
+      console.error('Forecast fetch error:', e);
+      if (showForecast) showToast('Forecast data unavailable');
+    })
+    .finally(() => {
+      forecastLoading = null;
+    });
+  return forecastLoading;
+}
+
+function setForecastOverlay(on) {
+  if (on) {
+    refreshForecast();
+    startForecastPoll();
+  } else {
+    stopForecastPoll();
+    renderForecast();
+  }
+}
+
+// 2-hr issues land on the hour (:30 timestamps) and the 24-hr 3x daily; a
+// 30-min cadence catches each new issue within ~30 min without hammering the
+// feed. Paused while the tab is hidden (same as radar polling).
+const FORECAST_POLL_MS = 30 * 60 * 1000;
+let forecastPollTimer = null;
+function startForecastPoll() {
+  stopForecastPoll();
+  forecastPollTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshForecast({ force: true });
+  }, FORECAST_POLL_MS);
+}
+function stopForecastPoll() {
+  if (forecastPollTimer) clearInterval(forecastPollTimer);
+  forecastPollTimer = null;
+}
+
+// Canonical MSS condition order (fair → clouds → rain → storms → haze/wind);
+// unknown labels sort last, alphabetically.
+const FORECAST_COND_ORDER = [
+  'Fair (Day)',
+  'Fair (Night)',
+  'Fair & Warm',
+  'Partly Cloudy (Day)',
+  'Partly Cloudy (Night)',
+  'Cloudy',
+  'Mist',
+  'Slightly Hazy',
+  'Hazy',
+  'Light Showers',
+  'Passing Showers',
+  'Showers',
+  'Light Rain',
+  'Moderate Rain',
+  'Heavy Showers',
+  'Heavy Rain',
+  'Thundery Showers',
+  'Heavy Thundery Showers',
+  'Heavy Thundery Showers with Gusty Winds',
+  'Windy',
+];
+function forecastCondRank(label) {
+  const i = FORECAST_COND_ORDER.indexOf(label);
+  return i === -1 ? FORECAST_COND_ORDER.length : i;
+}
+
+// Legend mirrors the AQI/temp pattern but is dynamic: it lists only the
+// distinct conditions currently rendered (2-hr areas + 24-hr strips), deduped.
+function updateForecastLegend() {
+  const el = document.getElementById('forecast-legend');
+  if (!el) return;
+  const conds = new Map(); // label -> iconUrl
+  if (showForecast) {
+    for (const fc of twoHrData?.items?.[0]?.forecasts || []) {
+      if (fc.forecast) conds.set(fc.forecast, forecastIconForText(fc.forecast));
+    }
+    for (const p of twentyFourHrData?.records?.[0]?.periods || []) {
+      for (const r of Object.values(p.regions || {})) {
+        if (r?.text) conds.set(r.text, forecastIconForCode(r.code));
+      }
+    }
+  }
+  el.replaceChildren();
+  if (!conds.size) {
+    el.hidden = true;
+    return;
+  }
+  const title = document.createElement('div');
+  title.className = 'aqi-title';
+  title.textContent = 'Forecast';
+  el.appendChild(title);
+  const grid = document.createElement('div');
+  grid.className = 'forecast-grid';
+  const labels = [...conds.keys()].sort(
+    (a, b) => forecastCondRank(a) - forecastCondRank(b) || a.localeCompare(b),
+  );
+  for (const label of labels) {
+    const row = document.createElement('div');
+    row.className = 'forecast-row';
+    const img = document.createElement('img');
+    img.src = conds.get(label);
+    img.alt = '';
+    img.draggable = false;
+    const span = document.createElement('span');
+    span.textContent = label;
+    row.appendChild(img);
+    row.appendChild(span);
+    grid.appendChild(row);
+  }
+  el.appendChild(grid);
+  el.hidden = false;
+}
+
+function renderForecast() {
+  clearForecastMarkers();
+  updateForecastButton();
+  updateForecastLegend();
+  if (!map || !showForecast) return;
+  const item = twoHrData?.items?.[0];
+  if (item) {
+    const byArea = new Map((item.forecasts || []).map((fc) => [fc.area, fc.forecast]));
+    const valid = item.valid_period?.text ? ` · valid ${item.valid_period.text}` : '';
+    for (const area of twoHrData.area_metadata || []) {
+      const loc = area.label_location;
+      if (!loc) continue;
+      const text = byArea.get(area.name) || '';
+      forecastMarkers.push(
+        new maplibregl.Marker({ element: forecastAreaEl(area.name, text, valid), anchor: 'center' })
+          .setLngLat([loc.longitude, loc.latitude])
+          .addTo(map),
+      );
+    }
+  }
+  const rec = twentyFourHrData?.records?.[0];
+  if (rec) {
+    const periods = rec.periods || [];
+    for (const [key, anchor] of Object.entries(FORECAST_REGION_ANCHORS)) {
+      forecastMarkers.push(
+        new maplibregl.Marker({
+          element: forecastStripEl(key[0].toUpperCase() + key.slice(1), periods, key),
+          anchor: 'center',
+        })
+          .setLngLat(anchor)
+          .addTo(map),
+      );
+    }
   }
 }
 
@@ -7508,6 +7855,7 @@ function refreshAfterWake() {
   if (Date.now() - lastFetchStart > 60 * 1000) fetchRadarBusy = false;
   if (showWind || showNowcast || showTemp) loadWind({ forNowcast: showNowcast });
   if (showTemp) refreshTemp();
+  if (showForecast) refreshForecast();
   if (pollRanges.length) pollOnce();
   else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
 }
