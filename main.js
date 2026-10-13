@@ -62,6 +62,11 @@ const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
 const FETCH_RETRY_DELAY = 1000;
 const FETCH_TIMEOUT = 10 * 1000;
+// Per-tab budget inside a rolling 10s window (upstream resets every 10s, per key:
+// prod 30, dev 12). Default is the shared prod key's limit; dev keeps headroom under 12.
+const RATE_WINDOW_MS = 10 * 1000;
+const RATE_MAX = import.meta.env.DEV ? 10 : 25;
+const RATE_BLOCK_MS = RATE_WINDOW_MS + 500;
 const RADAR_BOUNDS = {
   480: {
     upperLeft: { longitude: 99.638609, latitude: 5.657912 },
@@ -959,6 +964,27 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const rateStamps = [];
+let rateBlockedUntil = 0;
+
+// Rolling-window gate for all API reads: caps bursts at RATE_MAX per 10s and
+// holds the tab for RATE_BLOCK_MS after any upstream 429.
+async function acquireRateSlot() {
+  for (;;) {
+    const now = Date.now();
+    while (rateStamps.length && now - rateStamps[0] >= RATE_WINDOW_MS) rateStamps.shift();
+    if (now < rateBlockedUntil) {
+      await delay(rateBlockedUntil - now + 5);
+      continue;
+    }
+    if (rateStamps.length < RATE_MAX) {
+      rateStamps.push(now);
+      return;
+    }
+    await delay(rateStamps[0] + RATE_WINDOW_MS - now + 5);
+  }
+}
+
 function assertApiOk(json, url) {
   if (!json || json.code !== 0) {
     throw new Error(`${json ? json.errorMsg || `code ${json.code}` : 'empty response'} [${url}]`);
@@ -986,10 +1012,18 @@ async function httpErrorMessage(res, url) {
 async function fetchWithRetry(url, cached) {
   for (let attempt = 1; ; attempt++) {
     let res;
+    // A 429 exhausts the upstream 10s window: block the tab and wait it out —
+    // a 1s retry would only land in the same window.
+    let waitMs = FETCH_RETRY_DELAY;
     try {
+      await acquireRateSlot();
       res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
       if (res.ok) return { data: await res.json(), fresh: true };
       if (res.status === 409 && cached) return { data: cached.data, fresh: false };
+      if (res.status === 429) {
+        rateBlockedUntil = Date.now() + RATE_BLOCK_MS;
+        waitMs = RATE_BLOCK_MS;
+      }
     } catch (e) {
       if (cached) return { data: cached.data, fresh: false };
       if (attempt > FETCH_RETRIES) throw new Error(`${e.message || 'fetch failed'} [${url}]`);
@@ -998,7 +1032,7 @@ async function fetchWithRetry(url, cached) {
     }
     if (cached) return { data: cached.data, fresh: false };
     if (attempt <= FETCH_RETRIES) {
-      await delay(FETCH_RETRY_DELAY);
+      await delay(waitMs);
       continue;
     }
     throw new Error(await httpErrorMessage(res, url));
