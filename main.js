@@ -7760,6 +7760,11 @@ timeSlider.addEventListener('keyup', () => {
 });
 timeSlider.addEventListener('pointermove', (e) => {
   if (allTimestamps.length < 2) return;
+  // Hover preview only. Thumb drags are owned by the native input/change
+  // path: this ratio maps over the full element width while the browser maps
+  // pointer to value over the shorter thumb travel, so the two disagree by
+  // one step in a band between timestamps and alternate commits flicker.
+  if (e.buttons) return;
   const rect = timeSlider.getBoundingClientRect();
   const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
   const index = Math.round(ratio * (allTimestamps.length - 1));
