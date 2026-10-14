@@ -400,7 +400,7 @@ class RangeToggleControl {
     const clipBtn = document.createElement('button');
     clipBtn.type = 'button';
     clipBtn.className = 'toggle-btn';
-    clipBtn.title = 'Clip intersecting radar at range boundaries';
+    clipBtn.dataset.tip = 'Clip radar';
     clipBtn.setAttribute('aria-label', 'Clip intersecting radar at range boundaries');
     clipBtn.setAttribute('aria-pressed', String(clipBoundaries));
     clipBtn.classList.toggle('toggle-active', clipBoundaries);
@@ -428,9 +428,11 @@ class RangeToggleControl {
   }
   _updateButton() {
     const state = RANGE_TOGGLE_STATES[this._index];
-    const label = RANGE_TOGGLE_LABELS[state];
-    this._button.title = label;
-    this._button.setAttribute('aria-label', `Fit map to ${label}`);
+    // Clicking advances to the next state, so the tip names the next fit.
+    const nextLabel =
+      RANGE_TOGGLE_LABELS[RANGE_TOGGLE_STATES[(this._index + 1) % RANGE_TOGGLE_STATES.length]];
+    this._button.dataset.tip = `Fit ${nextLabel}`;
+    this._button.setAttribute('aria-label', `Fit map to ${nextLabel}`);
     this._button.innerHTML = `<svg${state === 'sg' ? ' class="sg-icon"' : ''} viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><use href="#range-shape-${state}"/></svg>`;
   }
   _fitBounds() {
@@ -446,7 +448,7 @@ class OverlayToggleControl {
     const floodBtn = document.createElement('button');
     floodBtn.type = 'button';
     floodBtn.className = 'toggle-btn';
-    floodBtn.title = 'Show flood alerts (broadcast radius)';
+    floodBtn.dataset.tip = 'Floods';
     floodBtn.setAttribute('aria-label', 'Show flood alerts');
     floodBtn.setAttribute('aria-pressed', String(showFloods));
     floodBtn.classList.toggle('toggle-active', showFloods);
@@ -465,7 +467,7 @@ class OverlayToggleControl {
     const lightningBtn = document.createElement('button');
     lightningBtn.type = 'button';
     lightningBtn.className = 'toggle-btn';
-    lightningBtn.title = 'Show cloud-to-ground lightning';
+    lightningBtn.dataset.tip = 'Lightning';
     lightningBtn.setAttribute('aria-label', 'Show cloud-to-ground lightning');
     lightningBtn.setAttribute('aria-pressed', String(showLightning));
     lightningBtn.classList.toggle('toggle-active', showLightning);
@@ -486,7 +488,7 @@ class OverlayToggleControl {
     const windBtn = document.createElement('button');
     windBtn.type = 'button';
     windBtn.className = 'toggle-btn';
-    windBtn.title = 'Show wind flow';
+    windBtn.dataset.tip = 'Wind';
     windBtn.setAttribute('aria-label', 'Show wind flow');
     windBtn.setAttribute('aria-pressed', String(showWind));
     windBtn.classList.toggle('toggle-active', showWind);
@@ -504,7 +506,7 @@ class OverlayToggleControl {
     const tempBtn = document.createElement('button');
     tempBtn.type = 'button';
     tempBtn.className = 'toggle-btn';
-    tempBtn.title = 'Show temperature and feels-like';
+    tempBtn.dataset.tip = 'Temp';
     tempBtn.setAttribute('aria-label', 'Show temperature and feels-like');
     tempBtn.setAttribute('aria-pressed', String(showTemp));
     tempBtn.classList.toggle('toggle-active', showTemp);
@@ -577,10 +579,10 @@ class NowcastForecastToggleControl {
   }
   _updateNowcastButton() {
     const fit = modelFitPercent();
-    const fitText = fit == null ? 'model fit pending' : `model fit ${fit}% (rolling 1 h)`;
+    const fitText = fit == null ? 'model fit pending' : `model fit ${fit.model}% (rolling 1 h)`;
     const label = 'Show 15-minute nowcast (70 km)';
-    this._nowcastButton.title = `${fitText} · short-range rain estimate`;
-    this._nowcastButton.setAttribute('aria-label', label);
+    this._nowcastButton.dataset.tip = 'Nowcast (15m)';
+    this._nowcastButton.setAttribute('aria-label', `${label}, ${fitText}`);
     this._nowcastButton.setAttribute('aria-pressed', String(showNowcast));
     this._nowcastButton.classList.toggle('toggle-active', showNowcast);
   }
@@ -601,7 +603,7 @@ class AqiToggleControl {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'toggle-btn';
-    button.title = 'Show air quality (AQI)';
+    button.dataset.tip = 'AQI';
     button.setAttribute('aria-label', 'Show air quality');
     button.setAttribute('aria-pressed', String(showAqi));
     button.classList.toggle('toggle-active', showAqi);
@@ -634,7 +636,7 @@ class TrafficToggleControl {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'toggle-btn';
-    button.title = 'Show live traffic (cameras + incidents)';
+    button.dataset.tip = 'Traffic';
     button.setAttribute('aria-label', 'Show live traffic');
     button.setAttribute('aria-pressed', String(showTraffic));
     button.classList.toggle('toggle-active', showTraffic);
@@ -2357,8 +2359,11 @@ function updateForecastButton() {
   const valid24 = twentyFourHrData?.records?.[0]?.general?.validPeriod?.text;
   if (valid24) bits.push(`24-hr valid ${valid24}`);
   const label = 'Show 2-hour + 24-hour forecast';
-  forecastControlButton.title = bits.length ? bits.join(' · ') : label;
-  forecastControlButton.setAttribute('aria-label', label);
+  forecastControlButton.dataset.tip = 'Forecast (2h, 24h)';
+  forecastControlButton.setAttribute(
+    'aria-label',
+    bits.length ? `${label}, ${bits.join(', ')}` : label,
+  );
   forecastControlButton.setAttribute('aria-pressed', String(showForecast));
   forecastControlButton.classList.toggle('toggle-active', showForecast);
 }
@@ -7298,7 +7303,11 @@ function recomputeNowcast() {
           fit == null
             ? 'model fit pending'
             : `model fit ${fit.model}% vs ${fit.persistence}% no-motion (${fit.n} frame${fit.n === 1 ? '' : 's'}, rolling 1 h)`;
-        nowcastControlButton.title = `${fitText} · short-range rain estimate`;
+        nowcastControlButton.dataset.tip = 'Nowcast (15m)';
+        nowcastControlButton.setAttribute(
+          'aria-label',
+          `Show 15-minute nowcast (70 km), ${fitText}`,
+        );
       }
     })
     .catch((error) => {

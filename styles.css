@@ -308,6 +308,47 @@ body {
   width: 24px;
   height: 18px;
 }
+/* Custom hover tooltips for map control buttons (replaces native title). */
+.maplibregl-ctrl-group button[data-tip] {
+  position: relative;
+  overflow: visible;
+}
+.maplibregl-ctrl-group button[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  right: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%) translateX(4px);
+  background: var(--ink-strong);
+  color: var(--bg);
+  font:
+    600 12px/1.2 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  padding: 4px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1001;
+  transition:
+    opacity 0.12s ease,
+    transform 0.12s ease;
+}
+@media (hover: hover) {
+  .maplibregl-ctrl-group button[data-tip]:hover::after,
+  .maplibregl-ctrl-group button[data-tip]:focus-visible::after {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .maplibregl-ctrl-group button[data-tip]::after {
+    transition: none;
+  }
+}
 
 /* !important: maplibre-gl.css loads after this file and would keep z-index: 2. */
 .maplibregl-map .maplibregl-ctrl-top-left,
