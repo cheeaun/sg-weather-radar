@@ -891,6 +891,7 @@ function initMap() {
     raisePlaceLabels();
   });
   map.on('moveend', updateRainNearLinkLabelVisibility);
+  map.on('moveend', queueTickRainRange);
   map.on('zoom', () => {
     updateCamThumbScale();
     updateCamAgeVisibility();
@@ -1852,6 +1853,432 @@ function renderTicks(newSlots) {
   }
   computeTickMidpoints();
   positionEndpointLabels();
+  requestTickRain();
+}
+
+// Pixel rain chart behind the console: an SVG stacked-area wash from the radar
+// frame in view — 70 km pixels by default, handing off to 240/480 km as the
+// map zooms out past their boxes — lightest band on top and heaviest at the
+// bottom. Heights are a 70 km ratio (full height = rain over the whole frame)
+// with a floor: below 50% coverage the scale compresses so the tallest stack
+// still reaches half the panel. Catmull-Rom smoothing, plus a slow ripple that
+// runs stronger through low-rain slots. Unlike the text summary (SG planning areas only), the chart
+// covers sea and Johor too, so approaching weather outside Singapore still
+// registers.
+let tickRainReq = 0;
+let tickRainHists = null;
+let tickRainChart = null;
+let tickRainObserved = false;
+let tickRainLayoutQueued = false;
+let tickRainGeom = null;
+let tickRainRaf = 0;
+let tickRainMorph = null;
+// The ripple runs at 30 fps: a 5 s wave is identical at half rate, and it
+// halves the string churn, style invalidation, and repaints (plus battery).
+const TICK_RAIN_FRAME_MS = 33;
+let tickRainLastPaint = 0;
+// 70 km ratio with a floor: the tallest stack never drops below half the
+// panel (below 50% coverage the scale compresses to pin the peak at 50%).
+const TICK_RAIN_FRAME_PX = 480 * 480;
+const TICK_RAIN_MIN_HEIGHT = 0.5;
+function tickRainScalePeak(peak) {
+  if (!(peak > 0)) return 1;
+  const coverage = peak / TICK_RAIN_FRAME_PX;
+  return coverage < TICK_RAIN_MIN_HEIGHT ? peak / TICK_RAIN_MIN_HEIGHT : TICK_RAIN_FRAME_PX;
+}
+// Active radar range for the chart: the smallest range whose box fully
+// contains the visible map, so zooming out hands off 70 → 240 → 480 km.
+let tickRainRange = 70;
+let tickRainRangeTimer = 0;
+function tickRainRangeForView() {
+  try {
+    if (!map) return 70;
+    const b = map.getBounds();
+    const w = b.getWest();
+    const e = b.getEast();
+    const s = b.getSouth();
+    const n = b.getNorth();
+    for (const range of [70, 240, 480]) {
+      const bb = boundaryBoxes[range] || RADAR_BOUNDS[range];
+      if (!bb) continue;
+      if (
+        w >= bb.upperLeft.longitude &&
+        e <= bb.lowerRight.longitude &&
+        s >= bb.lowerRight.latitude &&
+        n <= bb.upperLeft.latitude
+      )
+        return range;
+    }
+  } catch {}
+  return 480;
+}
+function queueTickRainRange() {
+  clearTimeout(tickRainRangeTimer);
+  tickRainRangeTimer = setTimeout(() => {
+    if (tickRainRangeForView() !== tickRainRange) requestTickRain();
+  }, 300);
+}
+// Unclipped canvases: the display cache clears the inner range's box for
+// 240/480 km (boundary clipping), which would punch a hole in the histogram.
+const tickRainCanvasCache = new Map();
+const TICK_RAIN_CANVAS_MAX = 24;
+function tickRainCanvas(range, frame) {
+  if (frame.nowcast) return buildRadarCanvas(range, frame, false);
+  const key = `${range}:${frame.timestamp}`;
+  let promise = tickRainCanvasCache.get(key);
+  if (!promise) {
+    promise = buildRadarCanvas(range, frame, false).catch((e) => {
+      tickRainCanvasCache.delete(key);
+      throw e;
+    });
+    tickRainCanvasCache.set(key, promise);
+    while (tickRainCanvasCache.size > TICK_RAIN_CANVAS_MAX) {
+      tickRainCanvasCache.delete(tickRainCanvasCache.keys().next().value);
+    }
+  }
+  tickRainCanvasCache.delete(key);
+  tickRainCanvasCache.set(key, promise);
+  return promise;
+}
+// Band opacity lives in CSS (.tick-rain-chart path) so it can differ by theme.
+const tickRainMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) startTickRainLoop();
+});
+tickRainMotionQuery.addEventListener('change', () => {
+  if (tickRainMotionQuery.matches) {
+    stopTickRainLoop();
+    if (tickRainGeom) renderTickRainWaves(0.8);
+  } else startTickRainLoop();
+});
+let rainPaletteCache = null;
+const rainStopCache = new Map();
+function rainPalette() {
+  if (rainPaletteCache) return rainPaletteCache;
+  const colors = [];
+  for (const [, rgb] of radarScaleStops()) {
+    const last = colors[colors.length - 1];
+    if (!last || last.rgb[0] !== rgb[0] || last.rgb[1] !== rgb[1] || last.rgb[2] !== rgb[2])
+      colors.push({ rgb, css: `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})` });
+  }
+  rainPaletteCache = colors;
+  return colors;
+}
+function rainStopForColor(r, g, b) {
+  const key = (r << 16) | (g << 8) | b;
+  const hit = rainStopCache.get(key);
+  if (hit !== undefined) return hit;
+  let s = -1;
+  // Same saturation gate as rainLevelForColor: background stays out.
+  if (Math.max(r, g, b) - Math.min(r, g, b) >= 40) {
+    const pal = rainPalette();
+    let best = Infinity;
+    for (let i = 0; i < pal.length; i++) {
+      const c = pal[i].rgb;
+      const d = (r - c[0]) ** 2 + (g - c[1]) ** 2 + (b - c[2]) ** 2;
+      if (d < best) {
+        best = d;
+        s = i;
+      }
+    }
+  }
+  if (rainStopCache.size > 8192) rainStopCache.clear();
+  rainStopCache.set(key, s);
+  return s;
+}
+function requestTickRain() {
+  tickRainRange = tickRainRangeForView();
+  ensureTickRainChart();
+  // The old wash keeps rippling until the recompute lands and morphs over.
+  paintTickRain(++tickRainReq).catch(() => {});
+}
+function ensureTickRainChart() {
+  if (tickRainChart?.isConnected) return tickRainChart;
+  const panel = document.querySelector('.panel.console');
+  if (!panel) return null;
+  tickRainChart = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  tickRainChart.setAttribute('class', 'tick-rain-chart');
+  tickRainChart.setAttribute('aria-hidden', 'true');
+  tickRainChart.setAttribute('preserveAspectRatio', 'none');
+  panel.prepend(tickRainChart);
+  if (!tickRainObserved) {
+    tickRainObserved = true;
+    new ResizeObserver(queueTickRainLayout).observe(panel);
+  }
+  return tickRainChart;
+}
+function queueTickRainLayout() {
+  if (tickRainLayoutQueued) return;
+  tickRainLayoutQueued = true;
+  requestAnimationFrame(() => {
+    tickRainLayoutQueued = false;
+    layoutTickRain();
+  });
+}
+const tickRainPt = (v) => Math.round(v * 10) / 10;
+// Catmull-Rom spline through points as an open SVG path (no leading M).
+function tickRainSegs(pts) {
+  let d = '';
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    d += `C${tickRainPt(p1[0] + (p2[0] - p0[0]) / 6)},${tickRainPt(p1[1] + (p2[1] - p0[1]) / 6)} ${tickRainPt(p2[0] - (p3[0] - p1[0]) / 6)},${tickRainPt(p2[1] - (p3[1] - p1[1]) / 6)} ${tickRainPt(p2[0])},${tickRainPt(p2[1])}`;
+  }
+  return d;
+}
+function startTickRainLoop() {
+  if (tickRainMotionQuery.matches || tickRainRaf || !tickRainGeom) return;
+  tickRainRaf = requestAnimationFrame(tickRainFrame);
+}
+function stopTickRainLoop() {
+  if (tickRainRaf) cancelAnimationFrame(tickRainRaf);
+  tickRainRaf = 0;
+}
+function tickRainFrame(now) {
+  tickRainRaf = 0;
+  const g = tickRainGeom;
+  if (document.hidden || tickRainMotionQuery.matches || !g) {
+    tickRainMorph = null;
+    return;
+  }
+  if (now - tickRainLastPaint < TICK_RAIN_FRAME_MS) {
+    tickRainRaf = requestAnimationFrame(tickRainFrame);
+    return;
+  }
+  tickRainLastPaint = now;
+  const M = tickRainMorph;
+  if (M) {
+    const e = easeInOutCubic(Math.min(1, (now - M.start) / M.dur));
+    M.targets.forEach((T, li) => {
+      const L = g.layers[li];
+      for (let i = 0; i < L.tops.length; i++) {
+        L.tops[i] = M.fromTops[li][i] + (T.tops[i] - M.fromTops[li][i]) * e;
+        L.bots[i] = M.fromBots[li][i] + (T.bots[i] - M.fromBots[li][i]) * e;
+      }
+    });
+    for (let i = 0; i < g.amps.length; i++)
+      g.amps[i] = M.fromAmps[i] + (M.toAmps[i] - M.fromAmps[i]) * e;
+    if (e >= 1) {
+      M.targets.forEach((T, li) => {
+        g.layers[li].tops = T.tops.slice();
+        g.layers[li].bots = T.bots.slice();
+      });
+      g.amps = M.toAmps.slice();
+      tickRainMorph = null;
+    }
+  }
+  renderTickRainWaves(now / 1000);
+  tickRainRaf = requestAnimationFrame(tickRainFrame);
+}
+const easeInOutCubic = (t) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
+// Cumulative band edges for one palette stop across slots; heavier stops
+// pile below. peak <= 0 maps everything flat to the panel bottom.
+function stackBand(hists, peak, s, m, H) {
+  const n = hists.length;
+  const tops = new Array(n);
+  const bots = new Array(n);
+  const p = peak || 1;
+  for (let i = 0; i < n; i++) {
+    const counts = hists[i];
+    let heavier = 0;
+    if (counts) for (let t = s + 1; t < m; t++) heavier += counts[t];
+    const withThis = heavier + (counts ? counts[s] : 0);
+    bots[i] = H - (heavier / p) * H;
+    tops[i] = H - (withThis / p) * H;
+  }
+  return { tops, bots };
+}
+// Morph stacks to new histograms instead of swapping: bands grow/shrink in
+// place over ~700 ms while the ripple keeps running. Layers always cover all
+// stops (empty bands are zero-height and invisible), so any old wash is a
+// valid morph source, including mid-morph restarts when zooming fast.
+function morphTickRainTo(newHists) {
+  tickRainHists = newHists;
+  const g = tickRainGeom;
+  const chart = tickRainChart?.isConnected ? tickRainChart : null;
+  const n = allTimestamps.length;
+  const m = rainPalette().length;
+  if (!g || !chart || g.n !== n || !g.layers.length || tickRainMotionQuery.matches) {
+    layoutTickRain();
+    return;
+  }
+  const H = g.H;
+  let newPeak = 0;
+  const newTotals = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const counts = newHists[i];
+    if (!counts) continue;
+    let total = 0;
+    for (let s = 0; s < m; s++) total += counts[s];
+    newTotals[i] = total;
+    if (total > newPeak) newPeak = total;
+  }
+  const p1 = tickRainScalePeak(newPeak);
+  const ext = (arr) => [arr[0], ...arr, arr[arr.length - 1]];
+  const targets = g.layers.map((L) => {
+    const { tops, bots } = stackBand(newHists, p1, L.s, m, H);
+    return { tops: ext(tops), bots: ext(bots) };
+  });
+  const newAmps = newTotals.map((total) => (newPeak > 0 ? 1.2 + 2.6 * (1 - total / newPeak) : 0));
+  const toAmps = g.xs.map((_, i) => newAmps[Math.min(n - 1, Math.max(0, i - 1))] ?? 0);
+  tickRainMorph = {
+    fromTops: g.layers.map((L) => L.tops.slice()),
+    fromBots: g.layers.map((L) => L.bots.slice()),
+    fromAmps: g.amps.slice(),
+    targets,
+    toAmps,
+    start: performance.now(),
+    dur: 700,
+  };
+  startTickRainLoop();
+}
+// One ripple every ~110 px, 5 s period; each band drifts slightly out of phase.
+function renderTickRainWaves(t) {
+  const g = tickRainGeom;
+  const chart = tickRainChart?.isConnected ? tickRainChart : null;
+  if (!g || !chart || !g.xs.length) return;
+  const k = (Math.PI * 2) / 110;
+  const w = (Math.PI * 2) / 5;
+  g.layers.forEach((L, li) => {
+    const tp = [];
+    const bp = [];
+    for (let i = 0; i < g.xs.length; i++) {
+      const y = g.amps[i] * Math.sin(g.xs[i] * k + t * w + li * 0.35);
+      tp.push([g.xs[i], Math.min(g.H, Math.max(0, L.tops[i] + y))]);
+      bp.push([g.xs[i], Math.min(g.H, Math.max(0, L.bots[i] + y))]);
+    }
+    bp.reverse();
+    L.el.setAttribute(
+      'd',
+      `M${tickRainPt(tp[0][0])},${tickRainPt(tp[0][1])}${tickRainSegs(tp)}L${tickRainPt(bp[0][0])},${tickRainPt(bp[0][1])}${tickRainSegs(bp)}Z`,
+    );
+  });
+}
+function layoutTickRain() {
+  const chart = tickRainChart?.isConnected ? tickRainChart : ensureTickRainChart();
+  if (!chart || !tickRainHists) return;
+  tickRainMorph = null;
+  const cols = document.getElementById('slider-ticks').children;
+  const n = allTimestamps.length;
+  if (cols.length !== n || tickRainHists.length !== n) return;
+  const panel = document.querySelector('.panel.console');
+  if (!panel) return;
+  // Geometry from the overlay's own box (padding box = rendered pixels), so
+  // the viewBox maps 1:1 with no letterbox gaps at the panel edges.
+  const box = chart.getBoundingClientRect();
+  const W = box.width;
+  const H = box.height;
+  if (!(W > 0 && H > 0)) {
+    chart.replaceChildren();
+    return;
+  }
+  chart.setAttribute('viewBox', `0 0 ${tickRainPt(W)} ${tickRainPt(H)}`);
+  const palette = rainPalette();
+  const m = palette.length;
+  const totals = new Array(n).fill(0);
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const counts = tickRainHists[i];
+    if (!counts) continue;
+    let total = 0;
+    for (let s = 0; s < m; s++) total += counts[s];
+    totals[i] = total;
+    if (total > peak) peak = total;
+  }
+  // Slot centers across the panel; curves bleed to both edges.
+  const cx = [];
+  for (let i = 0; i < n; i++) {
+    const colRect = cols[i].getBoundingClientRect();
+    cx.push(colRect.left + colRect.width / 2 - box.left);
+  }
+  const xs = n ? [0, ...cx, W] : [];
+  // Ripple runs stronger through low-rain slots.
+  const amps = totals.map((total) => (peak > 0 ? 1.2 + 2.6 * (1 - total / peak) : 0));
+  // Heaviest band at the bottom. Every stop gets a layer (empty bands are
+  // zero-height and invisible) so any wash can morph into any other.
+  const scalePeak = tickRainScalePeak(peak);
+  const layers = [];
+  for (let s = m - 1; s >= 0; s--) {
+    const { tops, bots } = stackBand(tickRainHists, scalePeak, s, m, H);
+    layers.push({
+      s,
+      color: palette[s].css,
+      tops: n ? [tops[0], ...tops, tops[n - 1]] : [],
+      bots: n ? [bots[0], ...bots, bots[n - 1]] : [],
+    });
+  }
+  const ampEdge = (i) => amps[Math.min(n - 1, Math.max(0, i - 1))] ?? 0;
+  tickRainGeom = {
+    n,
+    W,
+    H,
+    xs,
+    amps: xs.map((_, i) => ampEdge(i)),
+    layers,
+  };
+  chart.replaceChildren();
+  for (const L of layers) {
+    const el = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    el.setAttribute('fill', L.color);
+    L.el = el;
+    chart.appendChild(el);
+  }
+  if (tickRainMotionQuery.matches) renderTickRainWaves(0.8);
+  else {
+    renderTickRainWaves(performance.now() / 1000);
+    startTickRainLoop();
+  }
+}
+async function paintTickRain(req) {
+  const container = document.getElementById('slider-ticks');
+  const cols = container.children;
+  const n = allTimestamps.length;
+  if (!cols.length || cols.length !== n) return;
+  const palette = rainPalette();
+  const m = palette.length;
+  if (!m) return;
+  const hists = new Array(n);
+  let okSlots = 0;
+  const range = tickRainRange;
+  for (let i = 0; i < n; i++) {
+    if (req !== tickRainReq) return;
+    const slotMs = new Date(allTimestamps[i]).getTime();
+    const frame = framesMap[range]?.get(slotMs);
+    if (!frame || failedImages.has(frame.url)) continue;
+    let canvas = null;
+    try {
+      canvas = await tickRainCanvas(range, frame);
+    } catch {
+      continue;
+    }
+    if (req !== tickRainReq) return;
+    let data = null;
+    try {
+      data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    } catch {
+      continue;
+    }
+    okSlots++;
+    const counts = new Uint32Array(m);
+    let total = 0;
+    for (let o = 0; o < data.length; o += 4) {
+      const s = rainStopForColor(data[o], data[o + 1], data[o + 2]);
+      if (s >= 0) {
+        counts[s]++;
+        total++;
+      }
+    }
+    if (total) hists[i] = counts;
+    if (i % 3 === 2) await yieldToUI();
+  }
+  if (req !== tickRainReq) return;
+  if (document.getElementById('slider-ticks').children.length !== n) return;
+  // Total read failure keeps the old wash; a clean read with no rain anywhere
+  // morphs down to flat.
+  if (okSlots === 0) return;
+  morphTickRainTo(hists);
 }
 
 function updateSlider(newSlots) {

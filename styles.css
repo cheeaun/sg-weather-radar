@@ -1476,6 +1476,7 @@ body.cam-enhance-on .camera-tile img {
 }
 
 .scan {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
@@ -1483,6 +1484,8 @@ body.cam-enhance-on .camera-tile img {
   gap: 4px;
 }
 .scan-head {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1546,6 +1549,8 @@ scritto-text {
 }
 
 .rain-summary {
+  position: relative;
+  z-index: 1;
   display: block;
   height: 0;
   opacity: 0;
@@ -1569,6 +1574,8 @@ scritto-text {
 
 #time-slider {
   --slider-live-end: 100%;
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 22px;
   display: block;
@@ -1673,6 +1680,33 @@ scritto-text {
   align-items: center;
   justify-content: center;
   gap: 2px;
+}
+/* Full-panel pixel rain chart behind the console content: bars run from the
+panel's top padding down to the slider's top edge, heaviest color at the
+bottom. */
+.tick-rain-chart {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+/* Bands tile without overlap, so fill-opacity is the effective opacity over
+the panel. Higher on light, where the wash would otherwise sink into the
+pale panel. */
+.tick-rain-chart path {
+  fill-opacity: 0.4;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .tick-rain-chart path {
+    fill-opacity: 0.2;
+  }
+}
+:root[data-theme='dark'] .tick-rain-chart path {
+  fill-opacity: 0.2;
 }
 .tick-shape {
   display: flex;
