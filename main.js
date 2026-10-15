@@ -1857,9 +1857,10 @@ function renderTicks(newSlots) {
 }
 
 // Pixel rain chart behind the console: an SVG stacked-area wash from the radar
-// frame in view — 70 km pixels by default, handing off to 240/480 km as the
-// map zooms out past their boxes — lightest band on top and heaviest at the
-// bottom. Heights are a 70 km ratio (full height = rain over the whole frame)
+// frame in view — 70 km pixels by default, handing up to 240/480 km only once
+// ≥90% of their box is visible (panning a sliver across a boundary stays put),
+// back down when the viewport fits inside the smaller box, flat when panned
+// outside every box — lightest band on top and heaviest at the bottom. Heights are a 70 km ratio (full height = rain over the whole frame)
 // with a floor: below 50% coverage the scale compresses so the tallest stack
 // still reaches half the panel. Catmull-Rom smoothing, plus a slow ripple that
 // runs stronger through low-rain slots. Unlike the text summary (SG planning areas only), the chart
@@ -1886,10 +1887,43 @@ function tickRainScalePeak(peak) {
   const coverage = peak / TICK_RAIN_FRAME_PX;
   return coverage < TICK_RAIN_MIN_HEIGHT ? peak / TICK_RAIN_MIN_HEIGHT : TICK_RAIN_FRAME_PX;
 }
-// Active radar range for the chart: the smallest range whose box fully
-// contains the visible map, so zooming out hands off 70 → 240 → 480 km.
+// Active radar range for the chart (number|null; null = viewport outside all
+// boxes → flat chart). Switch up once ≥3 sides of a larger range's box are in
+// view, so panning a sliver of 240 km into frame doesn't switch away from 70;
+// switch back down only once the viewport fits fully inside the smaller box.
 let tickRainRange = 70;
 let tickRainRangeTimer = 0;
+// Switch up once this many of the larger range's four sides are in view, so a
+// mostly-visible 240 km box counts even panned with one edge off-screen.
+const TICK_RAIN_SIDES = 3;
+function tickRainBox(range) {
+  return boundaryBoxes[range] || RADAR_BOUNDS[range];
+}
+function tickRainBoxCovers(bb, w, e, s, n) {
+  return (
+    w >= bb.upperLeft.longitude &&
+    e <= bb.lowerRight.longitude &&
+    s >= bb.lowerRight.latitude &&
+    n <= bb.upperLeft.latitude
+  );
+}
+function tickRainBoxIntersects(bb, w, e, s, n) {
+  return (
+    w <= bb.lowerRight.longitude &&
+    e >= bb.upperLeft.longitude &&
+    s <= bb.upperLeft.latitude &&
+    n >= bb.lowerRight.latitude
+  );
+}
+// How many of the box's four sides are inside the viewport.
+function tickRainBoxSides(bb, w, e, s, n) {
+  let sides = 0;
+  if (bb.upperLeft.longitude >= w && bb.upperLeft.longitude <= e) sides++;
+  if (bb.lowerRight.longitude >= w && bb.lowerRight.longitude <= e) sides++;
+  if (bb.upperLeft.latitude >= s && bb.upperLeft.latitude <= n) sides++;
+  if (bb.lowerRight.latitude >= s && bb.lowerRight.latitude <= n) sides++;
+  return sides;
+}
 function tickRainRangeForView() {
   try {
     if (!map) return 70;
@@ -1898,20 +1932,61 @@ function tickRainRangeForView() {
     const e = b.getEast();
     const s = b.getSouth();
     const n = b.getNorth();
-    for (const range of [70, 240, 480]) {
-      const bb = boundaryBoxes[range] || RADAR_BOUNDS[range];
+    const boxes = [70, 240, 480].map((range) => [range, tickRainBox(range)]);
+    if (!boxes.some(([, bb]) => bb && tickRainBoxIntersects(bb, w, e, s, n))) return null;
+    // Switch up to the largest range with ≥3 sides in view.
+    let up = null;
+    for (const [range, bb] of boxes) {
       if (!bb) continue;
-      if (
-        w >= bb.upperLeft.longitude &&
-        e <= bb.lowerRight.longitude &&
-        s >= bb.lowerRight.latitude &&
-        n <= bb.upperLeft.latitude
-      )
-        return range;
+      if (tickRainBoxSides(bb, w, e, s, n) >= TICK_RAIN_SIDES) up = range;
     }
-  } catch {}
-  return 480;
+    if (up !== null && (tickRainRange === null || up > tickRainRange)) return up;
+    // Panned clean off the current range (or no range yet): reseed from the
+    // viewport center, falling back to the smallest intersecting box.
+    const order = [70, 240, 480];
+    const curBox = tickRainRange === null ? null : tickRainBox(tickRainRange);
+    if (!curBox || !tickRainBoxIntersects(curBox, w, e, s, n)) {
+      const cx = (w + e) / 2;
+      const cy = (s + n) / 2;
+      for (const [range, bb] of boxes) {
+        if (
+          bb &&
+          cx >= bb.upperLeft.longitude &&
+          cx <= bb.lowerRight.longitude &&
+          cy >= bb.lowerRight.latitude &&
+          cy <= bb.upperLeft.latitude
+        )
+          return range;
+      }
+      for (const [range, bb] of boxes) {
+        if (bb && tickRainBoxIntersects(bb, w, e, s, n)) return range;
+      }
+      return tickRainRange;
+    }
+    // Otherwise cascade down while the viewport fits fully inside a smaller box.
+    let i = order.indexOf(tickRainRange);
+    while (i > 0) {
+      const bb = tickRainBox(order[i - 1]);
+      if (bb && tickRainBoxCovers(bb, w, e, s, n)) i--;
+      else break;
+    }
+    return order[i];
+  } catch {
+    return tickRainRange;
+  }
 }
+// Console diagnostic (like nowcastScores()): active chart range, map zoom,
+// slot coverage. Useful when tuning the range thresholds above.
+window.tickRainStatus = () => {
+  return {
+    range: tickRainRange,
+    zoom: map ? Math.round(map.getZoom() * 10) / 10 : null,
+    slots: allTimestamps.length,
+    layers: tickRainChart?.isConnected
+      ? document.querySelectorAll('.tick-rain-chart path').length
+      : 0,
+  };
+};
 function queueTickRainRange() {
   clearTimeout(tickRainRangeTimer);
   tickRainRangeTimer = setTimeout(() => {
@@ -2240,8 +2315,15 @@ async function paintTickRain(req) {
   const m = palette.length;
   if (!m) return;
   const hists = new Array(n);
-  let okSlots = 0;
   const range = tickRainRange;
+  if (!range) {
+    if (req !== tickRainReq) return;
+    if (document.getElementById('slider-ticks').children.length !== n) return;
+    // Outside every range box: morph down to flat.
+    morphTickRainTo(new Array(n));
+    return;
+  }
+  let okSlots = 0;
   for (let i = 0; i < n; i++) {
     if (req !== tickRainReq) return;
     const slotMs = new Date(allTimestamps[i]).getTime();
@@ -2275,8 +2357,8 @@ async function paintTickRain(req) {
   }
   if (req !== tickRainReq) return;
   if (document.getElementById('slider-ticks').children.length !== n) return;
-  // Total read failure keeps the old wash; a clean read with no rain anywhere
-  // morphs down to flat.
+  // Total read failure keeps the old wash; a clean read (even all-clear)
+  // morphs to its result.
   if (okSlots === 0) return;
   morphTickRainTo(hists);
 }
