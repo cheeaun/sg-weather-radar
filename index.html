@@ -28,17 +28,50 @@
       aria-hidden="true"
     >
       <defs>
-        <path id="range-shape-70" d="M6 1.2 11 10.8H1Z" />
-        <path
-          id="range-shape-70-future"
-          d="M6 1.2 11 10.8H1Z"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.4"
-          stroke-linecap="round"
-        />
-        <rect id="range-shape-240" x="2.5" y="2.5" width="7" height="7" />
-        <rect id="range-shape-480" x="3" y="3" width="6" height="6" transform="rotate(45 6 6)" />
+        <!-- 70 km: dot-with-rings, hollow center (no dot — avoids confusion with map markers). Outer rings faded. -->
+        <g id="range-shape-70">
+          <circle cx="10" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle
+            cx="10"
+            cy="10"
+            r="5.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-opacity="0.2"
+          />
+          <circle
+            cx="10"
+            cy="10"
+            r="8.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-opacity="0.2"
+          />
+        </g>
+
+        <!-- 240 km: two solid rings, outer ring faded. -->
+        <g id="range-shape-240">
+          <circle cx="10" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle cx="10" cy="10" r="5.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle
+            cx="10"
+            cy="10"
+            r="8.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-opacity="0.2"
+          />
+        </g>
+
+        <!-- 480 km: three solid rings. -->
+        <g id="range-shape-480">
+          <circle cx="10" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle cx="10" cy="10" r="5.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle cx="10" cy="10" r="8.5" fill="none" stroke="currentColor" stroke-width="2" />
+        </g>
         <path
           id="range-shape-sg"
           d="M3 2.25H5.25V3H6.75V3.75H9V4.5H9.75V5.25H10.5V6H9V6.75H8.25V7.5H6V8.25H3V7.5H0.75V6.75H0V5.25H0.75V4.5H1.5V3H3ZM9 3.75V3H9.75V3.75ZM3 8.25V9H1.5V8.25ZM10.5 3H11.25V3.75H12V4.5H10.5ZM4.5 9H6V9.75H4.5Z"

@@ -885,6 +885,8 @@ body.cam-enhance-on .camera-tile img {
   background: var(--paper);
   -webkit-backdrop-filter: blur(5px);
   backdrop-filter: blur(5px);
+  /* Paper is translucent over the map: keep descendant blend modes inside the panel. */
+  isolation: isolate;
   border: 1px solid var(--line);
   border-radius: 12px;
   box-shadow: var(--shadow);
@@ -1572,118 +1574,94 @@ scritto-text {
   margin-bottom: 0;
 }
 
+/* The tick row is the slider. This input is hidden but stays focusable for
+   keyboard + AT; its focus ring draws on .slider-ticks via :has. */
 #time-slider {
-  --slider-live-end: 100%;
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  height: 22px;
-  display: block;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  pointer-events: none;
   appearance: none;
   -webkit-appearance: none;
   background: transparent;
-  cursor: pointer;
-  touch-action: none;
-}
-#time-slider::-webkit-slider-runnable-track {
-  height: 4px;
-  border-radius: 999px;
-  background: linear-gradient(
-    to right,
-    var(--live-data) 0 var(--slider-live-end),
-    var(--forecast) var(--slider-live-end) 100%
-  );
-}
-#time-slider::-moz-range-track {
-  height: 4px;
-  border-radius: 999px;
-  background: linear-gradient(
-    to right,
-    var(--live-data) 0 var(--slider-live-end),
-    var(--forecast) var(--slider-live-end) 100%
-  );
-}
-#time-slider::-moz-range-progress {
-  height: 4px;
-  border-radius: 999px;
-  background: transparent;
-}
-#time-slider::-webkit-slider-thumb {
-  width: 15px;
-  height: 15px;
-  margin-top: -5.5px;
-  appearance: none;
-  -webkit-appearance: none;
-  border: 3px solid var(--paper-solid);
-  border-radius: 50%;
-  background: var(--live-data);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--ink-strong) 35%, transparent),
-    0 2px 7px color-mix(in srgb, var(--ink-strong) 24%, transparent);
-  transition:
-    transform 0.15s ease,
-    box-shadow 0.15s ease;
-}
-#time-slider::-moz-range-thumb {
-  width: 9px;
-  height: 9px;
-  border: 3px solid var(--paper-solid);
-  border-radius: 50%;
-  background: var(--live-data);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--ink-strong) 35%, transparent),
-    0 2px 7px color-mix(in srgb, var(--ink-strong) 24%, transparent);
-  transition:
-    transform 0.15s ease,
-    box-shadow 0.15s ease;
-}
-#time-slider.forecast-active::-webkit-slider-thumb,
-#time-slider.forecast-active::-moz-range-thumb {
-  background: var(--forecast);
-}
-#time-slider:hover::-webkit-slider-thumb,
-#time-slider:focus-visible::-webkit-slider-thumb {
-  transform: scale(1.2);
-  box-shadow:
-    0 0 0 4px color-mix(in srgb, var(--ink-strong) 15%, transparent),
-    0 2px 7px color-mix(in srgb, var(--ink-strong) 24%, transparent);
-}
-#time-slider:hover::-moz-range-thumb,
-#time-slider:focus-visible::-moz-range-thumb {
-  transform: scale(1.2);
-  box-shadow:
-    0 0 0 4px color-mix(in srgb, var(--ink-strong) 15%, transparent),
-    0 2px 7px color-mix(in srgb, var(--ink-strong) 24%, transparent);
-}
-#time-slider:focus-visible {
-  outline: 2px solid var(--ink-strong);
-  outline-offset: 3px;
-  border-radius: 999px;
 }
 
 .slider-ticks {
   position: relative;
-  z-index: 1;
-  height: 40px;
+  /* No z-index: it would isolate the blended leaves from the rain chart.
+     Still above the chart by tree order (the chart is prepended first). */
+  height: 24px;
+  margin-top: 8px;
   cursor: pointer;
-  margin-bottom: -6px;
-  padding: 0 4px 8px;
+  padding-bottom: 8px;
   display: flex;
   justify-content: space-between;
+}
+.slider-ticks:has(+ #time-slider:focus-visible) {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 3px;
+  border-radius: 999px;
 }
 .slider-ticks:has(> .tick-col:only-child) {
   justify-content: center;
 }
 .tick-col {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 2px;
 }
+/* Sausage joining this tick to the next, stopping short of both icons. */
+.tick-col::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: calc(50% + 7px);
+  width: calc(var(--tick-step, 0px) - 14px);
+  height: 4px;
+  transform: translateY(-50%);
+  background: var(--seg, var(--line));
+  border-radius: 999px;
+  transition: opacity 0.25s ease;
+}
+.tick-col:last-child::after {
+  display: none;
+}
+/* Bars ahead of the current tick read as un-travelled track. */
+.tick-col.active::after,
+.tick-col.active ~ .tick-col::after {
+  opacity: 0.2;
+}
+/* Opaque thumb under the selected ring. The blend stays on the leaves, not
+   the row — a row-level multiply would erase white back into the backdrop. */
+.tick-col.active::before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .tick-col.active::before {
+    background: #000;
+  }
+}
+:root[data-theme='dark'] .tick-col.active::before {
+  background: #000;
+}
 /* Full-panel pixel rain chart behind the console content: bars run from the
-panel's top padding down to the slider's top edge, heaviest color at the
-bottom. */
+panel's top padding down to the timeline row, heaviest color at the bottom. */
 .tick-rain-chart {
   position: absolute;
   inset: 0;
@@ -1709,13 +1687,16 @@ pale panel. */
   fill-opacity: 0.2;
 }
 .tick-shape {
+  /* Positioned so it clears both the rain chart and the active disc. */
+  position: relative;
+  z-index: 1;
   display: flex;
   color: var(--muted);
   visibility: hidden;
 }
 .tick-shape svg {
-  width: 8px;
-  height: 8px;
+  width: 12px;
+  height: 12px;
   display: block;
 }
 .tick-shape.on {
@@ -1742,7 +1723,9 @@ pale panel. */
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+    /* Ends at none, not translateY(0): a filled transform would keep this
+       column a stacking context and trap its blend against the rain chart. */
+    transform: none;
   }
 }
 .tick-col.new {
@@ -1757,7 +1740,27 @@ pale panel. */
   font-weight: 500;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
-  margin-top: -3px;
+  cursor: pointer;
+  margin-top: -9px;
+}
+/* Ink picks up the rain bands (darkens on light, brightens on dark). Applied
+   per-leaf rather than to .slider-ticks, which would swallow the active disc. */
+.tick-shape,
+.tick-col::after,
+.scan-foot {
+  mix-blend-mode: multiply;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .tick-shape,
+  :root:not([data-theme]) .tick-col::after,
+  :root:not([data-theme]) .scan-foot {
+    mix-blend-mode: screen;
+  }
+}
+:root[data-theme='dark'] .tick-shape,
+:root[data-theme='dark'] .tick-col::after,
+:root[data-theme='dark'] .scan-foot {
+  mix-blend-mode: screen;
 }
 .scan-foot > :is(span, scritto-text) {
   position: absolute;

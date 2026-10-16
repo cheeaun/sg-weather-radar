@@ -155,9 +155,19 @@ function slotOf(iso) {
   return Math.floor(new Date(iso).getTime() / SLOT_MS) * SLOT_MS;
 }
 
-function rangeShapeSVG(range, future = false) {
-  const shape = future && range === 70 ? 'range-shape-70-future' : `range-shape-${range}`;
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><use href="#${shape}"/></svg>`;
+const TICK_RING_RADII = { 70: 2.5, 240: 5.5, 480: 8.5 };
+
+// Combined tick icon: always all three rings, but a range with no frame at this
+// slot fades to 20% instead of disappearing (matching the button glyphs).
+function tickShapeSVG(present, future70) {
+  let circles = '';
+  for (const range of TICK_RANGES) {
+    const has = present.includes(range);
+    const dash = has && range === 70 && future70 ? ' stroke-dasharray="4 4"' : '';
+    const fade = has ? '' : ' stroke-opacity="0.2"';
+    circles += `<circle cx="10" cy="10" r="${TICK_RING_RADII[range]}" fill="none" stroke="currentColor" stroke-width="2"${dash}${fade} />`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" aria-hidden="true">${circles}</svg>`;
 }
 
 function showError(msg) {
@@ -433,7 +443,7 @@ class RangeToggleControl {
       RANGE_TOGGLE_LABELS[RANGE_TOGGLE_STATES[(this._index + 1) % RANGE_TOGGLE_STATES.length]];
     this._button.dataset.tip = `Fit ${nextLabel}`;
     this._button.setAttribute('aria-label', `Fit map to ${nextLabel}`);
-    this._button.innerHTML = `<svg${state === 'sg' ? ' class="sg-icon"' : ''} viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><use href="#range-shape-${state}"/></svg>`;
+    this._button.innerHTML = `<svg${state === 'sg' ? ' class="sg-icon"' : ''} viewBox="${state === 'sg' ? '0 0 12 12' : '0 0 20 20'}" fill="currentColor" aria-hidden="true"><use href="#range-shape-${state}"/></svg>`;
   }
   _fitBounds() {
     fitToBounds(RANGE_TOGGLE_STATES[this._index]);
@@ -1779,7 +1789,8 @@ function scheduleNextRefresh() {
 let tickMidpoints = [];
 
 function computeTickMidpoints() {
-  const cols = document.getElementById('slider-ticks').children;
+  const container = document.getElementById('slider-ticks');
+  const cols = container.children;
   const rects = [];
   for (let i = 0; i < cols.length; i++) rects.push(cols[i].getBoundingClientRect());
   tickMidpoints = [];
@@ -1787,6 +1798,12 @@ function computeTickMidpoints() {
     tickMidpoints.push(
       (rects[i - 1].left + rects[i - 1].width / 2 + rects[i].left + rects[i].width / 2) / 2,
     );
+  }
+  if (rects.length > 1) {
+    const first = rects[0].left + rects[0].width / 2;
+    const last = rects[rects.length - 1].left + rects[rects.length - 1].width / 2;
+    // Bars run centre-to-centre; that step is a flex outcome CSS can't see, so measure it.
+    container.style.setProperty('--tick-step', `${(last - first) / (rects.length - 1)}px`);
   }
 }
 
@@ -1830,24 +1847,21 @@ function renderTicks(newSlots) {
     const col = document.createElement('div');
     col.className = 'tick-col';
     const slotMs = new Date(allTimestamps[i]).getTime();
-    for (const range of TICK_RANGES) {
-      const shape = document.createElement('span');
-      shape.className = 'tick-shape';
-      const future = range === 70 && slotMs > liveSlot70;
-      shape.innerHTML = rangeShapeSVG(range, future);
-      const frame = framesMap[range]?.get(slotMs);
-      // Tick = a scan exists at this slot. Image failures hide the map layer only;
-      // otherwise a burst of dead signed URLs blanks the whole timeline one by one.
-      if (frame) {
-        shape.classList.add('on');
-        if (future) {
-          shape.classList.add('nowcast');
-          if (nowcastCanvases.get(slotMs) && hasForecastRain(nowcastCanvases.get(slotMs)))
-            shape.classList.add('rain');
-        }
-      }
-      col.appendChild(shape);
+    col.style.setProperty('--seg', slotMs > Date.now() ? 'var(--forecast)' : 'var(--live-data)');
+    const present = TICK_RANGES.filter((range) => framesMap[range]?.get(slotMs));
+    const future70 = slotMs > liveSlot70;
+    const shape = document.createElement('span');
+    shape.className = 'tick-shape';
+    shape.innerHTML = tickShapeSVG(present, future70);
+    // Tick = a scan exists at this slot. Image failures hide the map layer only;
+    // otherwise a burst of dead signed URLs blanks the whole timeline one by one.
+    if (present.length) shape.classList.add('on');
+    if (present.includes(70) && future70) {
+      shape.classList.add('nowcast');
+      if (nowcastCanvases.get(slotMs) && hasForecastRain(nowcastCanvases.get(slotMs)))
+        shape.classList.add('rain');
     }
+    col.appendChild(shape);
     if (newSlots && newSlots.has(slotMs)) col.classList.add('new');
     container.appendChild(col);
   }
@@ -2398,24 +2412,13 @@ function updateSliderUI(index) {
 
   setRoll(document.getElementById('scan-time'), ts ? formatTime(ts) : '--:--');
   setRoll(document.getElementById('scan-date'), ts ? formatDate(ts) : '--');
-  updateSliderCutoff();
+  updateScanForecast();
 }
 
-function updateSliderCutoff() {
+function updateScanForecast() {
   const slider = document.getElementById('time-slider');
-  const minTime = allTimestamps.length ? new Date(allTimestamps[0]).getTime() : 0;
-  const maxTime = allTimestamps.length
-    ? new Date(allTimestamps[allTimestamps.length - 1]).getTime()
-    : 0;
-  const hasForecast = showNowcast && nowcastCanvases.size && maxTime > minTime;
-  const liveEnd = hasForecast
-    ? clamp(((Date.now() - minTime) / (maxTime - minTime)) * 100, 0, 100)
-    : 100;
-  slider.style.setProperty('--slider-live-end', `${liveEnd}%`);
-  const index = Number(slider.value) || 0;
-  const ts = allTimestamps[index];
+  const ts = allTimestamps[Number(slider.value) || 0];
   const forecast = Boolean(ts && new Date(ts).getTime() > Date.now());
-  slider.classList.toggle('forecast-active', forecast);
   document.getElementById('scan-time').classList.toggle('forecast', forecast);
 }
 
@@ -4691,26 +4694,18 @@ const SHAPE_VARIANTS = {
   dark: { ink: '#eef4f6', halo: 'rgba(5, 9, 11, 0.95)' },
 };
 
-function traceShape(ctx, range, cx, cy) {
-  ctx.beginPath();
-  switch (range) {
-    case 70:
-      ctx.moveTo(cx, cy - 5.4);
-      ctx.lineTo(cx + 5.5, cy + 5.4);
-      ctx.lineTo(cx - 5.5, cy + 5.4);
-      ctx.closePath();
-      break;
-    case 240:
-      ctx.rect(cx - 3.5, cy - 3.5, 7, 7);
-      break;
-    case 480:
-      ctx.moveTo(cx, cy - 4);
-      ctx.lineTo(cx + 4, cy);
-      ctx.lineTo(cx, cy + 4);
-      ctx.lineTo(cx - 4, cy);
-      ctx.closePath();
-      break;
-  }
+// Concentric rings matching the button glyphs; rings past the range fade to 20%.
+function traceShape(ctx, range, cx, cy, width) {
+  const solid = { 70: 1, 240: 2, 480: 3 }[range];
+  const s = SHAPE_SIZE / 20;
+  ctx.lineWidth = width;
+  [2.5, 5.5, 8.5].forEach((r, i) => {
+    ctx.globalAlpha = i < solid ? 1 : 0.2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * s, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
 }
 
 function renderShapeImage(range, variant) {
@@ -4725,18 +4720,15 @@ function renderShapeImage(range, variant) {
 
   ctx.save();
   ctx.strokeStyle = halo;
-  ctx.lineWidth = 2.5;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
   ctx.shadowColor = halo;
   ctx.shadowBlur = 2;
-  traceShape(ctx, range, cx, cy);
-  ctx.stroke();
+  traceShape(ctx, range, cx, cy, 2.5);
   ctx.restore();
 
-  traceShape(ctx, range, cx, cy);
-  ctx.fillStyle = ink;
-  ctx.fill();
+  ctx.strokeStyle = ink;
+  traceShape(ctx, range, cx, cy, 1.2);
 
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
@@ -6006,7 +5998,7 @@ async function loadWind({ forNowcast = false, forTemp = false } = {}) {
 window.addEventListener('resize', () => {
   computeTickMidpoints();
   positionEndpointLabels();
-  updateSliderCutoff();
+  updateScanForecast();
   if (!showWind) return;
   sizeWindCanvas();
   if (windMotionQuery.matches) renderWindStatic();
@@ -8238,19 +8230,22 @@ function tickIndexFromX(clientX) {
   return tickMidpoints.length;
 }
 const sliderTicks = document.getElementById('slider-ticks');
-sliderTicks.addEventListener('pointermove', (e) => {
+const scanFoot = document.querySelector('.scan-foot');
+// The time labels sit under the ticks; scrub them too so a tap never dead-ends.
+function scrubMove(e) {
   if (allTimestamps.length < 2) return;
   if (playbackTimer) setPlayback(false);
   scheduleCommit(tickIndexFromX(e.clientX));
-});
-sliderTicks.addEventListener('pointerdown', (e) => {
+}
+function scrubDown(e) {
   if (allTimestamps.length < 2) return;
   setPlayback(false);
   commitIndexNow(tickIndexFromX(e.clientX));
-});
-timeSlider.addEventListener('pointermove', () => {
-  if (playbackTimer) setPlayback(false);
-});
+}
+for (const el of [sliderTicks, scanFoot]) {
+  el.addEventListener('pointermove', scrubMove);
+  el.addEventListener('pointerdown', scrubDown);
+}
 timeSlider.addEventListener('input', (e) => {
   setPlayback(false);
   scheduleCommit(parseInt(e.target.value));
@@ -8259,25 +8254,9 @@ timeSlider.addEventListener('change', (e) => {
   setPlayback(false);
   commitIndexNow(parseInt(e.target.value));
 });
-timeSlider.addEventListener('pointerup', () => {
-  setPlayback(false);
-  commitIndexNow(parseInt(timeSlider.value));
-});
 timeSlider.addEventListener('keyup', () => {
   setPlayback(false);
   commitIndexNow(parseInt(timeSlider.value));
-});
-timeSlider.addEventListener('pointermove', (e) => {
-  if (allTimestamps.length < 2) return;
-  // Hover preview only. Thumb drags are owned by the native input/change
-  // path: this ratio maps over the full element width while the browser maps
-  // pointer to value over the shorter thumb travel, so the two disagree by
-  // one step in a band between timestamps and alternate commits flicker.
-  if (e.buttons) return;
-  const rect = timeSlider.getBoundingClientRect();
-  const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-  const index = Math.round(ratio * (allTimestamps.length - 1));
-  scheduleCommit(index);
 });
 
 const playbackButton = document.getElementById('playback-btn');
@@ -8317,7 +8296,7 @@ function tickCountdown() {
   setRoll(document.getElementById('donut-roll'), String(remaining), ROLL_DONUT);
   el.setAttribute('title', label);
   el.setAttribute('aria-label', label);
-  if (showNowcast && nowcastCanvases.size) updateSliderCutoff();
+  if (showNowcast && nowcastCanvases.size) updateScanForecast();
 }
 
 pruneApiCache();
