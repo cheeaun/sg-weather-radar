@@ -1923,8 +1923,8 @@ function renderTicks(newSlots) {
 // ≥90% of their box is visible (panning a sliver across a boundary stays put),
 // back down when the viewport fits inside the smaller box, flat when panned
 // outside every box — lightest band on top and heaviest at the bottom. Heights are a 70 km ratio (full height = rain over the whole frame)
-// with a floor: below 50% coverage the scale compresses so the tallest stack
-// still reaches half the panel. Catmull-Rom smoothing, plus a slow ripple that
+// with a floor: when the tallest stack would render under 16 px the scale
+// compresses so it still reaches 16 px. Catmull-Rom smoothing, plus a slow ripple that
 // runs stronger through low-rain slots. Unlike the text summary (SG planning areas only), the chart
 // covers sea and Johor too, so approaching weather outside Singapore still
 // registers.
@@ -1940,14 +1940,14 @@ let tickRainMorph = null;
 // halves the string churn, style invalidation, and repaints (plus battery).
 const TICK_RAIN_FRAME_MS = 33;
 let tickRainLastPaint = 0;
-// 70 km ratio with a floor: the tallest stack never drops below half the
-// panel (below 50% coverage the scale compresses to pin the peak at 50%).
+// 70 km ratio with a floor: the tallest stack never renders below 16 px
+// (the scale compresses to pin the peak at 16 px).
 const TICK_RAIN_FRAME_PX = 480 * 480;
-const TICK_RAIN_MIN_HEIGHT = 0.5;
-function tickRainScalePeak(peak) {
+const TICK_RAIN_MIN_HEIGHT = 16;
+function tickRainScalePeak(peak, H) {
   if (!(peak > 0)) return 1;
-  const coverage = peak / TICK_RAIN_FRAME_PX;
-  return coverage < TICK_RAIN_MIN_HEIGHT ? peak / TICK_RAIN_MIN_HEIGHT : TICK_RAIN_FRAME_PX;
+  const scaled = (peak / TICK_RAIN_FRAME_PX) * H;
+  return scaled < TICK_RAIN_MIN_HEIGHT ? (peak * H) / TICK_RAIN_MIN_HEIGHT : TICK_RAIN_FRAME_PX;
 }
 // Active radar range for the chart (number|null; null = viewport outside all
 // boxes → flat chart). Switch up once ≥3 sides of a larger range's box are in
@@ -2252,7 +2252,7 @@ function morphTickRainTo(newHists) {
     newTotals[i] = total;
     if (total > newPeak) newPeak = total;
   }
-  const p1 = tickRainScalePeak(newPeak);
+  const p1 = tickRainScalePeak(newPeak, H);
   const ext = (arr) => [arr[0], ...arr, arr[arr.length - 1]];
   const targets = g.layers.map((L) => {
     const { tops, bots } = stackBand(newHists, p1, L.s, m, H);
@@ -2335,7 +2335,7 @@ function layoutTickRain() {
   const amps = totals.map((total) => (peak > 0 ? 1.2 + 2.6 * (1 - total / peak) : 0));
   // Heaviest band at the bottom. Every stop gets a layer (empty bands are
   // zero-height and invisible) so any wash can morph into any other.
-  const scalePeak = tickRainScalePeak(peak);
+  const scalePeak = tickRainScalePeak(peak, H);
   const layers = [];
   for (let s = m - 1; s >= 0; s--) {
     const { tops, bots } = stackBand(tickRainHists, scalePeak, s, m, H);
