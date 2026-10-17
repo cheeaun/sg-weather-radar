@@ -33,6 +33,11 @@ const SG_LAND_BOUNDS = [
   [103.60535, 1.21013],
   [104.04367, 1.47085],
 ];
+// Same box as a radar-style corner object (up-left / lower-right lat-lng).
+const SG_LAND_BOX = {
+  upperLeft: { longitude: SG_LAND_BOUNDS[0][0], latitude: SG_LAND_BOUNDS[1][1] },
+  lowerRight: { longitude: SG_LAND_BOUNDS[1][0], latitude: SG_LAND_BOUNDS[0][1] },
+};
 const POLL_INTERVAL = 30 * 1000;
 const PAST_HOURS = 1;
 const RANGES = [480, 240, 70];
@@ -379,10 +384,26 @@ function panelControl(selector) {
 const RANGE_TOGGLE_STATES = ['sg', 70, 240, 480];
 const RANGE_TOGGLE_LABELS = { sg: 'Singapore', 70: '70 km', 240: '240 km', 480: '480 km' };
 
+// Viewport of the last 'sg' camera fit — the 'sg' chart range is selected when
+// the viewport fits inside it (the padded fit view, not just the land box).
+let sgSelBox = null;
+let sgSelCapturePending = false;
+function sgSelCapture() {
+  try {
+    const b = map.getBounds();
+    const e = 1e-5; // diagonal epsilon so covers() survives float rounding
+    sgSelBox = {
+      upperLeft: { longitude: b.getWest() - e, latitude: b.getNorth() + e },
+      lowerRight: { longitude: b.getEast() + e, latitude: b.getSouth() - e },
+    };
+  } catch {}
+  sgSelCapturePending = false;
+}
 function fitToBounds(state, duration = 1000) {
   let bounds;
   if (state === 'sg') {
     bounds = SG_LAND_BOUNDS;
+    sgSelCapturePending = true;
   } else {
     const bb = boundaryBoxes[state];
     if (!bb) return;
@@ -911,6 +932,9 @@ function initMap() {
   });
   map.on('moveend', updateRainNearLinkLabelVisibility);
   map.on('moveend', queueTickRainRange);
+  map.on('moveend', () => {
+    if (sgSelCapturePending) sgSelCapture();
+  });
   // Viewport resize changes bounds without a move; re-evaluate the range too.
   map.on('resize', queueTickRainRange);
   map.on('zoom', () => {
@@ -1921,12 +1945,14 @@ function renderTicks(newSlots) {
 }
 
 // Pixel rain chart behind the console: an SVG stacked-area wash from the radar
-// frame in view — 70 km pixels by default, handing up to 240/480 km only once
-// ≥90% of their box is visible (panning a sliver across a boundary stays put),
-// back down when the viewport fits inside the smaller box, flat when panned
-// outside every box — lightest band on top and heaviest at the bottom. Heights are a 70 km ratio (full height = rain over the whole frame)
-// with a floor: when the tallest stack would render under 16 px the scale
-// compresses so it still reaches 16 px. Catmull-Rom smoothing, plus a slow ripple that
+// frame in view — granularity follows the range controls' four states: 'sg'
+// counts only the Singapore land box (out of the 70 km frame, activating on the
+// sg camera fit and inside it), then 70/240/480 km by their frame visibility,
+// flat when panned outside every box — lightest band on top and heaviest at the
+// bottom. Heights are a ratio of the active range's box area (full height =
+// rain over the whole box) with a floor: when the tallest stack would render
+// under 16 px the scale compresses so it still reaches 16 px. Catmull-Rom
+// smoothing, plus a slow ripple that
 // runs stronger through low-rain slots. Unlike the text summary (SG planning areas only), the chart
 // covers sea and Johor too, so approaching weather outside Singapore still
 // registers.
@@ -1946,21 +1972,63 @@ let tickRainLastPaint = 0;
 // (the scale compresses to pin the peak at 16 px).
 const TICK_RAIN_FRAME_PX = 480 * 480;
 const TICK_RAIN_MIN_HEIGHT = 16;
-function tickRainScalePeak(peak, H) {
-  if (!(peak > 0)) return 1;
-  const scaled = (peak / TICK_RAIN_FRAME_PX) * H;
-  return scaled < TICK_RAIN_MIN_HEIGHT ? (peak * H) / TICK_RAIN_MIN_HEIGHT : TICK_RAIN_FRAME_PX;
+// Pixel sub-rect of a source canvas for the chart, null = whole frame. 'sg'
+// reads only the SG land box out of the 70 km frame.
+function tickRainPixelRect(range, W, H) {
+  if (range !== 'sg') return null;
+  const bb = SG_LAND_BOX;
+  const r = RADAR_BOUNDS[70];
+  const x = (v) =>
+    ((v - r.upperLeft.longitude) / (r.lowerRight.longitude - r.upperLeft.longitude)) * W;
+  const y = (v) =>
+    ((r.upperLeft.latitude - v) / (r.upperLeft.latitude - r.lowerRight.latitude)) * H;
+  return {
+    x0: Math.max(0, Math.floor(x(bb.upperLeft.longitude))),
+    x1: Math.min(W, Math.ceil(x(bb.lowerRight.longitude))),
+    y0: Math.max(0, Math.floor(y(bb.upperLeft.latitude))),
+    y1: Math.min(H, Math.ceil(y(bb.lowerRight.latitude))),
+  };
 }
-// Active radar range for the chart (number|null; null = viewport outside all
-// boxes → flat chart). Switch up once ≥3 sides of a larger range's box are in
-// view, so panning a sliver of 240 km into frame doesn't switch away from 70;
-// switch back down only once the viewport fits fully inside the smaller box.
+// Full-height denominator (in source-canvas pixels): the whole frame for the
+// radar ranges, the SG land sub-rect for 'sg' — so "full height" always means
+// "everything in the range's box is raining".
+function tickRainFramePx(range) {
+  if (range !== 'sg') return TICK_RAIN_FRAME_PX;
+  const r = RADAR_BOUNDS[70];
+  const fx =
+    (SG_LAND_BOX.lowerRight.longitude - SG_LAND_BOX.upperLeft.longitude) /
+    (r.lowerRight.longitude - r.upperLeft.longitude);
+  const fy =
+    (SG_LAND_BOX.upperLeft.latitude - SG_LAND_BOX.lowerRight.latitude) /
+    (r.upperLeft.latitude - r.lowerRight.latitude);
+  return Math.round(fx * fy * TICK_RAIN_FRAME_PX);
+}
+function tickRainScalePeak(peak, H, range = tickRainRange) {
+  if (!(peak > 0)) return 1;
+  const framePx = tickRainFramePx(range);
+  const scaled = (peak / framePx) * H;
+  return scaled < TICK_RAIN_MIN_HEIGHT ? (peak * H) / TICK_RAIN_MIN_HEIGHT : framePx;
+}
+// Active radar range for the chart ('sg' = Singapore land only, numbers = the
+// radar ranges; null = viewport outside all boxes → flat chart). Switch up
+// once ≥3 sides of a larger range's (selection) box are in view — so panning
+// a sliver of 240 km or 70 km into frame doesn't switch away; switch back down
+// only once the viewport fits fully inside the smaller box. The 'sg' switch
+// box is the viewport of the last sg camera fit (not the tiny land box), so
+// the SG-range button's view lands on it; zooming in keeps it, zooming out
+// until 3 sides of the 70 km box are visible goes back to 70.
 let tickRainRange = 70;
 let tickRainRangeTimer = 0;
+// Chart ranges smallest → largest. Numeric because range comparisons are
+// order-index based ('sg' < 70 despite string ordering).
+const TICK_RAIN_ORDER = ['sg', 70, 240, 480];
+// 'sg' histograms read from these radar ranges' frames.
+const TICK_RAIN_SRC = { sg: 70 };
 // Switch up once this many of the larger range's four sides are in view, so a
 // mostly-visible 240 km box counts even panned with one edge off-screen.
 const TICK_RAIN_SIDES = 3;
 function tickRainBox(range) {
+  if (range === 'sg') return sgSelBox || SG_LAND_BOX;
   return boundaryBoxes[range] || RADAR_BOUNDS[range];
 }
 function tickRainBoxCovers(bb, w, e, s, n) {
@@ -1996,7 +2064,7 @@ function tickRainRangeForView() {
     const e = b.getEast();
     const s = b.getSouth();
     const n = b.getNorth();
-    const boxes = [70, 240, 480].map((range) => [range, tickRainBox(range)]);
+    const boxes = TICK_RAIN_ORDER.map((range) => [range, tickRainBox(range)]);
     if (!boxes.some(([, bb]) => bb && tickRainBoxIntersects(bb, w, e, s, n))) return null;
     // Switch up to the largest range with ≥3 sides in view.
     let up = null;
@@ -2004,10 +2072,11 @@ function tickRainRangeForView() {
       if (!bb) continue;
       if (tickRainBoxSides(bb, w, e, s, n) >= TICK_RAIN_SIDES) up = range;
     }
-    if (up !== null && (tickRainRange === null || up > tickRainRange)) return up;
+    if (up !== null && TICK_RAIN_ORDER.indexOf(up) > TICK_RAIN_ORDER.indexOf(tickRainRange))
+      return up;
     // Panned clean off the current range (or no range yet): reseed from the
     // viewport center, falling back to the smallest intersecting box.
-    const order = [70, 240, 480];
+    const order = TICK_RAIN_ORDER;
     const curBox = tickRainRange === null ? null : tickRainBox(tickRainRange);
     if (!curBox || !tickRainBoxIntersects(curBox, w, e, s, n)) {
       const cx = (w + e) / 2;
@@ -2388,14 +2457,15 @@ async function paintTickRain(req) {
     return;
   }
   let okSlots = 0;
+  const src = TICK_RAIN_SRC[range] ?? range;
   for (let i = 0; i < n; i++) {
     if (req !== tickRainReq) return;
     const slotMs = new Date(allTimestamps[i]).getTime();
-    const frame = framesMap[range]?.get(slotMs);
+    const frame = framesMap[src]?.get(slotMs);
     if (!frame || failedImages.has(frame.url)) continue;
     let canvas = null;
     try {
-      canvas = await tickRainCanvas(range, frame);
+      canvas = await tickRainCanvas(src, frame);
     } catch {
       continue;
     }
@@ -2407,13 +2477,30 @@ async function paintTickRain(req) {
       continue;
     }
     okSlots++;
+    const rect = tickRainPixelRect(range, canvas.width, canvas.height);
     const counts = new Uint32Array(m);
     let total = 0;
-    for (let o = 0; o < data.length; o += 4) {
-      const s = rainStopForColor(data[o], data[o + 1], data[o + 2]);
-      if (s >= 0) {
-        counts[s]++;
-        total++;
+    if (rect) {
+      for (let y = rect.y0; y < rect.y1; y++) {
+        for (
+          let o = (y * canvas.width + rect.x0) * 4;
+          o < (y * canvas.width + rect.x1) * 4;
+          o += 4
+        ) {
+          const s = rainStopForColor(data[o], data[o + 1], data[o + 2]);
+          if (s >= 0) {
+            counts[s]++;
+            total++;
+          }
+        }
+      }
+    } else {
+      for (let o = 0; o < data.length; o += 4) {
+        const s = rainStopForColor(data[o], data[o + 1], data[o + 2]);
+        if (s >= 0) {
+          counts[s]++;
+          total++;
+        }
       }
     }
     if (total) hists[i] = counts;
