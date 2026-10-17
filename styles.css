@@ -1993,6 +1993,22 @@ pale panel. */
   opacity: 1;
   translate: 0 0;
 }
+/* Update prompt: stays until tapped, whole pill is the button. */
+.toast.update {
+  pointer-events: auto;
+  cursor: pointer;
+  animation: toast-pulse 2s ease infinite;
+}
+@keyframes toast-pulse {
+  50% {
+    translate: 0 -3px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast.update {
+    animation: none;
+  }
+}
 .toast.error {
   display: flex;
   align-items: center;

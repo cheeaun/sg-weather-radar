@@ -7,6 +7,7 @@ import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 // scripts/build-rail-data.mjs (delta-encoded int coords at 1e-5 deg). Imported
 // so Vite bundles it under a content hash like the rest of the assets.
 import railRaw from './rail.json';
+import { registerSW } from 'virtual:pwa-register';
 import SINGAPORE_AREAS from './areas-idx.json';
 // Pre-computed pixel→planning-area index for the 70 km radar, built by
 // scripts/build-rain-data.mjs from the planning-area source. Flat array of
@@ -834,6 +835,35 @@ sheetBackdrop.addEventListener('click', closeSettingsSheet);
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && settingsSheet.classList.contains('open')) closeSettingsSheet();
 });
+
+function registerServiceWorker() {
+  if (import.meta.env.DEV) return;
+  // Update prompt (deploy: rebuild ships a new SW; toast appears in-session,
+  // no reload needed). Plugin holds the new SW in "waiting", not activated.
+  let toastShown = false;
+  const updateSW = registerSW({
+    onNeedRefresh: () =>
+      setTimeout(() => {
+        if (toastShown) return;
+        toastShown = true;
+        const el = document.getElementById('toast');
+        el.textContent = 'Update ready — tap to reload';
+        el.classList.add('show', 'update');
+        el.onclick = updateSW;
+      }, 2000),
+    // Users never reload a radar tab, so update checks must come to them:
+    // hourly plus on each refocus. Cheap HEAD-ish re-download of /sw.js.
+    onRegisteredSW: (url, reg) => {
+      if (!reg) return;
+      const check = () => reg.update().catch(() => {});
+      setInterval(check, 60 * 60 * 1000);
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) check();
+      });
+      window.addEventListener('focus', check);
+    },
+  });
+}
 
 function initMap() {
   appliedStyle = mapStyleForTheme(resolvedTheme());
@@ -8532,6 +8562,7 @@ function tickCountdown() {
 }
 
 pruneApiCache();
+registerServiceWorker();
 initMap();
 fetchAtSlot();
 restartCountdown();
