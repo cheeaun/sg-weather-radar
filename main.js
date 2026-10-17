@@ -414,6 +414,12 @@ function fitToBounds(state, duration = 1000) {
   }
   const d = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : duration;
   map.fitBounds(bounds, { padding: 48, maxZoom: 12, duration: d });
+  if (state === 'sg') {
+    // duration 0 = jumpTo fires moveend synchronously, before the capture
+    // listener in initMap exists — read the bounds right away instead.
+    if (d === 0) sgSelCapture();
+    else sgSelCapturePending = true;
+  }
 }
 
 class RangeToggleControl {
