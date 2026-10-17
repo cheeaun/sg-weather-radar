@@ -123,6 +123,8 @@ localStorage.removeItem('sgwr-cams');
 localStorage.removeItem('sgwr-incidents');
 let showForecast = localStorage.getItem(FORECAST_STORAGE_KEY) === 'on';
 const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
+const HOTSPOT_ATTRIBUTION =
+  'Hotspots © <a href="https://asmc.asean.org" target="_blank" rel="noopener">ASMC</a>';
 const BASE_ATTRIBUTION =
   'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
 let attributionControl = null;
@@ -132,6 +134,9 @@ let floodAlerts = [];
 let floodLoading = null;
 let aqiStations = [];
 let aqiLoading = null;
+let hotspots = [];
+let hotspotLoading = null;
+let hotspotsFetchedAt = 0;
 let tempStations = [];
 let tempLoading = null;
 let tempWbgtStations = [];
@@ -866,7 +871,10 @@ function initMap() {
   // Radar data fetch starts immediately at module init; only wind needs the loaded map.
   map.once('load', () => {
     if (showWind) setWindOverlay(true);
-    if (showAqi) refreshAqi();
+    if (showAqi) {
+      refreshAqi();
+      refreshHotspots();
+    }
     if (showTemp) refreshTemp();
     if (showTraffic) {
       refreshCameras();
@@ -894,6 +902,7 @@ function initMap() {
     addRailLayers();
     addWindLayer();
     addBoundaryLayers();
+    addHotspotLayer();
     addLightningLayer();
     addFloodLayers();
     addRainNearCircleLayer();
@@ -1272,6 +1281,42 @@ async function refreshAqi() {
       aqiLoading = null;
     });
   return aqiLoading;
+}
+
+async function loadHotspots(fetchFn) {
+  const json = await fetchFn(apiURL('/hotspots'));
+  assertApiOk(json, apiURL('/hotspots'));
+  return json.data.hotspots || [];
+}
+
+// ASMC re-issues each product about twice a day, so an hourly check is plenty.
+// This has to be held in memory: sessionStorage entries are pruned at 60 s
+// (API_CACHE_TTL), so an `maxAgeMs` budget there can never pace the 5-min slot
+// refresh. A failed fetch leaves the stamp untouched, so the next slot retries.
+const HOTSPOT_REFRESH_MS = 60 * 60 * 1000;
+
+async function refreshHotspots() {
+  if (!showAqi) return null;
+  if (hotspotLoading) return hotspotLoading;
+  if (hotspotsFetchedAt && Date.now() - hotspotsFetchedAt < HOTSPOT_REFRESH_MS) {
+    // Skipping the fetch must still repaint: toggling AQI off clears the layer,
+    // so turning it back on has to restore the fires already in memory.
+    renderHotspots();
+    return null;
+  }
+  hotspotLoading = loadHotspots((url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL }))
+    .then((list) => {
+      hotspots = list;
+      hotspotsFetchedAt = Date.now();
+      renderHotspots();
+    })
+    .catch((e) => {
+      console.error('Hotspot fetch error:', e);
+    })
+    .finally(() => {
+      hotspotLoading = null;
+    });
+  return hotspotLoading;
 }
 
 // Feels-like (°C). Steadman/BOM AT (10 m wind) blended with NWS heat index, then
@@ -1730,7 +1775,10 @@ async function fetchAtSlot() {
   pollRanges = missingRangesFor(pollSlotMs);
   if (showWind || showNowcast || showTemp) loadWind({ forNowcast: showNowcast });
   if (showFloods) refreshFloods();
-  if (showAqi) refreshAqi();
+  if (showAqi) {
+    refreshAqi();
+    refreshHotspots();
+  }
   if (showTemp) refreshTemp();
   if (showTraffic) {
     refreshCameras();
@@ -2678,9 +2726,14 @@ function addAqiLayers() {
 
 function updateAqiAttribution(on) {
   if (!attributionControl) return;
-  attributionControl.options.customAttribution = on
-    ? `${BASE_ATTRIBUTION} · ${AQI_ATTRIBUTION}`
-    : BASE_ATTRIBUTION;
+  // Fires ride along with the AQI layer, so their credit does too.
+  attributionControl.options.customAttribution = [
+    BASE_ATTRIBUTION,
+    on && AQI_ATTRIBUTION,
+    on && HOTSPOT_ATTRIBUTION,
+  ]
+    .filter(Boolean)
+    .join(' · ');
   attributionControl._updateAttributions();
 }
 
@@ -2690,8 +2743,13 @@ function updateAqiLegend(on) {
 }
 
 function setAqiOverlay(on) {
-  if (on) refreshAqi();
-  else renderAqi();
+  if (on) {
+    refreshAqi();
+    refreshHotspots();
+  } else {
+    renderAqi();
+    renderHotspots();
+  }
   updateAqiAgeVisibility();
   updateAqiAttribution(on);
   updateAqiLegend(on);
@@ -5079,6 +5137,85 @@ function ensureLightningImage() {
   map.addImage('lightning-bolt', ctx.getImageData(0, 0, canvas.width, canvas.height), {
     pixelRatio: SHAPE_SCALE,
   });
+}
+
+// Small flame, dark halo first so it reads on both themes without per-theme art.
+function ensureHotspotImage() {
+  if (map.hasImage('hotspot-mark')) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = 14 * SHAPE_SCALE;
+  canvas.height = 14 * SHAPE_SCALE;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.scale(SHAPE_SCALE, SHAPE_SCALE);
+  const flame = new Path2D(
+    'M7 1c.5 2.2 1.9 3.1 2.9 4.5 1 1.4 1.6 2.6 1.6 3.9 0 2.5-2 4.2-4.5 4.2s-4.5-1.7-4.5-4.2c0-1.7.9-3.2 2.1-4.3.7-.6 1.3-1.2 1.7-1.9.4-.7.6-1.4.7-2.2z',
+  );
+  const core = new Path2D(
+    'M7 5.2c.3 1.2 1.2 1.8 1.6 2.6.5.8.4 1.8-.4 2.4a1.9 1.9 0 0 1-2.4 0c-.7-.6-.9-1.4-.5-2.2.4-.7.9-1 1.2-1.5.3-.4.4-.9.5-1.3z',
+  );
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
+  ctx.lineWidth = 2;
+  ctx.stroke(flame);
+  ctx.fillStyle = '#e0301e';
+  ctx.fill(flame);
+  ctx.fillStyle = '#ffcf4d';
+  ctx.fill(core);
+  map.addImage('hotspot-mark', ctx.getImageData(0, 0, canvas.width, canvas.height), {
+    pixelRatio: SHAPE_SCALE,
+  });
+}
+
+// Reprocessed (previous day) below, today's NRT above — same stack order as the
+// data, so where the two ever still overlap an NRT flame is the one that reads.
+const HOTSPOT_LAYERS = ['hotspot-layer-late', 'hotspot-layer-nrt'];
+
+function addHotspotLayer() {
+  if (!map || map.getSource('hotspots')) return;
+  ensureHotspotImage();
+  map.addSource('hotspots', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  const base = {
+    type: 'symbol',
+    source: 'hotspots',
+    layout: {
+      'icon-image': 'hotspot-mark',
+      'icon-anchor': 'center',
+      // Dense clusters should read as a solid burn area, like ASMC's own map.
+      'icon-allow-overlap': true,
+      'symbol-z-order': 'source',
+    },
+  };
+  map.addLayer({
+    ...base,
+    id: HOTSPOT_LAYERS[0],
+    filter: ['==', ['get', 'src'], 'late'],
+    paint: { 'icon-opacity': 0.5 },
+  });
+  map.addLayer({ ...base, id: HOTSPOT_LAYERS[1], filter: ['==', ['get', 'src'], 'nrt'] });
+  renderHotspots();
+}
+
+// Gated on the AQI toggle: turning air quality off clears the fires with it.
+function renderHotspots() {
+  if (!map || !map.getSource('hotspots')) return;
+  const features = showAqi
+    ? hotspots.map((h) => ({
+        type: 'Feature',
+        // Anything not explicitly reprocessed draws as NRT, so a cached payload
+        // predating the `src` field still renders instead of filtering to nothing.
+        properties: { src: h.src === 'late' ? 'late' : 'nrt' },
+        geometry: { type: 'Point', coordinates: [h.lng, h.lat] },
+      }))
+    : [];
+  map.getSource('hotspots').setData({ type: 'FeatureCollection', features });
+  const visibility = features.length ? 'visible' : 'none';
+  for (const id of HOTSPOT_LAYERS) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', visibility);
+  }
 }
 
 function addLightningLayer() {

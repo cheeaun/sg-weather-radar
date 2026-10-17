@@ -6,6 +6,27 @@ const API_BASE = 'https://api-open.data.gov.sg/v2/real-time/api';
 const AQI_BOUNDS_LATLNG = '5.657912,99.638609,-2.967382,108.290871'; // n,w,s,e
 const AQI_BOUNDS_BOX = { west: 99.638609, south: -2.967382, east: 108.290871, north: 5.657912 };
 
+// ASMC near-real-time hotspot reports — one plain-text file per region, stable
+// URLs, no key. High-confidence detections only, so a single icon tier.
+// The region list is both the allowlist and the extent: everything these files
+// publish is rendered, with no further geographic filter.
+// Both ASMC products are merged. `nrt` is today's partial set and wins any
+// collision; `late` is the reprocessed previous day — it finds ~3.5x more fires
+// but lags a day, so it's drawn back at reduced opacity.
+// Cache lifetimes come from ASMC's publication cadence, not from how live the map
+// feels: each product re-issues about twice a day, so a short TTL just re-fetches
+// identical bytes. `nrt` is today's accumulating set and takes the shorter span;
+// `late` is a fixed previous day, so it barely changes at all.
+const HOTSPOT_SOURCES = [
+  { src: 'nrt', prefix: 'DailyJP1NOAA20.', cacheTtl: 3 * 60 * 60 },
+  { src: 'late', prefix: 'DailyJP1_LATENOAA20.', cacheTtl: 6 * 60 * 60 },
+];
+const HOTSPOT_REGIONS = ['sumatra', 'p_malaysia', 'singapore', 'kalimantan'];
+// ASMC reports one row per 750 m VIIRS pixel, so within a single set neighbouring
+// rows sit ~0.5-1 km apart and the same fire on two days repeats at ~0.1-0.4 km.
+// 0.25 km therefore catches only genuine cross-set repeats, never a neighbour pixel.
+const HOTSPOT_DEDUPE_KM = 0.25;
+
 // Allowlist of paths the app uses; anything else is a 404.
 const ALLOWED_PREFIXES = [
   '/weather-radar-images/',
@@ -77,6 +98,116 @@ async function trafficIncidents(env) {
   }
 }
 
+// Leading row number then lng/lat. The lookahead (not an end anchor) tolerates
+// extra trailing columns — ASMC already ships confidence and FRP in the KML twin,
+// and requiring end-of-line there would silently drop every row. Header lines
+// still fail on `^\s*\d+` (`S/No…`, `Total Hotspot Count:…`, `====`).
+const HOTSPOT_ROW_RE = /^\s*\d+\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?=\s|$)/;
+
+// Reports repeat one block per satellite pass; each row inherits its block's
+// UTC stamp. Machine-generated shape, so line regexes beat a parser here.
+function parseHotspotReport(text) {
+  const out = [];
+  let time = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    const dt = line.match(/^Date & Time:\s*(\d{4})\/(\d{2})\/(\d{2})(?:\s+([\d:]+))?/);
+    if (dt) {
+      time = `${dt[1]}-${dt[2]}-${dt[3]}T${dt[4] || '00:00:00'}Z`;
+      continue;
+    }
+    const row = HOTSPOT_ROW_RE.exec(line);
+    if (!row) continue;
+    const lng = Number(row[1]);
+    const lat = Number(row[2]);
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+    out.push({ lng, lat, time });
+  }
+  return out;
+}
+
+const HOTSPOT_BASE = 'https://asmc.asean.org/files/msscommunity/hotspots/';
+
+function hotspotDistanceKm(a, b) {
+  const rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLng = rad(b.lng - a.lng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(h));
+}
+
+// NRT wins: a reprocessed row is dropped when it repeats an NRT one. Strictly
+// one-directional — `late` never suppresses `nrt`, so today's set is always whole.
+function dedupeHotspots(nrt, late) {
+  return [
+    ...nrt,
+    ...late.filter((b) => !nrt.some((a) => hotspotDistanceKm(a, b) <= HOTSPOT_DEDUPE_KM)),
+  ];
+}
+
+// Eight files in flight (two products x four regions). One file failing must not
+// blank the others.
+async function hotspots() {
+  const fetched = await Promise.all(
+    HOTSPOT_SOURCES.flatMap(({ src, prefix, cacheTtl }) =>
+      HOTSPOT_REGIONS.map(async (region) => {
+        try {
+          const res = await fetch(`${HOTSPOT_BASE}${prefix}${region}.txt`, {
+            headers: { 'user-agent': 'sg-weather-radar/1.0' },
+            cf: { cacheTtl },
+          });
+          if (!res.ok) return { src, ok: false, points: [], updated: null };
+          const text = await res.text();
+          const rows = parseHotspotReport(text);
+          // Canary: each report states its own row count, so a mismatch means the
+          // format drifted and rows are being dropped silently. Compared before the
+          // block dedupe below — the reprocessed files legitimately repeat blocks.
+          const declared = [...text.matchAll(/Total Hotspot Count:\s*(\d+)/g)].reduce(
+            (sum, m) => sum + Number(m[1]),
+            0,
+          );
+          if (declared && rows.length !== declared) {
+            console.warn(
+              `hotspots: ${prefix}${region} parsed ${rows.length} rows, report declares ${declared}`,
+            );
+          }
+          // The reprocessed reports repeat each pass block, so dedupe the rows.
+          const seen = new Set();
+          const points = [];
+          for (const p of rows) {
+            const key = `${p.time}|${p.lng}|${p.lat}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            points.push({ ...p, src });
+          }
+          return {
+            src,
+            ok: true,
+            points,
+            updated: text.match(/Created On:\s*(.+)/)?.[1]?.trim() || null,
+          };
+        } catch {
+          return { src, ok: false, points: [], updated: null };
+        }
+      }),
+    ),
+  );
+  // Every file failing is an outage, not a quiet day — say so, so the client keeps
+  // the fires already on screen instead of blanking the overlay. Note this is
+  // "zero fetches succeeded", not "zero points": p_malaysia and singapore are
+  // legitimately empty every day.
+  if (!fetched.some((r) => r.ok)) {
+    return Response.json({ code: 502, errorMsg: 'ASMC hotspot upstream error' }, { status: 502 });
+  }
+  const nrt = fetched.filter((r) => r.src === 'nrt').flatMap((r) => r.points);
+  const late = fetched.filter((r) => r.src === 'late').flatMap((r) => r.points);
+  const points = dedupeHotspots(nrt, late);
+  // The NRT stamp is the one worth surfacing; `late` is always a day behind.
+  const updated = fetched.find((r) => r.src === 'nrt' && r.updated)?.updated || null;
+  return Response.json({ code: 0, data: { hotspots: points, updated } });
+}
+
 function aqiError(status, message) {
   return Response.json({ code: status, errorMsg: message }, { status });
 }
@@ -138,6 +269,10 @@ export default {
 
     if (path === '/traffic-incidents') {
       return trafficIncidents(env);
+    }
+
+    if (path === '/hotspots') {
+      return hotspots();
     }
 
     if (path === '/aqi-stations') {
