@@ -911,6 +911,8 @@ function initMap() {
   });
   map.on('moveend', updateRainNearLinkLabelVisibility);
   map.on('moveend', queueTickRainRange);
+  // Viewport resize changes bounds without a move; re-evaluate the range too.
+  map.on('resize', queueTickRainRange);
   map.on('zoom', () => {
     updateCamThumbScale();
     updateCamAgeVisibility();
