@@ -2828,7 +2828,7 @@ function ageTextStyle(fill) {
   };
 }
 
-// DOM chips (not canvas sprites): crisp type, easy styling, fine at a few dozen stations.
+// DOM chips (not canvas sprites): crisp type, easy styling, fine at ~300 stations.
 const aqiMarkers = [];
 const aqiAgeEls = [];
 const AQI_AGE_ZOOM = 11;
@@ -2900,7 +2900,8 @@ function aqiChipEl(aqi, name, time) {
   return wrap;
 }
 
-// Station markers only inside the 480 km radar square — never outside.
+// Chips span the whole ASMC hotspot extent (Sumatra/Kalimantan) — a superset of
+// the 480 km radar square — so AQI shows near the fire hotspots.
 function addAqiLayers() {
   renderAqi();
   updateAqiAgeVisibility();
@@ -2943,7 +2944,6 @@ function renderAqi() {
   aqiAgeTimer = null;
   if (!map || !showAqi) return;
   for (const s of aqiStations) {
-    if (!inRadar480(s.lng, s.lat)) continue;
     const el = aqiChipEl(s.aqi, s.name, s.time);
     aqiMarkers.push(
       new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat([s.lng, s.lat]).addTo(map),

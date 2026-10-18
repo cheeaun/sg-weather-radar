@@ -1,10 +1,12 @@
 // Same-origin proxy for api-open.data.gov.sg; keeps the API key server-side (secret: DATA_GOV_SG_API_KEY).
 const API_BASE = 'https://api-open.data.gov.sg/v2/real-time/api';
 // WAQI JSON map-bounds feed (aqicn.org); token stays server-side (secret: WAQI_TOKEN).
-// Only the 480 km radar square is allowed — no open proxy to arbitrary bounds.
-// NW→SE corner order: WAQI returns more stations this way than S,W,N,E for the same box.
-const AQI_BOUNDS_LATLNG = '5.657912,99.638609,-2.967382,108.290871'; // n,w,s,e
-const AQI_BOUNDS_BOX = { west: 99.638609, south: -2.967382, east: 108.290871, north: 5.657912 };
+// One request spans the whole ASMC hotspot extent (Sumatra + Pen Malaysia + SG +
+// Kalimantan) — strictly a superset of the 480 km radar square, so haze AQI shows
+// near the fires. NW→SE corner order: WAQI returns more stations this way than
+// S,W,N,E for the same box.
+const AQI_BOUNDS_LATLNG = '7.5,92.0,-7.5,120.0'; // n,w,s,e
+const AQI_BOUNDS_BOX = { west: 92, south: -7.5, east: 120, north: 7.5 };
 
 // ASMC near-real-time hotspot reports — one plain-text file per region, stable
 // URLs, no key. High-confidence detections only, so a single icon tier.
