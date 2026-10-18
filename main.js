@@ -146,7 +146,24 @@ let hotspotsFetchedAt = 0;
 let tempStations = [];
 let tempLoading = null;
 let tempWbgtStations = [];
-const failedImages = new Set();
+// Failed radar image URLs by attempt time; a transient CDN failure must not
+// hide a frame for the rest of the session, so entries stop blocking (and are
+// dropped) after FAILED_IMAGE_TTL. Identity stays the exact URL: a re-signed
+// URL for the same timestamp is always a fresh attempt.
+const failedImages = new Map();
+const FAILED_IMAGE_TTL = 60 * 1000;
+function failedImageActive(url) {
+  const attemptedAt = failedImages.get(url);
+  if (attemptedAt == null) return false;
+  if (Date.now() - attemptedAt >= FAILED_IMAGE_TTL) {
+    failedImages.delete(url);
+    return false;
+  }
+  return true;
+}
+function markFailedImage(url) {
+  failedImages.set(url, Date.now());
+}
 const nowcastCanvases = new Map();
 let nowcastGeneration = 0;
 let nowcastControlButton = null;
@@ -1684,6 +1701,55 @@ function rebuildTimeline() {
   return newSlots;
 }
 
+// Slot map keyed by slotOf(); ties keep the frame whose timestamp sits closest
+// to the slot centre. The only place frames are slot-deduped.
+function slotFrames(frames) {
+  const slots = new Map();
+  for (const f of frames) {
+    const slot = slotOf(f.timestamp);
+    const existing = slots.get(slot);
+    if (
+      !existing ||
+      Math.abs(new Date(f.timestamp) - slot) < Math.abs(new Date(existing.timestamp) - slot)
+    ) {
+      slots.set(slot, f);
+    }
+  }
+  return slots;
+}
+
+// Fresh frames win per slot; last-known slots the fresh set lacks (a lagging
+// upstream page, a publish the poll transiently missed) stay on the timeline so
+// the newest scan can't vanish for a whole poll cycle. Retained slots bounded
+// by the fresh span's oldest edge (no window creep) and by now + 1 slot: the
+// 70km feed publishes the next slot ~47s early, so a frame keying above nowSlot
+// is legit and must survive a merge inside that window, while sentinels beyond
+// it are excluded anyway (frame.nowcast) and pruned slots stay pruned.
+function mergeFrameSlots(prevSlots, freshFrames) {
+  const slots = slotFrames(freshFrames);
+  if (!prevSlots || !slots.size) return slots;
+  let oldest = Infinity;
+  for (const slot of slots.keys()) {
+    if (slot < oldest) oldest = slot;
+  }
+  const nowSlot = Math.floor(Date.now() / SLOT_MS) * SLOT_MS;
+  for (const [slot, frame] of prevSlots) {
+    if (slots.has(slot) || slot < oldest || slot > nowSlot + SLOT_MS || frame.nowcast) continue;
+    slots.set(slot, frame);
+  }
+  return slots;
+}
+
+function compiledRangeFrames(prevRange, result) {
+  const prevSlots = prevRange?.length ? slotFrames(prevRange) : null;
+  const slots = mergeFrameSlots(prevSlots, result.frames);
+  return {
+    bb: result.bb,
+    slots,
+    frames: [...slots.entries()].sort((a, b) => a[0] - b[0]).map(([, f]) => f),
+  };
+}
+
 function applyRadarData(rangeResults, strikes, floods) {
   const prevBoxes = boundaryBoxes;
   const prevFrames = framesByRange;
@@ -1699,20 +1765,10 @@ function applyRadarData(rangeResults, strikes, floods) {
       result = { bb: prevBoxes[range], frames: prevFrames[range] };
     }
     if (!result) continue;
-    boundaryBoxes[range] = result.bb;
-    framesByRange[range] = result.frames;
-    const slots = new Map();
-    for (const f of framesByRange[range]) {
-      const slot = slotOf(f.timestamp);
-      const existing = slots.get(slot);
-      if (
-        !existing ||
-        Math.abs(new Date(f.timestamp) - slot) < Math.abs(new Date(existing.timestamp) - slot)
-      ) {
-        slots.set(slot, f);
-      }
-    }
-    framesMap[range] = slots;
+    const compiled = compiledRangeFrames(prevFrames[range], result);
+    boundaryBoxes[range] = compiled.bb;
+    framesByRange[range] = compiled.frames;
+    framesMap[range] = compiled.slots;
   }
   if (strikes) lightningStrikes = strikes;
   if (floods) floodAlerts = floods;
@@ -1736,20 +1792,12 @@ function mergeRangeResults(rangeResults) {
     if (!result) continue;
     // Same rule as applyRadarData: an empty poll result keeps the existing frames.
     if (!result.frames.length && framesByRange[range]?.length) continue;
-    boundaryBoxes[range] = result.bb;
-    framesByRange[range] = result.frames;
-    const slots = new Map();
-    for (const f of result.frames) {
-      const slot = slotOf(f.timestamp);
-      const existing = slots.get(slot);
-      if (
-        !existing ||
-        Math.abs(new Date(f.timestamp) - slot) < Math.abs(new Date(existing.timestamp) - slot)
-      ) {
-        slots.set(slot, f);
-      }
-    }
-    framesMap[range] = slots;
+    // Union with last-known frames so a token transient loss in the fresh set
+    // (page lag upstream) can't drop a slot mid-slot-window.
+    const merged = compiledRangeFrames(framesByRange[range], result);
+    boundaryBoxes[range] = merged.bb;
+    framesByRange[range] = merged.frames;
+    framesMap[range] = merged.slots;
   }
   addBoundaryLayers();
   if (showNowcast) recomputeNowcast();
@@ -1823,7 +1871,13 @@ async function doFetchRadar() {
 }
 
 function missingRangesFor(slotMs) {
-  return RANGES.filter((range) => !framesMap[range]?.get(slotMs));
+  return RANGES.filter((range) => {
+    const frame = framesMap[range]?.get(slotMs);
+    // An image that failed its load still blocks display; poll that range so the
+    // re-signed fetch lands inside the slot instead of waiting for the next one.
+    if (frame && failedImageActive(frame.url)) return true;
+    return !frame;
+  });
 }
 
 async function fetchAtSlot() {
@@ -1831,9 +1885,12 @@ async function fetchAtSlot() {
     scheduleNextRefresh();
     return;
   }
-  pollSlotMs = slotOf(new Date());
   pollRanges = [];
   await fetchRadar();
+  // Slot of the data just fetched, not of the start: a fetch starting just
+  // before a boundary should poll for the newer slot's records, and the
+  // 30s poll countdown should not count a slot it never fetched.
+  pollSlotMs = slotOf(new Date());
   pollRanges = missingRangesFor(pollSlotMs);
   if (showWind || showNowcast || showTemp) loadWind({ forNowcast: showNowcast });
   if (showFloods) refreshFloods();
@@ -2498,7 +2555,7 @@ async function paintTickRain(req) {
     if (req !== tickRainReq) return;
     const slotMs = new Date(allTimestamps[i]).getTime();
     const frame = framesMap[src]?.get(slotMs);
-    if (!frame || failedImages.has(frame.url)) continue;
+    if (!frame || failedImageActive(frame.url)) continue;
     let canvas = null;
     try {
       canvas = await tickRainCanvas(src, frame);
@@ -4156,11 +4213,15 @@ function addRailLayers() {
 
 async function fetchRadarImage(url) {
   for (let attempt = 1; ; attempt++) {
+    // Presigned URLs expire (20 min): a 403/404 never heals by retrying the
+    // same signature, so only retry the transient-looking failures.
+    let fatal = false;
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
       if (res.ok) return await res.blob();
+      if (res.status === 403 || res.status === 404) fatal = true;
     } catch (e) {}
-    if (attempt >= FETCH_RETRIES) throw new Error(`Radar image failed [${url}]`);
+    if (fatal || attempt >= FETCH_RETRIES) throw new Error(`Radar image failed [${url}]`);
     await delay(FETCH_RETRY_DELAY);
   }
 }
@@ -4756,7 +4817,7 @@ function applyRadarFrame(range, frame) {
   const key = frame && displayImageKey(range, frame);
   // Only the exact signed URL is failed; a re-signed URL for the same timestamp is retried,
   // else stale cached API data (expired S3 URLs) poisons a whole range until the next refresh.
-  if (!frame || failedImages.has(frame.url)) {
+  if (!frame || failedImageActive(frame.url)) {
     hide();
     return;
   }
@@ -4793,8 +4854,8 @@ function applyRadarFrame(range, frame) {
         updateBoundaryAvailability();
       })
       .catch(() => {
-        if (!failedImages.has(frame.url)) {
-          failedImages.add(frame.url);
+        if (!failedImageActive(frame.url)) {
+          markFailedImage(frame.url);
           renderTicks();
         }
         if (radarPendingKey.get(range) === key) hide();
@@ -4834,8 +4895,8 @@ function applyRadarFrame(range, frame) {
       updateBoundaryAvailability();
     })
     .catch(() => {
-      if (!failedImages.has(frame.url)) {
-        failedImages.add(frame.url);
+      if (!failedImageActive(frame.url)) {
+        markFailedImage(frame.url);
         renderTicks();
       }
       if (radarPendingKey.get(range) === key) hide();
@@ -5178,7 +5239,7 @@ function computeAvailability() {
       radarPendingKey.get(range) === key &&
       radarShownKey.has(range) &&
       !radarSlowPending.has(range);
-    available[range] = Boolean(frame && !failedImages.has(frame.url) && (shown || briefLoad));
+    available[range] = Boolean(frame && !failedImageActive(frame.url) && (shown || briefLoad));
   }
   return available;
 }
@@ -6282,7 +6343,7 @@ function prefetchFrames(index) {
     const slotMs = new Date(allTimestamps[i]).getTime();
     for (const range of RANGES) {
       const frame = framesMap[range]?.get(slotMs);
-      if (!frame || failedImages.has(frame.url)) continue;
+      if (!frame || failedImageActive(frame.url)) continue;
       (smoothRadar ? prepareDisplayData(range, frame) : prepareFrameImage(range, frame)).catch(
         () => {},
       );
@@ -8413,7 +8474,7 @@ function updateRainSummary({ force = false } = {}) {
   const ts = allTimestamps[currentIndex] ? new Date(allTimestamps[currentIndex]).getTime() : null;
   const frame = ts != null ? framesMap[70]?.get(ts) : null;
   const key =
-    frame && !failedImages.has(frame.url) ? frameImageKey(70, frame, clipBoundaries) : null;
+    frame && !failedImageActive(frame.url) ? frameImageKey(70, frame, clipBoundaries) : null;
   const liveSlot = newestLiveSlot(70);
   const isLive = !frame?.nowcast && ts != null && ts === liveSlot;
   const posSig = rainNearTracking && rainNearLng != null ? `${rainNearLng},${rainNearLat}` : '';
