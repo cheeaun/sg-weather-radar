@@ -7,7 +7,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const design = resolve(root, 'design');
 const pub = resolve(root, 'public');
 
-const src = readFileSync(resolve(design, 'icon.svg'), 'utf8');
+const master = 'icon-2.svg'; // design/ master; icon.svg is the superseded v1
+const src = readFileSync(resolve(design, master), 'utf8');
 
 writeFileSync(resolve(pub, 'favicon.svg'), src);
 
@@ -20,4 +21,4 @@ writeFileSync(resolve(pub, 'apple-touch-icon.svg'), ios);
 execFileSync('rsvg-convert', ['-w', '64', '-h', '64', '-o', resolve(pub, 'favicon-64.png'), resolve(pub, 'favicon.svg')]);
 execFileSync('rsvg-convert', ['-w', '180', '-h', '180', '-o', resolve(pub, 'apple-touch-icon.png'), resolve(pub, 'apple-touch-icon.svg')]);
 
-console.log('Generated public/favicon.svg, favicon-64.png, apple-touch-icon.svg, apple-touch-icon.png from design/icon.svg');
+console.log(`Generated public/favicon.svg, favicon-64.png, apple-touch-icon.svg, apple-touch-icon.png from design/${master}`);

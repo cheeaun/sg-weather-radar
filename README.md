@@ -106,7 +106,7 @@ One chip per station (US EPA AQI, WAQI palette) inside the 480 km radar square. 
 
 ## Icons
 
-The icon master is `design/icon.svg` (64×64 grid, pixelated radar-echo cells colored with the reflectivity swatch). `public/` icons are derived from it — never edit them directly:
+The icon master is `design/icon-2.svg` (64×64 grid: radar scope with a sweep, plus radar-palette rain cells — green body, yellow band, red heavy core — deliberately built to stay legible at 16px favicon size). `design/icon.svg` is the superseded v1 (pixelated echo cells), kept only for reference. `public/` icons are derived from the master — never edit them directly:
 
 ```sh
 node scripts/generate-icons.mjs
