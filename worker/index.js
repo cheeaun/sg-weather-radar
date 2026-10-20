@@ -210,8 +210,32 @@ async function hotspots() {
   return Response.json({ code: 0, data: { hotspots: points, updated } });
 }
 
+// 500 is the EPA AQI cap. Crowd sensors (GAIA AirNet) glitch-pin all channels to
+// exactly 500 (e.g. 4 Haig Road, uid -2791069) — pm1 ⊆ pm10 can never be equal, so
+// pm1=pm10=pm25=500 is safe as a global pin test; real fire-belt 500s have a
+// distinct pollutant mix. map/bounds items carry no pollutant values, so cap
+// stations get one feed cross-check each (edge-cached like the bounds feed),
+// bounded per response to limit fan-out during a heavy fire season.
+const AQI_CAP = 500;
+const AQI_GLITCH_CHECK_MAX = 20;
+
 function aqiError(status, message) {
   return Response.json({ code: status, errorMsg: message }, { status });
+}
+
+async function pinnedAqiGlitch(station, token) {
+  if (!station.uid) return false;
+  try {
+    const res = await fetch(`https://api.waqi.info/feed/@${station.uid}?token=${encodeURIComponent(token)}`, {
+      cf: { cacheTtl: 300 },
+    });
+    if (!res.ok) return false;
+    const iaqi = (await res.json())?.data?.iaqi;
+    const v = (k) => iaqi?.[k]?.v;
+    return v('pm1') === AQI_CAP && v('pm10') === AQI_CAP && v('pm25') === AQI_CAP;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeAqiStations(raw) {
@@ -295,8 +319,20 @@ export default {
       if (!raw || raw.status !== 'ok') {
         return aqiError(502, raw?.data || 'AQI upstream error');
       }
+      let stations = normalizeAqiStations(raw);
+      // Glitched cap pins across the whole box; a heavy fire season can put many
+      // stations at 500, so at most AQI_GLITCH_CHECK_MAX feed probes per refresh.
+      // Pins are dropped outright — no sensor data means nothing to render.
+      const capped = stations.filter((s) => s.aqi === AQI_CAP);
+      const checks = await Promise.allSettled(
+        capped.slice(0, AQI_GLITCH_CHECK_MAX).map((s) => pinnedAqiGlitch(s, token)),
+      );
+      const pinned = new Set(
+        checks.flatMap((c, i) => (c.status === 'fulfilled' && c.value ? [capped[i].uid] : [])),
+      );
+      stations = stations.filter((s) => !pinned.has(s.uid));
       return Response.json(
-        { code: 0, data: { stations: normalizeAqiStations(raw) } },
+        { code: 0, data: { stations } },
         { headers: { 'x-upstream-url': url.replace(token, '***') } },
       );
     }

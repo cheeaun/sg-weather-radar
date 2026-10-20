@@ -2772,16 +2772,52 @@ function addLandOutline() {
   }
 }
 
-// WAQI US EPA palette (aqicn.org scale) — number on a rounded rect, same colors as their markers.
+// WAQI scale — aqicn.org paints a *continuous* gradient across the EPA stops,
+// not discrete bands (their AirAirNet card: h<50 green→yellow … h<500 maroon→black).
+// Numbers sit on a rounded rect in that interpolated color, like their markers.
+const AQI_STOPS = [
+  [0, '#009966'],
+  [50, '#ffde33'],
+  [100, '#ff9933'],
+  [150, '#cc0033'],
+  [200, '#660099'],
+  [300, '#7e0023'],
+  [500, '#000000'],
+];
+
+function hexToRgb(hex) {
+  const n = hex.replace('#', '');
+  return [0, 2, 4].map((i) => parseInt(n.slice(i, i + 2), 16));
+}
+
 function aqiStyle(aqi) {
   const n = Number(aqi);
-  // Match WAQI map tiles: green only below 50 (50 paints yellow), not the scale table's "0-50".
-  if (n < 50) return { fill: '#009966', text: '#ffffff' };
-  if (n <= 100) return { fill: '#ffde33', text: '#000000' };
-  if (n <= 150) return { fill: '#ff9933', text: '#000000' };
-  if (n <= 200) return { fill: '#cc0033', text: '#ffffff' };
-  if (n <= 300) return { fill: '#660099', text: '#ffffff' };
-  return { fill: '#7e0023', text: '#ffffff' };
+  const stops = AQI_STOPS;
+  let fill;
+  if (n <= stops[0][0]) {
+    fill = stops[0][1];
+  } else if (n >= stops[stops.length - 1][0]) {
+    fill = stops[stops.length - 1][1];
+  } else {
+    let i = 1;
+    while (stops[i][0] < n) i += 1;
+    const [lo, loHex] = stops[i - 1];
+    const [hi, hiHex] = stops[i];
+    const a = hexToRgb(loHex);
+    const b = hexToRgb(hiHex);
+    const t = (n - lo) / (hi - lo);
+    fill = `#${a
+      .map((c, j) =>
+        Math.round(c + (b[j] - c) * t)
+          .toString(16)
+          .padStart(2, '0'),
+      )
+      .join('')}`;
+  }
+  // White text over dark fills, black over light ones (luminance).
+  const rgb = hexToRgb(fill);
+  const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+  return { fill, text: lum > 0.55 ? '#000000' : '#ffffff' };
 }
 
 // Shared stack for AQI + temp chips: good AQI < cool temp < moderate AQI < warm temp < unhealthy+.
