@@ -2772,9 +2772,9 @@ function addLandOutline() {
   }
 }
 
-// WAQI scale — aqicn.org paints a *continuous* gradient across the EPA stops,
-// not discrete bands (their AirAirNet card: h<50 green→yellow … h<500 maroon→black).
-// Numbers sit on a rounded rect in that interpolated color, like their markers.
+// WAQI scale — chips interpolate a **continuous** gradient across the EPA stops
+// like aqicn.org's map markers (their cards/marker pins blend through red into
+// plum; the maroon→black tail is only their calendar heatmap). No band snapping.
 const AQI_STOPS = [
   [0, '#009966'],
   [50, '#ffde33'],
@@ -2782,7 +2782,6 @@ const AQI_STOPS = [
   [150, '#cc0033'],
   [200, '#660099'],
   [300, '#7e0023'],
-  [500, '#000000'],
 ];
 
 function hexToRgb(hex) {
