@@ -37,6 +37,8 @@ const ALLOWED_PREFIXES = [
   '/wind-direction',
   '/air-temperature',
   '/relative-humidity',
+  '/psi',
+  '/pm25',
   '/two-hr-forecast',
   '/twenty-four-hr-forecast',
 ];

@@ -644,6 +644,87 @@ body.cam-enhance-on .camera-tile img {
   display: block;
 }
 
+/* NEA PSI / PM2.5 region plates: two band-tinted rows in one compact marker. */
+.air-marker {
+  display: inline-flex;
+  pointer-events: auto;
+  z-index: 200;
+}
+.air-marker:hover {
+  z-index: 501;
+}
+.air-chip {
+  display: flex;
+  flex-direction: column;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.85);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+  user-select: none;
+}
+.air-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 1px 4px;
+  white-space: nowrap;
+  font:
+    600 10px/1 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+.air-row + .air-row {
+  border-top: 1px solid rgba(0, 0, 0, 0.32);
+}
+.air-row-empty {
+  background: rgba(108, 122, 130, 0.88);
+  color: #ffffff;
+}
+.air-row-label {
+  font-size: 6.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  opacity: 0.9;
+}
+.air-row-value {
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.05;
+}
+.air-row + .air-row .air-row-value {
+  font-size: 10px;
+}
+.air-time {
+  display: none;
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font:
+    700 10px/1.2 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  text-shadow:
+    -1px -1px 0 var(--air-time-halo),
+    1px -1px 0 var(--air-time-halo),
+    -1px 1px 0 var(--air-time-halo),
+    1px 1px 0 var(--air-time-halo);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.air-time-psi {
+  bottom: calc(100% + 3px);
+}
+.air-time-pm {
+  top: calc(100% + 3px);
+}
+.air-marker:hover .air-time,
+.maplibregl-map.air-times-on .air-time {
+  display: block;
+}
+
 /* Temperature chips: white type, dark thermal-color outline (no plate). */
 .temp-marker {
   display: inline-flex;
@@ -1795,12 +1876,14 @@ pale panel. */
   margin-top: 6px;
 }
 .masthead .aqi-scale,
+.masthead .psi-scale,
 .masthead .temp-scale,
 .masthead .forecast-scale {
   margin-top: 4px;
 }
 /* Extra air between stacked legends when both overlays are on. */
-.aqi-scale:not([hidden]) + .temp-scale,
+.aqi-scale:not([hidden]) + .psi-scale,
+.psi-scale:not([hidden]) + .temp-scale,
 .temp-scale:not([hidden]) + .forecast-scale {
   margin-top: 10px;
 }
@@ -1853,6 +1936,53 @@ pale panel. */
   font-weight: 500;
   color: var(--muted);
   white-space: nowrap;
+}
+/* PSI / PM2.5 band grids reuse the AQI row layout with their own swatches. */
+.psi-legend-head {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  line-height: 1.15;
+  margin-top: 3px;
+}
+.psi-cols {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 16px;
+  align-items: start;
+}
+.psi-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.psi-col .psi-legend-head {
+  margin-top: 0;
+}
+.psi-band-grid {
+  grid-template-columns: max-content;
+  grid-template-rows: repeat(4, auto);
+  grid-auto-flow: row;
+}
+/* Long PSI descriptors wrap so the column stays narrow. */
+.psi-col-psi .aqi-row {
+  align-items: flex-start;
+}
+.psi-col-psi .aqi-row i {
+  margin-top: 1.5px;
+}
+.psi-col-psi .aqi-row span {
+  max-width: 52px;
+  white-space: normal;
+  line-height: 1.15;
+}
+.psi-band-grid .aqi-row i {
+  width: 10px;
+  height: 9px;
+}
+.psi-band-grid .aqi-row span {
+  font-size: 10px;
 }
 /* Dynamic forecast legend: icon + label per condition currently on the map. */
 .forecast-grid {

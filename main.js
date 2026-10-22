@@ -59,6 +59,7 @@ const FLOOD_STORAGE_KEY = 'sgwr-floods';
 const WIND_STORAGE_KEY = 'sgwr-wind';
 const NOWCAST_STORAGE_KEY = 'sgwr-nowcast';
 const AQI_STORAGE_KEY = 'sgwr-aqi';
+const PSI_STORAGE_KEY = 'sgwr-psi';
 const TEMP_STORAGE_KEY = 'sgwr-temp';
 const SMOOTH_STORAGE_KEY = 'sgwr-smooth';
 const TRAFFIC_STORAGE_KEY = 'sgwr-traffic';
@@ -116,6 +117,7 @@ let showFloods = localStorage.getItem(FLOOD_STORAGE_KEY) === 'on';
 let showWind = localStorage.getItem(WIND_STORAGE_KEY) === 'on';
 let showNowcast = localStorage.getItem(NOWCAST_STORAGE_KEY) === 'on';
 let showAqi = import.meta.env.VITE_AQI_UI === '1' && localStorage.getItem(AQI_STORAGE_KEY) === 'on';
+let showPsi = localStorage.getItem(PSI_STORAGE_KEY) === 'on';
 let showTemp = localStorage.getItem(TEMP_STORAGE_KEY) === 'on';
 let smoothRadar = localStorage.getItem(SMOOTH_STORAGE_KEY) === 'on';
 // One toggle drives both traffic layers; legacy per-layer keys migrate once,
@@ -140,6 +142,14 @@ let floodAlerts = [];
 let floodLoading = null;
 let aqiStations = [];
 let aqiLoading = null;
+let airRegions = [];
+let airTimes = { psi: null, pm25: null };
+let airLoading = null;
+let airFetchedAt = 0;
+// PSI/PM2.5 publish hourly; a 10-min memory stamp is enough to catch each issue
+// without riding every 5-min radar slot. sessionStorage prunes at 60s, so this
+// throttle has to live here like the hotspot one.
+const AIR_REFRESH_MS = 10 * 60 * 1000;
 let hotspots = [];
 let hotspotLoading = null;
 let hotspotsFetchedAt = 0;
@@ -655,29 +665,49 @@ class NowcastForecastToggleControl {
   }
 }
 
-class AqiToggleControl {
+class AirQualityToggleControl {
   onAdd(map) {
     this._map = map;
     const container = document.createElement('div');
     container.className = 'maplibregl-ctrl maplibregl-ctrl-group';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'toggle-btn';
-    button.dataset.tip = 'AQI';
-    button.setAttribute('aria-label', 'Show air quality');
-    button.setAttribute('aria-pressed', String(showAqi));
-    button.classList.toggle('toggle-active', showAqi);
-    button.innerHTML =
-      '<svg class="toggle-icon aqi-text-icon" viewBox="0 0 32 24" aria-hidden="true"><text x="50%" y="50%" dy="0.36em" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="currentColor">AQI</text></svg>';
-    button.addEventListener('click', () => {
-      showAqi = !showAqi;
-      localStorage.setItem(AQI_STORAGE_KEY, showAqi ? 'on' : 'off');
-      button.classList.toggle('toggle-active', showAqi);
-      button.setAttribute('aria-pressed', String(showAqi));
-      setAqiOverlay(showAqi);
-      showToast(showAqi ? 'Showing air quality' : 'Hiding air quality');
+    if (import.meta.env.VITE_AQI_UI === '1') {
+      const aqiButton = document.createElement('button');
+      aqiButton.type = 'button';
+      aqiButton.className = 'toggle-btn';
+      aqiButton.dataset.tip = 'AQI';
+      aqiButton.setAttribute('aria-label', 'Show air quality');
+      aqiButton.setAttribute('aria-pressed', String(showAqi));
+      aqiButton.classList.toggle('toggle-active', showAqi);
+      aqiButton.innerHTML =
+        '<svg class="toggle-icon aqi-text-icon" viewBox="0 0 32 24" aria-hidden="true"><text x="50%" y="50%" dy="0.36em" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="700" fill="currentColor">AQI</text></svg>';
+      aqiButton.addEventListener('click', () => {
+        showAqi = !showAqi;
+        localStorage.setItem(AQI_STORAGE_KEY, showAqi ? 'on' : 'off');
+        aqiButton.classList.toggle('toggle-active', showAqi);
+        aqiButton.setAttribute('aria-pressed', String(showAqi));
+        setAqiOverlay(showAqi);
+        showToast(showAqi ? 'Showing air quality' : 'Hiding air quality');
+      });
+      container.appendChild(aqiButton);
+    }
+    const psiButton = document.createElement('button');
+    psiButton.type = 'button';
+    psiButton.className = 'toggle-btn';
+    psiButton.dataset.tip = 'PSI · PM2.5';
+    psiButton.setAttribute('aria-label', 'Show PSI and PM2.5');
+    psiButton.setAttribute('aria-pressed', String(showPsi));
+    psiButton.classList.toggle('toggle-active', showPsi);
+    psiButton.innerHTML =
+      '<svg class="toggle-icon aqi-text-icon" viewBox="0 0 32 24" aria-hidden="true"><text x="50%" y="50%" dy="0.36em" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10.5" font-weight="700" fill="currentColor">PSI</text></svg>';
+    psiButton.addEventListener('click', () => {
+      showPsi = !showPsi;
+      localStorage.setItem(PSI_STORAGE_KEY, showPsi ? 'on' : 'off');
+      psiButton.classList.toggle('toggle-active', showPsi);
+      psiButton.setAttribute('aria-pressed', String(showPsi));
+      setAirOverlay(showPsi);
+      showToast(showPsi ? 'Showing PSI & PM2.5' : 'Hiding PSI & PM2.5');
     });
-    container.appendChild(button);
+    container.appendChild(psiButton);
     this._container = container;
     return container;
   }
@@ -751,6 +781,7 @@ function applyTheme() {
   updateThemeButtons();
   if (showWind && windMotionQuery.matches) renderWindStatic();
   if (showAqi) renderAqi();
+  if (showPsi) renderAirQuality();
 }
 
 function setThemePreference(pref) {
@@ -898,6 +929,7 @@ function initMap() {
   map.addControl(attributionControl);
   updateAqiAttribution(showAqi);
   updateAqiLegend(showAqi);
+  updateAirLegend(showPsi);
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
   const geolocateControl = new maplibregl.GeolocateControl({
     positionOptions: { enableHighAccuracy: true },
@@ -933,9 +965,7 @@ function initMap() {
   map.addControl(new RangeToggleControl(), 'bottom-right');
   map.addControl(new OverlayToggleControl(), 'bottom-right');
   map.addControl(new TrafficToggleControl(), 'bottom-right');
-  if (import.meta.env.VITE_AQI_UI === '1') {
-    map.addControl(new AqiToggleControl(), 'bottom-right');
-  }
+  map.addControl(new AirQualityToggleControl(), 'bottom-right');
   map.addControl(new NowcastForecastToggleControl(), 'bottom-right');
   map.addControl(panelControl('.masthead'), 'top-left');
   map.addControl(panelControl('.console'), 'bottom-left');
@@ -949,6 +979,7 @@ function initMap() {
       refreshAqi();
       refreshHotspots();
     }
+    if (showPsi) refreshAirQuality();
     if (showTemp) refreshTemp();
     if (showTraffic) {
       refreshCameras();
@@ -970,6 +1001,7 @@ function initMap() {
     addRadarLayers();
     addLandOutline();
     addAqiLayers();
+    renderAirQuality();
     renderTemp();
     updateTempFeelsVisibility();
     updateTempLegend(showTemp);
@@ -1001,6 +1033,7 @@ function initMap() {
   map.on('move', layoutCamMarkers);
   map.on('zoomend', () => {
     updateAqiAgeVisibility();
+    updateAirTimeVisibility();
     updateTempFeelsVisibility();
   });
   applyTheme();
@@ -1360,6 +1393,76 @@ async function refreshAqi() {
       aqiLoading = null;
     });
   return aqiLoading;
+}
+
+async function loadAirQuality(fetchFn) {
+  const psiUrl = apiURL('/psi');
+  const pm25Url = apiURL('/pm25');
+  const [psiJson, pm25Json] = await Promise.all([
+    fetchFn(psiUrl),
+    fetchFn(pm25Url).catch(() => null),
+  ]);
+  assertApiOk(psiJson, psiUrl);
+  if (pm25Json) assertApiOk(pm25Json, pm25Url);
+  const item = psiJson.data?.items?.[0];
+  const pm25Item = pm25Json?.data?.items?.[0];
+  const readings = item?.readings || {};
+  const oneHour = pm25Item?.readings?.pm25_one_hourly || {};
+  const previous = new Map(airRegions.map((r) => [r.name, r]));
+  const regions = [];
+  for (const meta of psiJson.data?.regionMetadata || []) {
+    const name = meta?.name;
+    const psi = readings.psi_twenty_four_hourly?.[name];
+    const lat = meta?.labelLocation?.latitude;
+    const lng = meta?.labelLocation?.longitude;
+    if (!name || !Number.isFinite(psi) || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    // A failed /pm25 must not blank the layer: keep the previous 1-hr reading.
+    const pm25 = Number.isFinite(oneHour[name])
+      ? oneHour[name]
+      : (previous.get(name)?.pm25 ?? null);
+    const pm25Day = readings.pm25_twenty_four_hourly?.[name];
+    regions.push({
+      name,
+      lat,
+      lng,
+      psi,
+      pm25,
+      pm25_24h: Number.isFinite(pm25Day) ? pm25Day : null,
+    });
+  }
+  return {
+    regions,
+    psiTime: item?.timestamp || item?.updatedTimestamp || null,
+    pm25Time: pm25Item?.timestamp || pm25Item?.updatedTimestamp || null,
+  };
+}
+
+async function refreshAirQuality() {
+  if (!showPsi) return null;
+  if (airLoading) return airLoading;
+  if (airFetchedAt && Date.now() - airFetchedAt < AIR_REFRESH_MS) {
+    // Skipping the fetch must still repaint: toggling off clears the markers.
+    renderAirQuality();
+    return null;
+  }
+  airLoading = loadAirQuality((url) => apiFetch(url, { maxAgeMs: 15 * 60 * 1000 }))
+    .then(({ regions, psiTime, pm25Time }) => {
+      if (!regions.length) throw new Error('empty PSI response');
+      airRegions = regions;
+      // A failed feed keeps its last-known values, so keep its old reading time too.
+      airTimes = { psi: psiTime || airTimes.psi, pm25: pm25Time || airTimes.pm25 };
+      airFetchedAt = Date.now();
+      renderAirQuality();
+    })
+    .catch((e) => {
+      console.error('PSI/PM2.5 fetch error:', e);
+      // Keep the last-known regions; only complain when there is nothing on screen.
+      if (showPsi && !airRegions.length) showToast('PSI/PM2.5 data unavailable');
+    })
+    .finally(() => {
+      airLoading = null;
+    });
+  return airLoading;
 }
 
 async function loadHotspots(fetchFn) {
@@ -1898,6 +2001,7 @@ async function fetchAtSlot() {
     refreshAqi();
     refreshHotspots();
   }
+  if (showPsi) refreshAirQuality();
   if (showTemp) refreshTemp();
   if (showTraffic) {
     refreshCameras();
@@ -2985,6 +3089,143 @@ function renderAqi() {
     );
   }
   if (aqiAgeEls.length) aqiAgeTimer = setInterval(updateAqiAges, 60 * 1000);
+}
+
+// NEA PSI (24-hr) and 1-hr PM2.5 bands. Discrete, not blended: the descriptors
+// are defined per band, so the chips snap to the band colour instead of ramping.
+// Palette from haze.gov.sg: the 24-hr PSI legend merges Good + Moderate into
+// one green band, and the 1-hr PM2.5 advisory's third band is a softer orange.
+const PSI_BANDS = [
+  { max: 100, label: 'Good to moderate', fill: '#479b02' },
+  { max: 200, label: 'Unhealthy', fill: '#ffce03' },
+  { max: 300, label: 'Very unhealthy', fill: '#ffa800' },
+  { max: Infinity, label: 'Hazardous', fill: '#d60000' },
+];
+const PM25_BANDS = [
+  { max: 55, label: 'Normal', fill: '#479b02' },
+  { max: 150, label: 'Elevated', fill: '#ffce03' },
+  { max: 250, label: 'High', fill: '#e87d32' },
+  { max: Infinity, label: 'Very High', fill: '#d60000' },
+];
+const AIR_TIME_ZOOM = 11;
+
+const airMarkers = [];
+
+function clearAirMarkers() {
+  for (const m of airMarkers) m.remove();
+  airMarkers.length = 0;
+}
+
+function airBandStyle(value, bands) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const band = bands.find((b) => n <= b.max) || bands[bands.length - 1];
+  const rgb = hexToRgb(band.fill);
+  const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+  return { ...band, text: lum > 0.55 ? '#000000' : '#ffffff' };
+}
+
+function airRowEl(label, value, band) {
+  const row = document.createElement('div');
+  row.className = 'air-row';
+  if (band) {
+    row.style.backgroundColor = `color-mix(in srgb, ${band.fill} 88%, transparent)`;
+    row.style.color = band.text;
+  } else {
+    row.classList.add('air-row-empty');
+  }
+  const name = document.createElement('span');
+  name.className = 'air-row-label';
+  name.textContent = label;
+  const num = document.createElement('span');
+  num.className = 'air-row-value';
+  const n = value == null ? NaN : Number(value);
+  num.textContent = Number.isFinite(n) ? String(Math.round(n)) : '–';
+  row.append(name, num);
+  return row;
+}
+
+function airRegionName(name) {
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : '';
+}
+
+function airChipEl(region) {
+  const psiBand = airBandStyle(region.psi, PSI_BANDS);
+  const pmBand = airBandStyle(region.pm25, PM25_BANDS);
+  const wrap = document.createElement('div');
+  wrap.className = 'air-marker';
+  const parts = [
+    `${airRegionName(region.name)} · PSI ${Math.round(region.psi)} (${psiBand.label})`,
+  ];
+  parts.push(
+    pmBand
+      ? `PM2.5 1-hr ${Math.round(region.pm25)} µg/m³ (${pmBand.label})`
+      : 'PM2.5 1-hr unavailable',
+  );
+  if (region.pm25_24h != null) parts.push(`24-hr PM2.5 ${Math.round(region.pm25_24h)} µg/m³`);
+  wrap.title = parts.join(' · ');
+  wrap.setAttribute('role', 'img');
+  wrap.setAttribute('aria-label', parts.join(', '));
+  const psiTime = readingTimeLabel(airTimes.psi);
+  const pmTime = readingTimeLabel(airTimes.pm25);
+  const chip = document.createElement('div');
+  chip.className = 'air-chip';
+  chip.append(airRowEl('PSI', region.psi, psiBand), airRowEl('PM2.5', region.pm25, pmBand));
+  if (psiTime) wrap.appendChild(airTimeEl('air-time-psi', psiTime, psiBand.fill));
+  wrap.appendChild(chip);
+  if (pmTime) wrap.appendChild(airTimeEl('air-time-pm', pmTime, pmBand?.fill || '#6b7a80'));
+  return wrap;
+}
+
+function airTimeEl(cls, text, fill) {
+  const el = document.createElement('div');
+  el.className = `air-time ${cls}`;
+  el.textContent = text;
+  const { text: color, halo } = ageTextStyle(fill);
+  el.style.color = color;
+  el.style.setProperty('--air-time-halo', halo);
+  return el;
+}
+
+function updateAirTimeVisibility() {
+  if (!map) return;
+  map.getContainer().classList.toggle('air-times-on', showPsi && map.getZoom() >= AIR_TIME_ZOOM);
+}
+
+function readingTimeLabel(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '';
+  const parts = timeFormatter.formatToParts(new Date(t));
+  const hour = parts.find((p) => p.type === 'hour')?.value;
+  const minute = parts.find((p) => p.type === 'minute')?.value;
+  const dayPeriod = parts.find((p) => p.type === 'dayPeriod')?.value.toLowerCase() || '';
+  if (!hour) return '';
+  return minute === '00' ? `${hour}${dayPeriod}` : `${hour}.${minute}${dayPeriod}`;
+}
+
+function updateAirLegend(on) {
+  const el = document.getElementById('psi-legend');
+  if (el) el.hidden = !on;
+}
+
+function setAirOverlay(on) {
+  if (on) refreshAirQuality();
+  else renderAirQuality();
+  updateAirTimeVisibility();
+  updateAirLegend(on);
+}
+
+function renderAirQuality() {
+  clearAirMarkers();
+  if (!map || !showPsi) return;
+  for (const region of airRegions) {
+    airMarkers.push(
+      new maplibregl.Marker({ element: airChipEl(region), anchor: 'center' })
+        .setLngLat([region.lng, region.lat])
+        .addTo(map),
+    );
+  }
 }
 
 // OKLCH cool → warm red; L/C/H free-run on the short hue arc (220→25 via purple).
@@ -8669,6 +8910,7 @@ function refreshAfterWake() {
   if (Date.now() - lastFetchStart > 60 * 1000) fetchRadarBusy = false;
   if (showWind || showNowcast || showTemp) loadWind({ forNowcast: showNowcast });
   if (showTemp) refreshTemp();
+  if (showPsi) refreshAirQuality();
   if (showForecast) refreshForecast();
   if (pollRanges.length) pollOnce();
   else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
