@@ -64,6 +64,7 @@ const TEMP_STORAGE_KEY = 'sgwr-temp';
 const SMOOTH_STORAGE_KEY = 'sgwr-smooth';
 const TRAFFIC_STORAGE_KEY = 'sgwr-traffic';
 const FORECAST_STORAGE_KEY = 'sgwr-forecast';
+const LEGENDS_STORAGE_KEY = 'sgwr-legends';
 const API_CACHE_PREFIX = 'sgwr-api:';
 const API_CACHE_TTL = 60 * 1000;
 const FETCH_RETRIES = 2;
@@ -884,6 +885,59 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && settingsSheet.classList.contains('open')) closeSettingsSheet();
 });
 
+const mastheadEl = document.getElementById('masthead');
+const legendToggle = document.getElementById('legend-toggle');
+
+function setLegendsCollapsed(collapsed, persist = true) {
+  mastheadEl.classList.toggle('legends-collapsed', collapsed);
+  legendToggle.setAttribute('aria-expanded', String(!collapsed));
+  const label = collapsed ? 'Show legends' : 'Hide legends';
+  legendToggle.setAttribute('aria-label', label);
+  legendToggle.title = label;
+  if (persist) localStorage.setItem(LEGENDS_STORAGE_KEY, collapsed ? 'off' : 'on');
+}
+
+setLegendsCollapsed(localStorage.getItem(LEGENDS_STORAGE_KEY) === 'off', false);
+// Enable the collapse transition after first paint so a stored state doesn't animate in.
+setTimeout(() => mastheadEl.classList.add('legends-animate'), 0);
+let legendHoverTimer = null;
+function toggleLegends() {
+  setLegendsCollapsed(!mastheadEl.classList.contains('legends-collapsed'));
+}
+legendToggle.addEventListener('click', () => {
+  clearTimeout(legendHoverTimer);
+  toggleLegends();
+});
+
+// Turning on a layer that owns a legend reopens the stack — a new legend hidden
+// inside a collapsed panel would otherwise go unnoticed.
+function revealLegendsOnLayer() {
+  if (mastheadEl.classList.contains('legends-collapsed')) setLegendsCollapsed(false);
+}
+
+// The toggle only earns its place once at least one overlay legend is shown.
+const mastheadFoot = document.getElementById('masthead-foot');
+const legendSections = ['aqi-legend', 'psi-legend', 'temp-legend', 'forecast-legend']
+  .map((id) => document.getElementById(id))
+  .filter(Boolean);
+
+function syncLegendToggle() {
+  mastheadFoot.hidden = !legendSections.some((el) => !el.hidden);
+}
+
+const legendObserver = new MutationObserver(syncLegendToggle);
+for (const el of legendSections) {
+  legendObserver.observe(el, { attributes: true, attributeFilter: ['hidden'] });
+}
+syncLegendToggle();
+
+// Hovering the tab toggles it after a short intent delay; leaving cancels.
+mastheadFoot.addEventListener('mouseenter', () => {
+  clearTimeout(legendHoverTimer);
+  legendHoverTimer = setTimeout(toggleLegends, 260);
+});
+mastheadFoot.addEventListener('mouseleave', () => clearTimeout(legendHoverTimer));
+
 function registerServiceWorker() {
   if (import.meta.env.DEV) return;
   // Update prompt (deploy: rebuild ships a new SW; toast appears in-session,
@@ -991,6 +1045,12 @@ function initMap() {
     }
   });
   map.on('move', windInvalidateScreen);
+  // Panning or zooming tucks the legends away so the map stays readable.
+  const collapseLegendsOnMapMove = (e) => {
+    if (!e.originalEvent || mastheadFoot.hidden) return;
+    if (!mastheadEl.classList.contains('legends-collapsed')) setLegendsCollapsed(true);
+  };
+  for (const type of ['dragstart', 'zoomstart', 'wheel']) map.on(type, collapseLegendsOnMapMove);
   map.on('moveend', () => {
     if (!showWind) return;
     if (windMotionQuery.matches) renderWindStatic();
@@ -3066,6 +3126,7 @@ function updateAqiLegend(on) {
 
 function setAqiOverlay(on) {
   if (on) {
+    revealLegendsOnLayer();
     refreshAqi();
     refreshHotspots();
   } else {
@@ -3210,8 +3271,10 @@ function updateAirLegend(on) {
 }
 
 function setAirOverlay(on) {
-  if (on) refreshAirQuality();
-  else renderAirQuality();
+  if (on) {
+    revealLegendsOnLayer();
+    refreshAirQuality();
+  } else renderAirQuality();
   updateAirTimeVisibility();
   updateAirLegend(on);
 }
@@ -3315,8 +3378,10 @@ function tempChipEl(station) {
 }
 
 function setTempOverlay(on) {
-  if (on) refreshTemp();
-  else renderTemp();
+  if (on) {
+    revealLegendsOnLayer();
+    refreshTemp();
+  } else renderTemp();
   updateTempFeelsVisibility();
   updateTempLegend(on);
 }
@@ -3500,6 +3565,7 @@ async function refreshForecast({ force = false } = {}) {
 
 function setForecastOverlay(on) {
   if (on) {
+    revealLegendsOnLayer();
     refreshForecast();
     startForecastPoll();
   } else {

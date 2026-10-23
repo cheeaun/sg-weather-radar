@@ -79,56 +79,93 @@
       </defs>
     </svg>
 
-    <div class="panel masthead">
+    <div class="panel masthead" id="masthead">
       <h1>SG Weather Radar</h1>
       <div class="scale">
         <div class="scale-gradient"></div>
         <div class="scale-labels"><span>Light</span><span>Moderate</span><span>Heavy</span></div>
       </div>
-      <div class="scale aqi-scale" id="aqi-legend" hidden>
-        <div class="aqi-title">AQI</div>
-        <div class="aqi-grid">
-          <div class="aqi-row"><i style="background: #009966"></i><span>Good</span></div>
-          <div class="aqi-row"><i style="background: #ffde33"></i><span>Moderate</span></div>
-          <div class="aqi-row"><i style="background: #ff9933"></i><span>Sensitive</span></div>
-          <div class="aqi-row"><i style="background: #cc0033"></i><span>Unhealthy</span></div>
-          <div class="aqi-row"><i style="background: #660099"></i><span>Very Unhealthy</span></div>
-          <div class="aqi-row"><i style="background: #7e0023"></i><span>Hazardous</span></div>
-        </div>
-      </div>
-      <div class="scale psi-scale" id="psi-legend" hidden>
-        <div class="aqi-title">PSI / PM2.5</div>
-        <div class="psi-cols">
-          <div class="psi-col psi-col-psi">
-            <div class="psi-legend-head">PSI 24-hr</div>
-            <div class="aqi-grid psi-band-grid">
+      <div class="masthead-legends" id="masthead-legends">
+        <div class="masthead-legends-inner">
+          <div class="scale aqi-scale" id="aqi-legend" hidden>
+            <div class="aqi-title">AQI</div>
+            <div class="aqi-grid">
+              <div class="aqi-row"><i style="background: #009966"></i><span>Good</span></div>
+              <div class="aqi-row"><i style="background: #ffde33"></i><span>Moderate</span></div>
+              <div class="aqi-row"><i style="background: #ff9933"></i><span>Sensitive</span></div>
+              <div class="aqi-row"><i style="background: #cc0033"></i><span>Unhealthy</span></div>
               <div class="aqi-row">
-                <i style="background: #479b02"></i><span>Good to moderate</span>
+                <i style="background: #660099"></i><span>Very Unhealthy</span>
               </div>
-              <div class="aqi-row"><i style="background: #ffce03"></i><span>Unhealthy</span></div>
-              <div class="aqi-row">
-                <i style="background: #ffa800"></i><span>Very unhealthy</span>
-              </div>
-              <div class="aqi-row"><i style="background: #d60000"></i><span>Hazardous</span></div>
+              <div class="aqi-row"><i style="background: #7e0023"></i><span>Hazardous</span></div>
             </div>
           </div>
-          <div class="psi-col psi-col-pm">
-            <div class="psi-legend-head">PM2.5 1-hr</div>
-            <div class="aqi-grid psi-band-grid">
-              <div class="aqi-row"><i style="background: #479b02"></i><span>Normal</span></div>
-              <div class="aqi-row"><i style="background: #ffce03"></i><span>Elevated</span></div>
-              <div class="aqi-row"><i style="background: #e87d32"></i><span>High</span></div>
-              <div class="aqi-row"><i style="background: #d60000"></i><span>Very high</span></div>
+          <div class="scale psi-scale" id="psi-legend" hidden>
+            <div class="aqi-title">PSI / PM2.5</div>
+            <div class="psi-cols">
+              <div class="psi-col psi-col-psi">
+                <div class="psi-legend-head">PSI 24-hr</div>
+                <div class="aqi-grid psi-band-grid">
+                  <div class="aqi-row">
+                    <i style="background: #479b02"></i><span>Good to moderate</span>
+                  </div>
+                  <div class="aqi-row">
+                    <i style="background: #ffce03"></i><span>Unhealthy</span>
+                  </div>
+                  <div class="aqi-row">
+                    <i style="background: #ffa800"></i><span>Very unhealthy</span>
+                  </div>
+                  <div class="aqi-row">
+                    <i style="background: #d60000"></i><span>Hazardous</span>
+                  </div>
+                </div>
+              </div>
+              <div class="psi-col psi-col-pm">
+                <div class="psi-legend-head">PM2.5 1-hr</div>
+                <div class="aqi-grid psi-band-grid">
+                  <div class="aqi-row"><i style="background: #479b02"></i><span>Normal</span></div>
+                  <div class="aqi-row">
+                    <i style="background: #ffce03"></i><span>Elevated</span>
+                  </div>
+                  <div class="aqi-row"><i style="background: #e87d32"></i><span>High</span></div>
+                  <div class="aqi-row">
+                    <i style="background: #d60000"></i><span>Very high</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
+          <div class="scale temp-scale" id="temp-legend" hidden>
+            <div class="aqi-title">Temperature</div>
+            <div class="temp-gradient"></div>
+            <div class="scale-labels"><span>25°</span><span>32°+</span></div>
+          </div>
+          <div class="scale forecast-scale" id="forecast-legend" hidden></div>
         </div>
       </div>
-      <div class="scale temp-scale" id="temp-legend" hidden>
-        <div class="aqi-title">Temperature</div>
-        <div class="temp-gradient"></div>
-        <div class="scale-labels"><span>25°</span><span>32°+</span></div>
+      <div class="masthead-foot" id="masthead-foot" hidden>
+        <button
+          type="button"
+          class="legend-toggle"
+          id="legend-toggle"
+          aria-controls="masthead-legends"
+          aria-expanded="true"
+          aria-label="Hide legends"
+          title="Hide legends"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
       </div>
-      <div class="scale forecast-scale" id="forecast-legend" hidden></div>
     </div>
 
     <div class="panel console">

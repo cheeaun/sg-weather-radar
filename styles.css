@@ -1423,6 +1423,105 @@ body.cam-enhance-on .camera-tile img {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Legend collapse: the row collapses to 0fr so the panel shrinks smoothly. */
+.masthead-legends {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+.masthead-legends-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+/* Each section grows/shrinks in place so the panel resizes with it. */
+#masthead-legends .scale {
+  interpolate-size: allow-keywords;
+  overflow: clip;
+  transition:
+    height 0.3s cubic-bezier(0.32, 0.72, 0, 1),
+    margin-top 0.3s cubic-bezier(0.32, 0.72, 0, 1),
+    opacity 0.22s ease,
+    display 0.3s allow-discrete;
+}
+#masthead-legends .scale[hidden] {
+  height: 0;
+  margin-top: 0;
+  opacity: 0;
+}
+.masthead.legends-animate .masthead-legends {
+  transition: grid-template-rows 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.masthead.legends-animate .masthead-legends-inner {
+  transition: opacity 0.2s ease;
+}
+.masthead.legends-collapsed .masthead-legends {
+  grid-template-rows: 0fr;
+}
+.masthead.legends-collapsed .masthead-legends-inner {
+  opacity: 0;
+}
+/* Hangs off the panel's bottom edge like a small tab. */
+.masthead-foot {
+  position: absolute;
+  top: calc(100% - 1px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+}
+.masthead-foot[hidden] {
+  display: none;
+}
+.legend-toggle {
+  width: 46px;
+  height: 17px;
+  padding: 0 0 1px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 9px 9px;
+  background: color-mix(in srgb, var(--paper-solid) 88%, transparent);
+  -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.1s ease;
+}
+.legend-toggle svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  /* Points up while legends are open (hide), down when collapsed (show). */
+  transform: rotate(180deg);
+  transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.legend-toggle:hover {
+  background: var(--paper-solid);
+  border-color: var(--muted);
+  color: var(--ink-strong);
+}
+.legend-toggle:active {
+  transform: scale(0.94);
+}
+.legend-toggle:focus-visible {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 2px;
+}
+.masthead.legends-collapsed .legend-toggle svg {
+  transform: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  #masthead-legends .scale,
+  .masthead.legends-animate .masthead-legends,
+  .masthead.legends-animate .masthead-legends-inner,
+  .legend-toggle,
+  .legend-toggle svg {
+    transition: none;
+  }
+}
 .donut {
   position: relative;
   display: inline-flex;
