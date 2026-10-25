@@ -847,9 +847,10 @@ body.cam-enhance-on .camera-tile img {
   gap: 2px;
   align-items: flex-end;
 }
-/* Dotted timeline runs text-to-text: each cell's label row flanks its label
-   with connectors that fill to the cell edges, bridging the 2px cell gap.
-   Outer connectors stay transparent so dots never bleed past the end labels. */
+/* Dotted timeline runs text-to-text: each cell's label is left-aligned at its
+   slot's start edge (the junction with the previous icon) and one connector
+   fills the rest of the row, bridging the 2px cell gap. The last cell's
+   trailing connector stays transparent so dots never bleed past the end label. */
 .forecast-label-row {
   display: flex;
   align-items: center;
@@ -864,7 +865,6 @@ body.cam-enhance-on .camera-tile img {
   border-bottom: 1px dotted rgba(255, 255, 255, 0.55);
   transform: translateY(1px);
 }
-.forecast-cell:first-child > .forecast-label-row > .forecast-connector:first-child,
 .forecast-cell:last-child > .forecast-label-row > .forecast-connector:last-child {
   border-bottom-color: transparent;
 }
@@ -2084,6 +2084,14 @@ pale panel. */
   font-size: 10px;
 }
 /* Dynamic forecast legend: icon + label per condition currently on the map. */
+/* 2-hr valid period, mirroring the tooltip info for touch devices. */
+.forecast-when {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--muted);
+  white-space: nowrap;
+  margin-bottom: 1px;
+}
 .forecast-grid {
   display: grid;
   grid-template-columns: max-content;

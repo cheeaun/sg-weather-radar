@@ -3502,7 +3502,6 @@ function forecastStripEl(regionName, periods, regionKey) {
     img.draggable = false;
     const row = document.createElement('div');
     row.className = 'forecast-label-row';
-    row.appendChild(connector());
     const lab = document.createElement('span');
     lab.textContent = label;
     row.appendChild(lab);
@@ -3645,6 +3644,13 @@ function updateForecastLegend() {
   title.className = 'aqi-title';
   title.textContent = 'Forecast';
   el.appendChild(title);
+  const vp = twoHrData?.items?.[0]?.valid_period;
+  if (vp?.start && vp?.end) {
+    const when = document.createElement('div');
+    when.className = 'forecast-when';
+    when.textContent = `2h: ${formatTime(vp.start)} to ${formatTime(vp.end)}`;
+    el.appendChild(when);
+  }
   const grid = document.createElement('div');
   grid.className = 'forecast-grid';
   const labels = [...conds.keys()].sort(
