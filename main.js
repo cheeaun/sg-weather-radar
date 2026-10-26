@@ -134,6 +134,8 @@ let showForecast = localStorage.getItem(FORECAST_STORAGE_KEY) === 'on';
 const AQI_ATTRIBUTION = 'AQI © <a href="https://waqi.info" target="_blank" rel="noopener">WAQI</a>';
 const HOTSPOT_ATTRIBUTION =
   'Hotspots © <a href="https://asmc.asean.org" target="_blank" rel="noopener">ASMC</a>';
+const WIND_ATTRIBUTION =
+  'METARs © <a href="https://mesonet.agron.iastate.edu/" target="_blank" rel="noopener">IEM</a>';
 const BASE_ATTRIBUTION =
   'Weather data © <a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">NEA, data.gov.sg</a>';
 let attributionControl = null;
@@ -981,7 +983,7 @@ function initMap() {
     customAttribution: BASE_ATTRIBUTION,
   });
   map.addControl(attributionControl);
-  updateAqiAttribution(showAqi);
+  refreshAttribution();
   updateAqiLegend(showAqi);
   updateAirLegend(showPsi);
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
@@ -1203,7 +1205,7 @@ async function httpErrorMessage(res, url) {
 
 // Returns { data, fresh }; fresh means the data came from upstream, so callers must
 // never cache it into a fresh-looking entry when it was actually a stale-cache fallback.
-async function fetchWithRetry(url, cached) {
+async function fetchWithRetry(url, cached, retries = FETCH_RETRIES) {
   for (let attempt = 1; ; attempt++) {
     let res;
     // A 429 exhausts the upstream 10s window: block the tab and wait it out —
@@ -1220,12 +1222,12 @@ async function fetchWithRetry(url, cached) {
       }
     } catch (e) {
       if (cached) return { data: cached.data, fresh: false };
-      if (attempt > FETCH_RETRIES) throw new Error(`${e.message || 'fetch failed'} [${url}]`);
+      if (attempt > retries) throw new Error(`${e.message || 'fetch failed'} [${url}]`);
       await delay(FETCH_RETRY_DELAY);
       continue;
     }
     if (cached) return { data: cached.data, fresh: false };
-    if (attempt <= FETCH_RETRIES) {
+    if (attempt <= retries) {
       await delay(waitMs);
       continue;
     }
@@ -1242,13 +1244,13 @@ function isCacheable(json) {
 // data short-circuits without touching the network; beyond it the network answers, falling
 // back to a still-valid cache entry on failure (never re-stamped as fresh). Entries past
 // the cache TTL are invisible to readApiCache — their signed image URLs are dead.
-async function apiFetch(url, { maxAgeMs = 0 } = {}) {
+async function apiFetch(url, { maxAgeMs = 0, retries = FETCH_RETRIES } = {}) {
   if (inflightFetches.has(url)) return inflightFetches.get(url);
   const promise = (async () => {
     const cached = readApiCache(url);
     if (cached && Date.now() - cached.cachedAt < maxAgeMs) return cached.data;
 
-    const { data, fresh } = await fetchWithRetry(url, cached);
+    const { data, fresh } = await fetchWithRetry(url, cached, retries);
     if (fresh && isCacheable(data)) writeApiCache(url, data);
     return data;
   })();
@@ -3106,13 +3108,14 @@ function addAqiLayers() {
   updateAqiAgeVisibility();
 }
 
-function updateAqiAttribution(on) {
+function refreshAttribution() {
   if (!attributionControl) return;
   // Fires ride along with the AQI layer, so their credit does too.
   attributionControl.options.customAttribution = [
     BASE_ATTRIBUTION,
-    on && AQI_ATTRIBUTION,
-    on && HOTSPOT_ATTRIBUTION,
+    showAqi && AQI_ATTRIBUTION,
+    showAqi && HOTSPOT_ATTRIBUTION,
+    showWind && WIND_ATTRIBUTION,
   ]
     .filter(Boolean)
     .join(' · ');
@@ -3134,7 +3137,7 @@ function setAqiOverlay(on) {
     renderHotspots();
   }
   updateAqiAgeVisibility();
-  updateAqiAttribution(on);
+  refreshAttribution();
   updateAqiLegend(on);
 }
 
@@ -6041,8 +6044,10 @@ function windBucketStyles() {
   return windPalette;
 }
 
-function buildWindField(stations) {
-  // IDW (p=3) over stations on a ~450 m grid; mask is full within ~9 km of a station, zero past ~24 km.
+// `regional` widens the field to the whole 480 km radar square so ring-airport
+// METARs cover the seas around Singapore; the default is the NEA-only island field.
+function buildWindField(stations, { regional = false } = {}) {
+  // IDW (p=3) over stations; mask is full within R0, zero past R1.
   const PAD = 0.25;
   let minLng = Infinity,
     maxLng = -Infinity,
@@ -6054,10 +6059,26 @@ function buildWindField(stations) {
     if (s.lat < minLat) minLat = s.lat;
     if (s.lat > maxLat) maxLat = s.lat;
   }
-  minLng -= PAD;
-  maxLng += PAD;
-  minLat -= PAD;
-  maxLat += PAD;
+  let R0, R1;
+  if (regional) {
+    // Ring airports sit ~150–500 km out: fade across the gaps so interpolation
+    // fills them, and cover the full box (the hull alone stops at the outermost
+    // airports, leaving the west/south corners empty).
+    const bb = RADAR_BOUNDS[480];
+    minLng = bb.upperLeft.longitude;
+    maxLng = bb.lowerRight.longitude;
+    minLat = bb.lowerRight.latitude;
+    maxLat = bb.upperLeft.latitude;
+    R0 = 0.5;
+    R1 = 4.5;
+  } else {
+    minLng -= PAD;
+    maxLng += PAD;
+    minLat -= PAD;
+    maxLat += PAD;
+    R0 = 0.08;
+    R1 = 0.22;
+  }
   const nx = clamp(Math.round((maxLng - minLng) / 0.004), 48, 300);
   const ny = clamp(Math.round((maxLat - minLat) / 0.004), 48, 300);
   const dLng = (maxLng - minLng) / (nx - 1);
@@ -6065,8 +6086,6 @@ function buildWindField(stations) {
   const u = new Float32Array(nx * ny);
   const v = new Float32Array(nx * ny);
   const m = new Float32Array(nx * ny);
-  const R0 = 0.08,
-    R1 = 0.22;
   for (let j = 0; j < ny; j++) {
     const lat = minLat + j * dLat;
     for (let i = 0; i < nx; i++) {
@@ -6196,23 +6215,33 @@ function windRespawn(i) {
   windSx[i] = NaN;
 }
 
+function windZoomBoost() {
+  // Screen-speed compensation: geographic steps shrink with zoom, so at far zoom-outs
+  // trails collapse into static-looking dots that read as map marks. Below the default
+  // SG fit (zoom 10), double the exact 2^(10-zoom) compensation and lengthen the fade
+  // tail so far zoom-outs show flowing streaks instead of dashes.
+  const zoom = map.getZoom();
+  return zoom >= 10 ? 1 : Math.min(2 ** (10 - zoom) * 2, 32);
+}
+
 function stepWind(now) {
   let dt = now - windLastT;
   windLastT = now;
   dt = clamp(dt, 4, 50);
   const w = windViewW;
   const h = windViewH;
+  const zoomBoost = windZoomBoost();
   if (windClearNext) {
     windCtx.clearRect(0, 0, w, h);
     windClearNext = false;
   } else {
     windCtx.globalCompositeOperation = 'destination-in';
-    windCtx.fillStyle = `rgba(0, 0, 0, ${WIND_FADE})`;
+    windCtx.fillStyle = `rgba(0, 0, 0, ${zoomBoost > 1 ? 0.95 : WIND_FADE})`;
     windCtx.fillRect(0, 0, w, h);
     windCtx.globalCompositeOperation = 'source-over';
   }
   windBucketN.fill(0);
-  const step = (dt / 1000) * WIND_SPEEDUP;
+  const step = (dt / 1000) * WIND_SPEEDUP * zoomBoost;
   for (let i = 0; i < windParticleCount; i++) {
     windAge[i] += dt;
     if (windAge[i] > windLife[i]) {
@@ -6276,10 +6305,12 @@ function stepWind(now) {
 }
 
 // Stationary km/h readouts: outline-only text, rotated to the local flow direction.
-// Positions stay put; only the number/angle refresh when the wind field updates.
+// Each reads its own station observation — never the interpolated field — so the
+// number and angle are exactly what that station reported, like the NEA ones.
 const WIND_MS_TO_KMH = 3.6;
 const windLabels = [];
 let windLabelRaf = 0;
+let windLabelSignature = '';
 
 function clearWindLabels() {
   if (windLabelRaf) {
@@ -6288,6 +6319,7 @@ function clearWindLabels() {
   }
   for (const L of windLabels) L.marker.remove();
   windLabels.length = 0;
+  windLabelSignature = '';
 }
 
 function windLabelEl() {
@@ -6313,9 +6345,9 @@ function tickWindLabelRots() {
 }
 
 function updateWindLabelReadout(L) {
-  sampleWind(L.lng, L.lat);
-  const u = windSample.u;
-  const v = windSample.v;
+  // The station's own u/v: station observations are not interpolated or smoothed.
+  const u = L.station.u;
+  const v = L.station.v;
   const kmh = Math.round(Math.hypot(u, v) * WIND_MS_TO_KMH);
   const label = `${kmh}km/h`;
   L.text.textContent = label;
@@ -6330,7 +6362,8 @@ function updateWindLabelReadout(L) {
   }
   // Align to travel direction, then flip 180° if that would leave the text upside-down.
   // When flipped, reverse the shimmer so the glint still travels with the wind.
-  let rot = (-Math.atan2(v, u) * 180) / Math.PI;
+  // Calm has no direction to show, so it stays upright instead of pointing at noise.
+  let rot = u === 0 && v === 0 ? 0 : (-Math.atan2(v, u) * 180) / Math.PI;
   let flip = false;
   while (rot > 90) {
     rot -= 180;
@@ -6360,9 +6393,7 @@ function updateWindLabelReadout(L) {
   }
 }
 
-function addWindLabelAt(lng, lat) {
-  sampleWind(lng, lat);
-  if (windSample.m < 0.03) return;
+function addWindLabel(station) {
   const { wrap, text } = windLabelEl();
   // setLngLat before addTo — Marker._update reads _lngLat on insert.
   const marker = new maplibregl.Marker({
@@ -6371,11 +6402,16 @@ function addWindLabelAt(lng, lat) {
     rotationAlignment: 'map',
     pitchAlignment: 'map',
   })
-    .setLngLat([lng, lat])
+    .setLngLat([station.lng, station.lat])
     .addTo(map);
-  const L = { marker, text, lng, lat, speedKmh: -1, rot: null, rotTarget: null };
+  const L = { marker, text, station, speedKmh: -1, rot: null, rotTarget: null };
   updateWindLabelReadout(L);
   windLabels.push(L);
+}
+
+// Identity, not count: a swap of stations at equal count must still rebuild.
+function windStationSignature() {
+  return windStations.map((s) => s.id ?? `${s.lng},${s.lat}`).join('|');
 }
 
 function ensureWindLabels() {
@@ -6383,13 +6419,18 @@ function ensureWindLabels() {
     clearWindLabels();
     return;
   }
-  // One label per NEA station so coverage is the island itself, not the padded field.
-  if (windLabels.length === windStations.length) {
-    for (const L of windLabels) updateWindLabelReadout(L);
+  // One label per station (NEA island network plus the regional ring airports).
+  const signature = windStationSignature();
+  if (signature === windLabelSignature) {
+    for (let i = 0; i < windLabels.length; i++) {
+      windLabels[i].station = windStations[i];
+      updateWindLabelReadout(windLabels[i]);
+    }
     return;
   }
   clearWindLabels();
-  for (const s of windStations) addWindLabelAt(s.lng, s.lat);
+  windLabelSignature = signature;
+  for (const s of windStations) addWindLabel(s);
 }
 
 function renderWindLabelsStatic() {
@@ -6410,7 +6451,8 @@ function renderWindStatic() {
   // Fixed segment budget so big viewports don't block for hundreds of ms in one task;
   // streamline extent stays constant, only sampling gets coarser.
   const steps = clamp(Math.round(32000 / windParticleCount), 15, 110);
-  const step = (0.04 * WIND_SPEEDUP * 110) / steps;
+  // Same screen-speed compensation as stepWind so static streamlines stay readable zoomed out.
+  const step = (0.04 * WIND_SPEEDUP * 110 * windZoomBoost()) / steps;
   for (let i = 0; i < windParticleCount; i++) {
     windRespawn(i);
     let lng = windPx[i];
@@ -6569,6 +6611,7 @@ function startWindLoop() {
 
 function setWindOverlay(on) {
   const hasLayer = !!map?.getLayer(WIND_LAYER_ID);
+  refreshAttribution();
   if (on) {
     sizeWindCanvas();
     for (let i = 0; i < WIND_MAX_PARTICLES; i++) windSx[i] = NaN;
@@ -6614,7 +6657,13 @@ async function loadWind({ forNowcast = false, forTemp = false } = {}) {
       const speedUrl = apiURL('/wind-speed');
       const dirUrl = apiURL('/wind-direction');
       const agedFetch = (url) => apiFetch(url, { maxAgeMs: API_CACHE_TTL });
-      const [speedJson, dirJson] = await Promise.all([agedFetch(speedUrl), agedFetch(dirUrl)]);
+      const regionalUrl = apiURL('/wind-regional');
+      const [speedJson, dirJson, regionalJson] = await Promise.all([
+        agedFetch(speedUrl),
+        agedFetch(dirUrl),
+        // Optional regional ring: no retries, so an outage can't stall the wind load.
+        apiFetch(regionalUrl, { maxAgeMs: API_CACHE_TTL, retries: 0 }).catch(() => null),
+      ]);
       assertApiOk(speedJson, speedUrl);
       assertApiOk(dirJson, dirUrl);
       const speedByStation = new Map();
@@ -6623,7 +6672,7 @@ async function loadWind({ forNowcast = false, forTemp = false } = {}) {
       const dirByStation = new Map();
       for (const r of dirJson.data.readings?.[0]?.data || [])
         dirByStation.set(r.stationId, r.value);
-      const stations = [];
+      const neaStations = [];
       for (const s of speedJson.data.stations || []) {
         const knots = speedByStation.get(s.id);
         const dir = dirByStation.get(s.id);
@@ -6631,16 +6680,35 @@ async function loadWind({ forNowcast = false, forTemp = false } = {}) {
         const speedMs = knots * WIND_KNOTS_TO_MS;
         // Readings report meteorological "from" direction; particles flow the opposite way.
         const toRad = ((dir + 180) * Math.PI) / 180;
-        stations.push({
+        neaStations.push({
+          id: s.id,
           lng: s.location.longitude,
           lat: s.location.latitude,
-          u: speedMs * Math.sin(toRad),
-          v: speedMs * Math.cos(toRad),
+          // A calm reading has no direction; keep it an exact zero vector.
+          u: speedMs === 0 ? 0 : speedMs * Math.sin(toRad),
+          v: speedMs === 0 ? 0 : speedMs * Math.cos(toRad),
         });
       }
-      if (stations.length < 3) throw new Error('Insufficient wind stations');
-      windStations = stations;
-      windField = buildWindField(stations);
+      if (neaStations.length < 3) throw new Error('Insufficient wind stations');
+      const regional = [];
+      for (const s of regionalJson?.code === 0 ? regionalJson.data.stations || [] : []) {
+        if (!Number.isFinite(s.lat) || !Number.isFinite(s.lng) || !Number.isFinite(s.spd)) continue;
+        // A speed with no direction is unplaceable; never invent one.
+        if (s.spd > 0 && (s.dir == null || !Number.isFinite(Number(s.dir)))) continue;
+        const speedMs = s.spd * WIND_KNOTS_TO_MS;
+        const toRad = ((Number(s.dir ?? 0) + 180) * Math.PI) / 180;
+        regional.push({
+          id: s.id,
+          lng: s.lng,
+          lat: s.lat,
+          u: speedMs === 0 ? 0 : speedMs * Math.sin(toRad),
+          v: speedMs === 0 ? 0 : speedMs * Math.cos(toRad),
+        });
+      }
+      windStations = regional.length ? neaStations.concat(regional) : neaStations;
+      // One field for everything: the nowcast samples it across the whole 70 km
+      // frame, so ring METARs must reach the frame edges, not just Singapore.
+      windField = buildWindField(windStations, { regional: regional.length > 0 });
       windDataAt = Date.now();
       if (showTemp) recomputeTempFeels();
       if (showWind) {
@@ -6757,7 +6825,7 @@ const NOWCAST_SCORES_KEY = 'sgwr-nowcast-scores';
 const NOWCAST_SCORES_MAX = 6 * 12 * 3;
 // Bump when the forecast logic changes so nowcastScores() doesn't average
 // old and new behaviour. v1 = pre edge/dense/decay changes (no `v` field).
-const NOWCAST_SCORE_VERSION = 2;
+const NOWCAST_SCORE_VERSION = 3;
 // Rolling fit samples: {slot, model, persistence}, one per live 70km slot.
 const nowcastFitSamples = [];
 // Forecasts awaiting verification, keyed `${targetSlot}:${lead}`.
@@ -7114,9 +7182,11 @@ function pixelLngLat(pixel) {
 
 function windDisplacement(pixel, steps) {
   const { lng, lat } = pixelLngLat(pixel);
+  // Callers iterate 70 km frame pixels only, so the regional field is sampled
+  // exactly where the nowcast runs — never beyond the frame.
   const w = sampleWind(lng, lat);
   return {
-    // Station-coverage mask (0 far from stations); u/v are already scaled by it.
+    // Station-coverage mask (0 away from every station); u/v are already scaled by it.
     m: w.m,
     dx:
       (w.u * steps * 5 * 60) /

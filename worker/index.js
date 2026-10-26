@@ -29,6 +29,85 @@ const HOTSPOT_REGIONS = ['sumatra', 'p_malaysia', 'singapore', 'kalimantan'];
 // 0.25 km therefore catches only genuine cross-set repeats, never a neighbour pixel.
 const HOTSPOT_DEDUPE_KM = 0.25;
 
+// Regional wind observations: ring-airport METARs within the 480 km radar square
+// (Iowa Environmental Mesonet archive of the global METAR feed, keyless). Chosen
+// over aviationweather.gov because it carries ~8 more regional stations (Malacca,
+// Mersing, Kerteh, Ipoh, Sitiawan, Kuala Terengganu, Minangkabau, Palembang) and
+// reports 30-minutely, not hourly. Calm stations (0 kt) pass through with dir null;
+// rows with missing wind are dropped — no direction means no vector to place.
+// Coordinates are hardcoded (verified) — IEM's own metadata misplaces WIDN at
+// Batam's position.
+const METAR_STATIONS = {
+  WMKJ: { name: 'Senai', lat: 1.641, lng: 103.67 },
+  WIDD: { name: 'Batam', lat: 1.121, lng: 104.119 },
+  WIDN: { name: 'Tanjung Pinang', lat: 0.923, lng: 104.532 },
+  WIBB: { name: 'Pekanbaru', lat: 0.461, lng: 101.445 },
+  WIEE: { name: 'Minangkabau', lat: -0.788, lng: 100.281 },
+  WIPP: { name: 'Palembang', lat: -2.898, lng: 104.7 },
+  WMKK: { name: 'KLIA', lat: 2.747, lng: 101.714 },
+  WMSA: { name: 'Subang', lat: 3.131, lng: 101.552 },
+  WMKM: { name: 'Malacca', lat: 2.263, lng: 102.252 },
+  WMAU: { name: 'Mersing', lat: 2.45, lng: 103.833 },
+  WMKD: { name: 'Kuantan', lat: 3.775, lng: 103.209 },
+  WMKE: { name: 'Kerteh', lat: 4.537, lng: 103.427 },
+  WMKN: { name: 'Kuala Terengganu', lat: 5.383, lng: 103.103 },
+  WMKI: { name: 'Ipoh', lat: 4.568, lng: 101.092 },
+  WMBA: { name: 'Sitiawan', lat: 4.217, lng: 100.7 },
+};
+
+// Normalized to the app's { code: 0, data } envelope. One windowed batch request
+// covers every station; the newest valid row per station wins. Reports older than
+// 90 min are stale and dropped. 5 min edge cache matches the METAR cadence.
+async function metars() {
+  const ids = Object.keys(METAR_STATIONS);
+  const fmt = (d) => ({
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+  });
+  const end = fmt(new Date(Date.now() + 60 * 1000));
+  const start = fmt(new Date(Date.now() - 2 * 60 * 60 * 1000));
+  const q = (t, suffix) =>
+    Object.entries(t)
+      .map(([k, v]) => `${k}${suffix}=${v}`)
+      .join('&');
+  const url = `https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=${ids.join('&station=')}&data=drct&data=sknt&report_type=3&report_type=4&tz=UTC&${q(start, 1)}&${q(end, 2)}`;
+  try {
+    const upstreamRes = await fetch(url, { cf: { cacheTtl: 300 } });
+    if (!upstreamRes.ok) throw new Error(`upstream ${upstreamRes.status}`);
+    const text = await upstreamRes.text();
+    const staleBefore = Date.now() - 90 * 60 * 1000;
+    const latest = new Map();
+    for (const line of text.split(/\r?\n/).slice(1)) {
+      const [station, valid, drct, sknt] = line.split(',');
+      const meta = METAR_STATIONS[station];
+      // An absent column is '', never 0 — Number('') would fake a calm reading.
+      if (!meta || !valid || !sknt || sknt === 'M') continue;
+      const spd = Number(sknt);
+      if (!Number.isFinite(spd)) continue;
+      const dir = spd === 0 || !drct || drct === 'M' ? null : Number(drct);
+      // No direction means no vector: a moving station is dropped, never placed.
+      if (spd > 0 && !Number.isFinite(dir)) continue;
+      const time = Date.parse(`${valid.replace(' ', 'T')}Z`);
+      if (!Number.isFinite(time) || time < staleBefore) continue;
+      latest.set(station, {
+        id: station,
+        name: meta.name,
+        lat: meta.lat,
+        lng: meta.lng,
+        dir,
+        spd,
+        time: new Date(time).toISOString(),
+      });
+    }
+    return Response.json({ code: 0, data: { stations: [...latest.values()] } });
+  } catch (e) {
+    return Response.json({ code: 502, errorMsg: `METAR upstream error: ${e.message}` }, { status: 502 });
+  }
+}
+
 // Allowlist of paths the app uses; anything else is a 404.
 const ALLOWED_PREFIXES = [
   '/weather-radar-images/',
@@ -297,6 +376,12 @@ export default {
 
     if (path === '/traffic-incidents') {
       return trafficIncidents(env);
+    }
+
+    // Provider-agnostic route: METARs today, but only the envelope is the contract,
+    // so the upstream can change without renaming the API.
+    if (path === '/wind-regional') {
+      return metars();
     }
 
     if (path === '/hotspots') {

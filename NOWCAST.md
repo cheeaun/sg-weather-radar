@@ -98,8 +98,10 @@ rain on a dry frame scores 0 (false alarm).
   shared arrays such as `persistence` encoded once; entries older than 30 min
   dropped on load) and fit samples to `sgwr-nowcast-fit`, so dev reloads no
   longer lose +10/+15 scores. Quota errors fall back to in-memory only.
-- **Score versions**: records carry `v` (`NOWCAST_SCORE_VERSION`, now 2;
-  missing = 1). Bump it whenever forecast logic changes; `nowcastScores()`
+- **Score versions**: records carry `v` (`NOWCAST_SCORE_VERSION`, now 3;
+  missing = 1). 3 = regional (NEA + ring-airport METAR) wind field, so the wind
+  member and the look-back motion field now have weight across the whole 70 km
+  frame instead of fading out ~24 km from an NEA station. Bump it whenever forecast logic changes; `nowcastScores()`
   shows the current version by default (`nowcastScores({ v: 1 })` for older).
 - **`nowcastScores()`** in the console: `console.table` of mean score per
   lead × member over the persisted history, plus mean points vs persistence.
@@ -153,8 +155,10 @@ so light fringes don't bloat. Dense flow is low-passed (4× box + bilinear).
 **Map display** uses a dedicated `createDisplayField`: small cells follow
 their median track; sheets follow the **wind IDW** (smooth shear, no block
 grid) topped up by low-pass dense × `(1 − mask)`. Station wind u/v are
-pre-multiplied by the coverage mask (→ 0 ~24 km beyond the stations), so
-without the top-up far sheets (Strait, Johor) stalled. Wind missing (API 429)
+pre-multiplied by the coverage mask; with ring-airport METARs the mask is ~1
+across the whole 70 km frame, so even far sheets (Strait, Johor) follow the
+wind. Without METARs the mask still fades out ~24 km beyond the NEA stations
+and the top-up carries the far field, as before. Wind missing (API 429)
 → mask 0 → pure **low-pass dense** (4× box average + bilinear upsample) — never raw dense, which
 re-tears into axis-aligned rectangles. Raw dense stays in the ensemble for
 votes. Pipeline: `advectForward(displayField)` → `spatialCoherence` →
