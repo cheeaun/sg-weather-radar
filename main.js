@@ -2045,6 +2045,18 @@ function missingRangesFor(slotMs) {
   });
 }
 
+// fetchAtSlot snapshots pollRanges before the image loads settle, so a failure that
+// lands later never reaches the missingRangesFor re-sign poll and the hatched map
+// waits for the slot boundary; re-arm it for the current slot only, never scrubbed.
+function noteFailedFrameImage(url, slotMs) {
+  if (failedImageActive(url)) return;
+  markFailedImage(url);
+  renderTicks();
+  if (!pollSlotMs || slotMs !== pollSlotMs || pollRanges.length) return;
+  pollRanges = missingRangesFor(pollSlotMs);
+  if (pollRanges.length) scheduleNextRefresh();
+}
+
 async function fetchAtSlot() {
   if (fetchRadarBusy) {
     scheduleNextRefresh();
@@ -2201,6 +2213,9 @@ function renderTicks(newSlots) {
   computeTickMidpoints();
   positionEndpointLabels();
   requestTickRain();
+  // Rebuilds start without `.active`, and an async image failure repaints the ticks
+  // after updateSliderUI already ran — without this the selection silently vanishes.
+  container.children[currentIndex]?.classList.add('active');
 }
 
 // Pixel rain chart behind the console: an SVG stacked-area wash from the radar
@@ -5148,7 +5163,7 @@ function prepareDisplayData(range, frame) {
   return promise;
 }
 
-function applyRadarFrame(range, frame) {
+function applyRadarFrame(range, frame, slotMs) {
   const source = map && styleReady && map.getSource(`radar-${range}`);
   if (!source) return;
   const layerId = `radar-${range}`;
@@ -5205,10 +5220,7 @@ function applyRadarFrame(range, frame) {
         updateBoundaryAvailability();
       })
       .catch(() => {
-        if (!failedImageActive(frame.url)) {
-          markFailedImage(frame.url);
-          renderTicks();
-        }
+        noteFailedFrameImage(frame.url, slotMs);
         if (radarPendingKey.get(range) === key) hide();
       })
       .finally(() => setBusy(false));
@@ -5246,10 +5258,7 @@ function applyRadarFrame(range, frame) {
       updateBoundaryAvailability();
     })
     .catch(() => {
-      if (!failedImageActive(frame.url)) {
-        markFailedImage(frame.url);
-        renderTicks();
-      }
+      noteFailedFrameImage(frame.url, slotMs);
       if (radarPendingKey.get(range) === key) hide();
     })
     .finally(() => setBusy(false));
@@ -6779,7 +6788,7 @@ function showFrame(index) {
   radarAvailabilityDeferred = true;
   try {
     for (const range of RANGES) {
-      applyRadarFrame(range, framesMap[range]?.get(slotMs));
+      applyRadarFrame(range, framesMap[range]?.get(slotMs), slotMs);
     }
   } finally {
     radarAvailabilityDeferred = false;
@@ -9054,6 +9063,9 @@ function refreshAfterWake() {
   if (showTemp) refreshTemp();
   if (showPsi) refreshAirQuality();
   if (showForecast) refreshForecast();
+  // pollRanges was snapshotted before the last image loads settled, so re-read it:
+  // a wake inside the hatched window must poll now, not wait for the slot boundary.
+  if (pollSlotMs) pollRanges = missingRangesFor(pollSlotMs);
   if (pollRanges.length) pollOnce();
   else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
 }
