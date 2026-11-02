@@ -45,7 +45,7 @@ const RANGES = [480, 240, 70];
 const SLOT_MS = 5 * 60 * 1000;
 const FETCH_PAD_MS = SLOT_MS * 3;
 const WINDOW_MS = PAST_HOURS * 60 * 60 * 1000 + FETCH_PAD_MS;
-const TICK_RANGES = [480, 240, 70];
+const TICK_RANGES = [70, 240, 480];
 const LIGHTNING_MAX_AGE = 10 * 60 * 1000;
 const FLOOD_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 // Soft end when PUB never sends a Cancel (instruction text says avoid ~1 hour).
@@ -196,19 +196,18 @@ function slotOf(iso) {
   return Math.floor(new Date(iso).getTime() / SLOT_MS) * SLOT_MS;
 }
 
-const TICK_RING_RADII = { 70: 2.5, 240: 5.5, 480: 8.5 };
+const TICK_RING_CY = { 70: 20, 240: 12, 480: 4 };
 
-// Combined tick icon: always all three rings, but a range with no frame at this
-// slot fades to 20% instead of disappearing (matching the button glyphs).
-function tickShapeSVG(present, future70) {
+// Combined tick icon: stacked range dots (70 at the bottom), filled where the
+// range has a frame at this slot, outline-only otherwise (the button glyphs
+// follow the same solid-vs-outline rule).
+function tickShapeSVG(present) {
   let circles = '';
   for (const range of TICK_RANGES) {
-    const has = present.includes(range);
-    const dash = has && range === 70 && future70 ? ' stroke-dasharray="4 4"' : '';
-    const fade = has ? '' : ' stroke-opacity="0.2"';
-    circles += `<circle cx="10" cy="10" r="${TICK_RING_RADII[range]}" fill="none" stroke="currentColor" stroke-width="2"${dash}${fade} />`;
+    const fill = present.includes(range) ? 'currentColor' : 'none';
+    circles += `<circle cx="6" cy="${TICK_RING_CY[range]}" r="2.5" fill="${fill}" stroke="currentColor" stroke-width="1.2" />`;
   }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" aria-hidden="true">${circles}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 24" aria-hidden="true">${circles}</svg>`;
 }
 
 function showError(msg) {
@@ -506,7 +505,7 @@ class RangeToggleControl {
       RANGE_TOGGLE_LABELS[RANGE_TOGGLE_STATES[(this._index + 1) % RANGE_TOGGLE_STATES.length]];
     this._button.dataset.tip = `Fit ${nextLabel}`;
     this._button.setAttribute('aria-label', `Fit map to ${nextLabel}`);
-    this._button.innerHTML = `<svg${state === 'sg' ? ' class="sg-icon"' : ''} viewBox="${state === 'sg' ? '0 0 12 12' : '0 0 20 20'}" fill="currentColor" aria-hidden="true"><use href="#range-shape-${state}"/></svg>`;
+    this._button.innerHTML = `<svg${state === 'sg' ? ' class="sg-icon"' : ''} viewBox="${state === 'sg' ? '0 0 12 12' : '0 0 12 24'}" fill="currentColor" aria-hidden="true"><use href="#range-shape-${state}"/></svg>`;
   }
   _fitBounds() {
     fitToBounds(RANGE_TOGGLE_STATES[this._index]);
@@ -2192,12 +2191,15 @@ function renderTicks(newSlots) {
     const col = document.createElement('div');
     col.className = 'tick-col';
     const slotMs = new Date(allTimestamps[i]).getTime();
-    col.style.setProperty('--seg', slotMs > Date.now() ? 'var(--forecast)' : 'var(--live-data)');
+    // The bar leads into the next slot, so it turns forecast-blue at the live →
+    // nowcast boundary, not one tick later.
+    const nextMs = i + 1 < n ? new Date(allTimestamps[i + 1]).getTime() : slotMs;
+    col.style.setProperty('--seg', nextMs > Date.now() ? 'var(--forecast)' : 'var(--live-data)');
     const present = TICK_RANGES.filter((range) => framesMap[range]?.get(slotMs));
     const future70 = slotMs > liveSlot70;
     const shape = document.createElement('span');
     shape.className = 'tick-shape';
-    shape.innerHTML = tickShapeSVG(present, future70);
+    shape.innerHTML = tickShapeSVG(present);
     // Tick = a scan exists at this slot. Image failures hide the map layer only;
     // otherwise a burst of dead signed URLs blanks the whole timeline one by one.
     if (present.length) shape.classList.add('on');
@@ -5291,36 +5293,41 @@ function boundaryTextHalo() {
   );
 }
 
-const SHAPE_SIZE = 12;
+const SHAPE_DESIGN_W = 12;
+const SHAPE_DESIGN_H = 24;
+// Logical width the stacked-dot icon renders at inside the map label; the 12×24
+// design space below is scaled to fit it.
+const SHAPE_SIZE = 9;
 const SHAPE_SCALE = 2;
 const SHAPE_VARIANTS = {
   light: { ink: '#0a161c', halo: 'rgba(253, 252, 248, 0.95)' },
   dark: { ink: '#eef4f6', halo: 'rgba(5, 9, 11, 0.95)' },
 };
 
-// Concentric rings matching the button glyphs; rings past the range fade to 20%.
-function traceShape(ctx, range, cx, cy, width) {
+// Stacked range dots matching the button glyphs (480 top → 70 bottom); dots for
+// ranges within the box fill solid, the rest stay outline-only.
+function traceShape(ctx, range, width) {
   const solid = { 70: 1, 240: 2, 480: 3 }[range];
-  const s = SHAPE_SIZE / 20;
   ctx.lineWidth = width;
-  [2.5, 5.5, 8.5].forEach((r, i) => {
-    ctx.globalAlpha = i < solid ? 1 : 0.2;
+  [20, 12, 4].forEach((cy, i) => {
     ctx.beginPath();
-    ctx.arc(cx, cy, r * s, 0, Math.PI * 2);
+    ctx.arc(6, cy, 2.5, 0, Math.PI * 2);
+    if (i < solid) {
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.fill();
+    }
     ctx.stroke();
   });
-  ctx.globalAlpha = 1;
 }
 
 function renderShapeImage(range, variant) {
   const { ink, halo } = SHAPE_VARIANTS[variant];
+  const fit = (SHAPE_SIZE / SHAPE_DESIGN_W) * SHAPE_SCALE;
   const canvas = document.createElement('canvas');
   canvas.width = SHAPE_SIZE * SHAPE_SCALE;
-  canvas.height = SHAPE_SIZE * SHAPE_SCALE;
+  canvas.height = SHAPE_DESIGN_H * (SHAPE_SIZE / SHAPE_DESIGN_W) * SHAPE_SCALE;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.scale(SHAPE_SCALE, SHAPE_SCALE);
-  const cx = SHAPE_SIZE / 2;
-  const cy = SHAPE_SIZE / 2;
+  ctx.scale(fit, fit);
 
   ctx.save();
   ctx.strokeStyle = halo;
@@ -5328,11 +5335,11 @@ function renderShapeImage(range, variant) {
   ctx.lineCap = 'round';
   ctx.shadowColor = halo;
   ctx.shadowBlur = 2;
-  traceShape(ctx, range, cx, cy, 2.5);
+  traceShape(ctx, range, 2.5);
   ctx.restore();
 
   ctx.strokeStyle = ink;
-  traceShape(ctx, range, cx, cy, 1.2);
+  traceShape(ctx, range, 1.2);
 
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }

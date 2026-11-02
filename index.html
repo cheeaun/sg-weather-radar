@@ -28,49 +28,66 @@
       aria-hidden="true"
     >
       <defs>
-        <!-- 70 km: dot-with-rings, hollow center (no dot — avoids confusion with map markers). Outer rings faded. -->
+        <!-- Stacked range dots, 480 km on top → 70 km at the bottom. Filled solid
+             for ranges within the fitted range, outline-only beyond it. -->
         <g id="range-shape-70">
-          <circle cx="10" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle cx="6" cy="4" r="2.5" fill="none" stroke="currentColor" stroke-width="1.2" />
+          <circle cx="6" cy="12" r="2.5" fill="none" stroke="currentColor" stroke-width="1.2" />
           <circle
-            cx="10"
-            cy="10"
-            r="5.5"
-            fill="none"
+            cx="6"
+            cy="20"
+            r="2.5"
+            fill="currentColor"
             stroke="currentColor"
-            stroke-width="2"
-            stroke-opacity="0.2"
-          />
-          <circle
-            cx="10"
-            cy="10"
-            r="8.5"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-opacity="0.2"
+            stroke-width="1.2"
           />
         </g>
 
-        <!-- 240 km: two solid rings, outer ring faded. -->
         <g id="range-shape-240">
-          <circle cx="10" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="2" />
-          <circle cx="10" cy="10" r="5.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle cx="6" cy="4" r="2.5" fill="none" stroke="currentColor" stroke-width="1.2" />
           <circle
-            cx="10"
-            cy="10"
-            r="8.5"
-            fill="none"
+            cx="6"
+            cy="12"
+            r="2.5"
+            fill="currentColor"
             stroke="currentColor"
-            stroke-width="2"
-            stroke-opacity="0.2"
+            stroke-width="1.2"
+          />
+          <circle
+            cx="6"
+            cy="20"
+            r="2.5"
+            fill="currentColor"
+            stroke="currentColor"
+            stroke-width="1.2"
           />
         </g>
 
-        <!-- 480 km: three solid rings. -->
         <g id="range-shape-480">
-          <circle cx="10" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="2" />
-          <circle cx="10" cy="10" r="5.5" fill="none" stroke="currentColor" stroke-width="2" />
-          <circle cx="10" cy="10" r="8.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <circle
+            cx="6"
+            cy="4"
+            r="2.5"
+            fill="currentColor"
+            stroke="currentColor"
+            stroke-width="1.2"
+          />
+          <circle
+            cx="6"
+            cy="12"
+            r="2.5"
+            fill="currentColor"
+            stroke="currentColor"
+            stroke-width="1.2"
+          />
+          <circle
+            cx="6"
+            cy="20"
+            r="2.5"
+            fill="currentColor"
+            stroke="currentColor"
+            stroke-width="1.2"
+          />
         </g>
         <path
           id="range-shape-sg"

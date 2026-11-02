@@ -263,8 +263,8 @@ body {
   border-top: 1px solid var(--line);
 }
 .range-toggle-ctrl svg:not(.toggle-icon) {
-  width: 13px;
-  height: 13px;
+  width: 10px;
+  height: 20px;
   display: block;
   color: #333;
 }
@@ -1802,8 +1802,8 @@ scritto-text {
   content: '';
   position: absolute;
   top: 50%;
-  left: calc(50% + 7px);
-  width: calc(var(--tick-step, 0px) - 14px);
+  left: calc(50% + 4px);
+  width: calc(var(--tick-step, 0px) - 8px);
   height: 4px;
   transform: translateY(-50%);
   background: var(--seg, var(--line));
@@ -1818,7 +1818,7 @@ scritto-text {
 .tick-col.active ~ .tick-col::after {
   opacity: 0.2;
 }
-/* Opaque thumb under the selected ring. The blend stays on the leaves, not
+/* Opaque tall thumb under the selected dot stack. The blend stays on the leaves, not
    the row — a row-level multiply would erase white back into the backdrop. */
 .tick-col.active::before {
   content: '';
@@ -1826,11 +1826,16 @@ scritto-text {
   z-index: 1;
   top: 50%;
   left: 50%;
-  width: 18px;
-  height: 18px;
+  width: 8px;
+  height: 16px;
   transform: translate(-50%, -50%);
-  border-radius: 50%;
+  border-radius: 999px;
   background: #fff;
+  border: 2px solid var(--ink-strong);
+}
+/* Forecast selection: the thumb outline joins the nowcast blue. */
+.tick-col.active:has(.tick-shape.nowcast)::before {
+  border-color: var(--forecast);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) .tick-col.active::before {
@@ -1871,22 +1876,24 @@ pale panel. */
   position: relative;
   z-index: 1;
   display: flex;
-  color: var(--muted);
+  color: var(--ink-strong);
   visibility: hidden;
 }
 .tick-shape svg {
-  width: 12px;
+  width: 6px;
   height: 12px;
   display: block;
 }
 .tick-shape.on {
   visibility: visible;
-  opacity: 0.45;
-  transition:
-    opacity 0.25s ease,
-    color 0.25s ease;
+  opacity: 0.75;
+
+  .tick-col.active ~ .tick-col & {
+    opacity: 0.2;
+  }
 }
 .tick-shape.nowcast {
+  color: var(--forecast);
   opacity: 0.35;
 }
 .tick-shape.nowcast.rain {
@@ -1894,7 +1901,6 @@ pale panel. */
 }
 .tick-col.active .tick-shape.on {
   opacity: 1;
-  color: var(--ink-strong);
 }
 @keyframes ticks-in {
   from {
