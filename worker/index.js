@@ -13,12 +13,13 @@ const AQI_BOUNDS_BOX = { west: 92, south: -7.5, east: 120, north: 7.5 };
 // The region list is both the allowlist and the extent: everything these files
 // publish is rendered, with no further geographic filter.
 // Both ASMC products are merged. `nrt` is today's partial set and wins any
-// collision; `late` is the reprocessed previous day — it finds ~3.5x more fires
-// but lags a day, so it's drawn back at reduced opacity.
+// collision; `late` is the reprocessed product, which lags a day but finds ~3.5x
+// more fires, so it's drawn back at reduced opacity. The `late` file is a growing
+// archive (everything since early September), so only its newest date is used.
 // Cache lifetimes come from ASMC's publication cadence, not from how live the map
 // feels: each product re-issues about twice a day, so a short TTL just re-fetches
 // identical bytes. `nrt` is today's accumulating set and takes the shorter span;
-// `late` is a fixed previous day, so it barely changes at all.
+// `late` only gains a day per publication, so it barely changes at all.
 const HOTSPOT_SOURCES = [
   { src: 'nrt', prefix: 'DailyJP1NOAA20.', cacheTtl: 3 * 60 * 60 },
   { src: 'late', prefix: 'DailyJP1_LATENOAA20.', cacheTtl: 6 * 60 * 60 },
@@ -28,6 +29,8 @@ const HOTSPOT_REGIONS = ['sumatra', 'p_malaysia', 'singapore', 'kalimantan'];
 // rows sit ~0.5-1 km apart and the same fire on two days repeats at ~0.1-0.4 km.
 // 0.25 km therefore catches only genuine cross-set repeats, never a neighbour pixel.
 const HOTSPOT_DEDUPE_KM = 0.25;
+// ASMC's publication often lags a day, so a couple of days is still "current".
+const HOTSPOT_MAX_LAG_DAYS = 2;
 
 // Regional wind observations: ring-airport METARs within the 480 km radar square
 // (Iowa Environmental Mesonet archive of the global METAR feed, keyless). Chosen
@@ -220,6 +223,18 @@ function hotspotDistanceKm(a, b) {
   return 2 * 6371 * Math.asin(Math.sqrt(h));
 }
 
+// The reprocessed file stopped being "the previous day" — it now archives every
+// pass since early September and keeps growing, so only its newest date is the
+// intended yesterday backdrop (the rest is two months of stale fires).
+function latestDayOnly(points) {
+  let newest = '';
+  for (const p of points) {
+    const day = p.time ? p.time.slice(0, 10) : '';
+    if (day > newest) newest = day;
+  }
+  return newest ? points.filter((p) => p.time && p.time.slice(0, 10) === newest) : points;
+}
+
 // NRT wins: a reprocessed row is dropped when it repeats an NRT one. Strictly
 // one-directional — `late` never suppresses `nrt`, so today's set is always whole.
 function dedupeHotspots(nrt, late) {
@@ -284,10 +299,25 @@ async function hotspots() {
     return Response.json({ code: 502, errorMsg: 'ASMC hotspot upstream error' }, { status: 502 });
   }
   const nrt = fetched.filter((r) => r.src === 'nrt').flatMap((r) => r.points);
-  const late = fetched.filter((r) => r.src === 'late').flatMap((r) => r.points);
+  const late = latestDayOnly(fetched.filter((r) => r.src === 'late').flatMap((r) => r.points));
   const points = dedupeHotspots(nrt, late);
   // The NRT stamp is the one worth surfacing; `late` is always a day behind.
   const updated = fetched.find((r) => r.src === 'nrt' && r.updated)?.updated || null;
+  // Date & Time stamps are UTC but the app reads in Singapore time, so lateness is
+  // measured against the SGT calendar day. Up to two days behind is still shown (the
+  // feed itself often lags a day); anything staler is dropped rather than painted as
+  // current.
+  const newest = points.reduce(
+    (day, p) => (p.time && p.time.slice(0, 10) > day ? p.time.slice(0, 10) : day),
+    '',
+  );
+  const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const lagDays = Math.round(
+    (Date.parse(`${today}T00:00:00Z`) - Date.parse(`${newest}T00:00:00Z`)) / 86400000,
+  );
+  if (!newest || lagDays > HOTSPOT_MAX_LAG_DAYS) {
+    return Response.json({ code: 0, data: { hotspots: [], updated } });
+  }
   return Response.json({ code: 0, data: { hotspots: points, updated } });
 }
 
