@@ -165,6 +165,14 @@ let tempWbgtStations = [];
 // URL for the same timestamp is always a fresh attempt.
 const failedImages = new Map();
 const FAILED_IMAGE_TTL = 60 * 1000;
+// S3 presigns every frame URL for 20 min (X-Amz-Expires=1200). Frames kept from an
+// older fetch can't load any more, so their signature age decides whether the poll
+// must re-sign them before the map tries again.
+const FRAME_URL_TTL = 18 * 60 * 1000;
+function frameSignatureFresh(frame) {
+  if (!frame || frame.nowcast) return true;
+  return Date.now() - (frame.signedAt ?? 0) < FRAME_URL_TTL;
+}
 function failedImageActive(url) {
   const attemptedAt = failedImages.get(url);
   if (attemptedAt == null) return false;
@@ -1167,16 +1175,18 @@ let rateBlockedUntil = 0;
 async function acquireRateSlot() {
   for (;;) {
     const now = Date.now();
+    // A device clock correction can leave stamps "in the future"; never wait on those.
+    while (rateStamps.length && rateStamps[0] - now > RATE_WINDOW_MS) rateStamps.shift();
     while (rateStamps.length && now - rateStamps[0] >= RATE_WINDOW_MS) rateStamps.shift();
     if (now < rateBlockedUntil) {
-      await delay(rateBlockedUntil - now + 5);
+      await delay(Math.min(rateBlockedUntil - now, RATE_BLOCK_MS) + 5);
       continue;
     }
     if (rateStamps.length < RATE_MAX) {
       rateStamps.push(now);
       return;
     }
-    await delay(rateStamps[0] + RATE_WINDOW_MS - now + 5);
+    await delay(Math.min(rateStamps[0] + RATE_WINDOW_MS - now, RATE_WINDOW_MS) + 5);
   }
 }
 
@@ -1774,7 +1784,7 @@ async function loadRadarData(fetchFn, ranges = RANGES) {
           if (newest - WINDOW_MS < cutoffMs) cutoffMs = newest - WINDOW_MS;
           frames = usable
             .filter((r) => new Date(r.timestamp).getTime() >= cutoffMs)
-            .map((r) => ({ url: r.image.url, timestamp: r.timestamp }))
+            .map((r) => ({ url: r.image.url, timestamp: r.timestamp, signedAt: Date.now() }))
             .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
         }
 
@@ -2040,6 +2050,13 @@ function missingRangesFor(slotMs) {
     // An image that failed its load still blocks display; poll that range so the
     // re-signed fetch lands inside the slot instead of waiting for the next one.
     if (frame && failedImageActive(frame.url)) return true;
+    // Same for a signature past the presign window: nothing on screen can reload it.
+    if (
+      frame &&
+      !frameSignatureFresh(frame) &&
+      radarShownKey.get(range) !== displayImageKey(range, frame)
+    )
+      return true;
     return !frame;
   });
 }
@@ -2128,6 +2145,60 @@ function scheduleNextRefresh() {
     refreshTimer = setTimeout(pollRanges.length ? pollOnce : fetchAtSlot, delay);
   }
   restartCountdown();
+}
+
+// Missing one slot is normal inside a slot (the 70km feed publishes ~47s early, the
+// others a minute in); a whole slot behind means the refresh loop lost track.
+function radarDataStale() {
+  const nowSlot = Math.floor(Date.now() / SLOT_MS) * SLOT_MS;
+  let newest = -Infinity;
+  for (const range of RANGES) newest = Math.max(newest, newestLiveSlot(range));
+  return !Number.isFinite(newest) || nowSlot - newest >= SLOT_MS;
+}
+
+// The refresh chain is one setTimeout, and a hidden/frozen tab can suspend a fetch or
+// an image load past any timeout. Nothing else re-arms the chain, so watch for exactly
+// those states: post-throttle timers, a wedged lock, and a frame no path will re-apply.
+const RADAR_PENDING_MAX_MS = 45 * 1000;
+
+function radarStalledFrame() {
+  if (!allTimestamps.length) return null;
+  const slotMs = new Date(allTimestamps[currentIndex]).getTime();
+  for (const range of RANGES) {
+    const frame = framesMap[range]?.get(slotMs);
+    if (!frame || failedImageActive(frame.url) || !frameSignatureFresh(frame)) continue;
+    const key = displayImageKey(range, frame);
+    if (radarShownKey.get(range) === key) continue;
+    if (
+      radarPendingKey.get(range) === key &&
+      Date.now() - (radarPendingAt.get(range) || 0) < RADAR_PENDING_MAX_MS
+    )
+      continue;
+    return { range, frame, key };
+  }
+  return null;
+}
+
+function radarWatchdog() {
+  if (document.visibilityState === 'hidden') return;
+  if (fetchRadarBusy) {
+    // A fetch suspended mid-flight must not block every later attempt.
+    if (Date.now() - lastFetchStart <= 60 * 1000) return;
+    fetchRadarBusy = false;
+  }
+  // nextFetchAt is the only thing that re-arms refreshes; overdue means the chain died.
+  if (Date.now() > nextFetchAt + POLL_INTERVAL) {
+    fetchAtSlot();
+    return;
+  }
+  if (pollRanges.length) return;
+  const stalled = radarStalledFrame();
+  if (!stalled) return;
+  const { range, frame, key } = stalled;
+  clearRadarPending(range);
+  frameImageCache.delete(frameImageKey(range, frame, clipBoundaries));
+  smoothDataCache.delete(key);
+  showFrame(currentIndex);
 }
 
 let tickMidpoints = [];
@@ -2847,6 +2918,17 @@ const smoothDataCache = new Map();
 const FRAME_CACHE_MAX = RANGES.length * Math.ceil((PAST_HOURS * 60 * 60 * 1000) / SLOT_MS + 2);
 const radarShownKey = new Map();
 const radarPendingKey = new Map();
+// When the pending load started: a load frozen mid-flight never settles, so the
+// watchdog needs an age to declare it abandoned and try a fresh one.
+const radarPendingAt = new Map();
+function setRadarPending(range, key) {
+  radarPendingKey.set(range, key);
+  radarPendingAt.set(range, Date.now());
+}
+function clearRadarPending(range) {
+  radarPendingKey.delete(range);
+  radarPendingAt.delete(range);
+}
 // Ranges whose pending frame has been loading longer than RADAR_STRIPE_DELAY_MS.
 // Until then the previous image stays up without the "no radar" hatch, so
 // scrubbing over cached frames doesn't flash stripes for a frame or two
@@ -5177,7 +5259,7 @@ function applyRadarFrame(range, frame, slotMs) {
   const hide = () => {
     clearSlow();
     radarShownKey.delete(range);
-    radarPendingKey.delete(range);
+    clearRadarPending(range);
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
     setSmoothRangeVisible(range, false);
     updateBoundaryAvailability();
@@ -5189,15 +5271,21 @@ function applyRadarFrame(range, frame, slotMs) {
     hide();
     return;
   }
+  // A signature past the presign window can only 403 on first load. Keep a frame that is
+  // already drawn, but never start a download the poll is about to re-sign anyway.
+  if (!frameSignatureFresh(frame) && radarShownKey.get(range) !== key) {
+    hide();
+    return;
+  }
   if (smoothRadar) {
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'none');
     setSmoothRangeVisible(range, true);
     if (radarShownKey.get(range) === key) {
       clearSlow();
-      radarPendingKey.delete(range);
+      clearRadarPending(range);
       return;
     }
-    radarPendingKey.set(range, key);
+    setRadarPending(range, key);
     clearSlow();
     radarSlowTimers.set(
       range,
@@ -5217,7 +5305,7 @@ function applyRadarFrame(range, frame, slotMs) {
         L.dirty = true;
         if (map) map.triggerRepaint();
         radarShownKey.set(range, key);
-        radarPendingKey.delete(range);
+        clearRadarPending(range);
         clearSlow();
         updateBoundaryAvailability();
       })
@@ -5233,11 +5321,11 @@ function applyRadarFrame(range, frame, slotMs) {
   source.setCoordinates(bbCoordinatesOf(boundaryBoxes[range] || RADAR_BOUNDS[range]));
   if (radarShownKey.get(range) === key) {
     clearSlow();
-    radarPendingKey.delete(range);
+    clearRadarPending(range);
     if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', 'visible');
     return;
   }
-  radarPendingKey.set(range, key);
+  setRadarPending(range, key);
   clearSlow();
   radarSlowTimers.set(
     range,
@@ -5255,7 +5343,7 @@ function applyRadarFrame(range, frame, slotMs) {
       if (!src || radarPendingKey.get(range) !== key) return;
       src.updateImage({ image: canvas });
       radarShownKey.set(range, key);
-      radarPendingKey.delete(range);
+      clearRadarPending(range);
       clearSlow();
       updateBoundaryAvailability();
     })
@@ -9073,8 +9161,18 @@ function refreshAfterWake() {
   // pollRanges was snapshotted before the last image loads settled, so re-read it:
   // a wake inside the hatched window must poll now, not wait for the slot boundary.
   if (pollSlotMs) pollRanges = missingRangesFor(pollSlotMs);
-  if (pollRanges.length) pollOnce();
-  else if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
+  if (pollRanges.length) {
+    pollOnce();
+    return;
+  }
+  // Judge freshness by the data, not by the last attempt: a fetch that failed while
+  // throttled/offline still stamped lastFetchStart, and its frames' URLs then age out.
+  if (radarDataStale() || Date.now() - lastFetchStart > SLOT_MS) {
+    fetchAtSlot();
+    return;
+  }
+  // Same frames, but a frozen/style-reloaded map can have lost its radar textures.
+  if (allTimestamps.length) showFrame(currentIndex);
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
@@ -9084,7 +9182,10 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pageshow', (e) => {
   if (e.persisted) refreshAfterWake();
 });
+// A frozen (not just hidden) page resumes with every timer it missed; treat it the same.
+document.addEventListener('resume', refreshAfterWake);
 window.addEventListener('online', () => {
-  if (Date.now() - lastFetchStart > SLOT_MS) fetchAtSlot();
+  if (radarDataStale()) fetchAtSlot();
 });
 setInterval(tickCountdown, 1000);
+setInterval(radarWatchdog, POLL_INTERVAL);
